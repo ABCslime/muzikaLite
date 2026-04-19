@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# muzika-decrypt: decrypt deploy/.env.sops from the repo checkout and split
+# it into two service env files.
+#
+# Called by /usr/local/bin/muzika-update on every timer tick, or manually
+# by the operator after the first install. Idempotent.
+#
+# Inputs:
+#   /srv/muzika/repo/deploy/.env.sops   (SOPS-encrypted .env)
+#   /etc/muzika/age.key                 (age private key, 0400 root)
+#
+# Outputs:
+#   /etc/muzika/muzika.env              (MUZIKA_* vars, 0640 muzika:muzika)
+#   /etc/muzika/slskd.env               (SLSKD_* and SOULSEEK_* vars, same)
+
+set -euo pipefail
+
+# Prefer /run (tmpfs, auto-cleared on reboot, survives OOM better than /tmp
+# under restrictive sandbox settings) for intermediate files if writable.
+# Only override if the caller didn't set TMPDIR themselves.
+if [ -z "${TMPDIR:-}" ] && [ -w /run ]; then
+    TMPDIR=/run
+    export TMPDIR
+fi
+
+REPO_DIR="${REPO_DIR:-/srv/muzika/repo}"
+ETC_DIR="${ETC_DIR:-/etc/muzika}"
+AGE_KEY="${AGE_KEY:-/etc/muzika/age.key}"
+SOPS_FILE="${REPO_DIR}/deploy/.env.sops"
+
+LOG_TAG="muzika-decrypt"
+
+log() {
+    logger -t "$LOG_TAG" -- "$*"
+    echo "[$LOG_TAG] $*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+[ -r "$SOPS_FILE" ] || die "missing $SOPS_FILE"
+[ -r "$AGE_KEY" ]   || die "missing $AGE_KEY"
+command -v sops >/dev/null 2>&1 || die "sops not installed"
+
+tmp_plain=$(mktemp)
+tmp_muzika=$(mktemp)
+tmp_slskd=$(mktemp)
+# shellcheck disable=SC2064
+# Intentional early-expansion — we want the current filenames baked in.
+trap "rm -f '$tmp_plain' '$tmp_muzika' '$tmp_slskd'" EXIT
+
+SOPS_AGE_KEY_FILE="$AGE_KEY" sops -d "$SOPS_FILE" > "$tmp_plain"
+
+# Split the decrypted env by variable prefix. The two service units
+# consume disjoint variable families; anything else is ignored.
+#
+# grep returns 1 if no lines match — we accept that with || :.
+grep '^MUZIKA_' "$tmp_plain" > "$tmp_muzika" || :
+grep -E '^(SLSKD_|SOULSEEK_)' "$tmp_plain" > "$tmp_slskd" || :
+
+[ -s "$tmp_muzika" ] || die "no MUZIKA_* variables in decrypted env"
+[ -s "$tmp_slskd" ]  || log "WARNING: no SLSKD_/SOULSEEK_ variables in decrypted env"
+
+install -m 0640 -o muzika -g muzika "$tmp_muzika" "${ETC_DIR}/muzika.env"
+install -m 0640 -o muzika -g muzika "$tmp_slskd"  "${ETC_DIR}/slskd.env"
+
+log "decrypted env into ${ETC_DIR}/{muzika,slskd}.env"

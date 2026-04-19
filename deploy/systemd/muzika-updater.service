@@ -1,0 +1,31 @@
+[Unit]
+Description=Muzika auto-updater (oneshot, timer-driven)
+Documentation=https://github.com/macabc/muzika
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root is needed to replace /usr/local/bin/muzika and run systemctl restart.
+User=root
+ExecStart=/usr/local/bin/muzika-update
+StandardOutput=journal
+StandardError=journal
+# No Restart= — the timer retries on its own cadence.
+
+# Sandboxing. The script writes to a tightly-scoped set of paths; everything
+# else is read-only via ProtectSystem=strict.
+#   /usr/local/bin     — atomic-replace the muzika binary
+#   /var/lib/muzika    — write the version marker
+#   /etc/muzika        — write decrypted env files (via muzika-decrypt)
+#   /srv/muzika/repo   — git fetch + reset --hard
+#
+# NoNewPrivileges is intentionally NOT set. The script invokes systemctl to
+# restart muzika.service and slskd.service. While systemctl itself is not
+# setuid, NoNewPrivileges has caused subtle interaction issues with
+# systemd's D-Bus helpers on some distributions; the ProtectSystem=strict +
+# ReadWritePaths combination already bounds the blast radius.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/usr/local/bin /var/lib/muzika /etc/muzika /srv/muzika/repo

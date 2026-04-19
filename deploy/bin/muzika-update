@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# muzika-update: pull latest release from GitHub, verify, atomic-install,
+# restart affected services. Also git pulls the repo under /srv/muzika/repo
+# and re-decrypts deploy/.env.sops on every tick so config changes propagate.
+#
+# Invoked by muzika-updater.service on each timer tick. Expected to run as
+# root (systemd sets User=root).
+#
+# Exit codes:
+#   0 — success, nothing to do, transient failure to retry next tick, or
+#       another instance already running (flock contention)
+#   1 — hard failure (bad checksum, malformed tag, permanent download error)
+#
+# Logs go to journald via `logger -t muzika-updater` and stderr.
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Single-instance lock. Prevents overlapping timer ticks from racing on the
+# repo or the binary. Non-blocking: if another run holds the lock, exit 0
+# silently; the next 5-min tick will find whatever work remains.
+# -----------------------------------------------------------------------------
+LOCK_FILE="${LOCK_FILE:-/var/lock/muzika-update.lock}"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    logger -t muzika-updater "another muzika-update already running; exiting"
+    exit 0
+fi
+
+GITHUB_REPO="${GITHUB_REPO:-macabc/muzika}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+BIN_PATH="${INSTALL_DIR}/muzika"
+VERSION_FILE="${VERSION_FILE:-/var/lib/muzika/version}"
+REPO_DIR="${REPO_DIR:-/srv/muzika/repo}"
+ENV_FILE="${ENV_FILE:-/etc/muzika/muzika.env}"
+SLSKD_ENV_FILE="${SLSKD_ENV_FILE:-/etc/muzika/slskd.env}"
+LOG_TAG="muzika-updater"
+
+# curl timeouts applied to every remote call:
+#   --connect-timeout 15  — give up on TCP handshake after 15s
+#   --max-time 300        — cap total time at 5 min (< timer interval)
+CURL_TIMEOUTS=(--connect-timeout 15 --max-time 300)
+
+# Temp-file variables initialized empty so the cleanup trap is safe under set -u.
+tmp_api=""
+tmp_bin=""
+tmp_sha=""
+
+cleanup() {
+    rm -f "$tmp_api" "$tmp_bin" "$tmp_sha"
+}
+trap cleanup EXIT
+
+log() {
+    logger -t "$LOG_TAG" -- "$*"
+    echo "[$LOG_TAG] $*" >&2
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+hash_file() {
+    if [ -r "$1" ]; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        echo ""
+    fi
+}
+
+# Per-service restart flags. Set to 1 when that service's inputs changed.
+should_restart_muzika=0
+should_restart_slskd=0
+
+# -----------------------------------------------------------------------------
+# 1. Git fetch + HEAD comparison + decrypt.
+#
+#    Only reset --hard when origin/main actually moved. Log both SHAs so a
+#    silent corruption (local rewind, forced push) is visible in journalctl.
+# -----------------------------------------------------------------------------
+if [ -d "${REPO_DIR}/.git" ]; then
+    old_muzika_env_hash=$(hash_file "$ENV_FILE")
+    old_slskd_env_hash=$(hash_file "$SLSKD_ENV_FILE")
+
+    if ! git -C "$REPO_DIR" fetch --quiet origin; then
+        log "git fetch failed; will retry next tick"
+        exit 0
+    fi
+
+    local_head=$(git -C "$REPO_DIR" rev-parse HEAD)
+    remote_head=$(git -C "$REPO_DIR" rev-parse origin/main)
+
+    if [ "$local_head" = "$remote_head" ]; then
+        log "repo already at ${local_head} (no pull needed)"
+    else
+        log "advancing repo from ${local_head} to ${remote_head}"
+
+        # Optional-but-preferred guard: confirm the target commit is reachable
+        # from a signed v* tag. This is a soft check — we log a warning if the
+        # property doesn't hold but still pull, so env-only changes on main
+        # stay deployable between release tags. Upgrade this to a hard gate by
+        # replacing the `log WARNING` with `die` if you sign every release.
+        signed_tag=""
+        mapfile -t containing_tags < <(
+            git -C "$REPO_DIR" tag --contains "$remote_head" --list 'v*' 2>/dev/null
+        )
+        for t in "${containing_tags[@]}"; do
+            if git -C "$REPO_DIR" verify-tag "$t" >/dev/null 2>&1; then
+                signed_tag="$t"
+                break
+            fi
+        done
+        if [ -n "$signed_tag" ]; then
+            log "target ${remote_head} reachable from signed tag ${signed_tag}"
+        else
+            log "WARNING: target ${remote_head} not reachable from a signed v* tag"
+        fi
+
+        git -C "$REPO_DIR" reset --hard --quiet origin/main
+    fi
+
+    if /usr/local/bin/muzika-decrypt; then
+        new_muzika_env_hash=$(hash_file "$ENV_FILE")
+        new_slskd_env_hash=$(hash_file "$SLSKD_ENV_FILE")
+        if [ "$old_muzika_env_hash" != "$new_muzika_env_hash" ]; then
+            should_restart_muzika=1
+            log "muzika.env changed"
+        fi
+        if [ "$old_slskd_env_hash" != "$new_slskd_env_hash" ]; then
+            should_restart_slskd=1
+            log "slskd.env changed"
+        fi
+    else
+        log "decrypt failed; keeping existing env and continuing"
+    fi
+else
+    log "no repo at ${REPO_DIR}; skipping git pull + decrypt"
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Query GitHub Releases API for the latest tag.
+#
+#    Transient failures (403 rate-limit, 5xx, network error) are non-fatal —
+#    we still want to fall through to the restart logic in case env files
+#    changed above.
+# -----------------------------------------------------------------------------
+api_ok=0
+api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+tmp_api=$(mktemp)
+
+http_code=$(
+    curl -sS "${CURL_TIMEOUTS[@]}" -o "$tmp_api" -w '%{http_code}' "$api_url" \
+        || echo "000"
+)
+
+case "$http_code" in
+    200) api_ok=1 ;;
+    403)
+        log "GitHub API rate-limited (403); skipping binary check this tick"
+        ;;
+    000|5??)
+        log "GitHub API transient error (${http_code}); skipping binary check this tick"
+        ;;
+    *)
+        die "GitHub API returned HTTP ${http_code}"
+        ;;
+esac
+
+if [ "$api_ok" -eq 1 ]; then
+    latest_tag=$(jq -r '.tag_name // empty' "$tmp_api")
+    [ -n "$latest_tag" ] || die "no tag_name in GitHub API response"
+
+    # Refuse anything that isn't a v* tag. Guards against upstream mistakes.
+    case "$latest_tag" in
+        v*) ;;
+        *)  die "refusing to install tag ${latest_tag} (does not start with 'v')" ;;
+    esac
+
+    # -------------------------------------------------------------------------
+    # 3. Compare to installed version.
+    # -------------------------------------------------------------------------
+    current="none"
+    if [ -f "$VERSION_FILE" ]; then
+        current=$(cat "$VERSION_FILE")
+    fi
+
+    if [ "$current" = "$latest_tag" ]; then
+        log "muzika binary already at ${current}"
+    else
+        log "updating muzika from ${current} to ${latest_tag}"
+
+        bin_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/muzika-linux-arm64"
+        sha_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/muzika-linux-arm64.sha256"
+
+        # Download the binary to a tempfile ON THE SAME FILESYSTEM as the
+        # destination so the final mv is an atomic rename (not a cross-FS
+        # copy+unlink, which would leave a truncation window).
+        tmp_bin=$(mktemp "$INSTALL_DIR/muzika.new.XXXXXX")
+        tmp_sha=$(mktemp)
+
+        curl "${CURL_TIMEOUTS[@]}" -fsSL -o "$tmp_bin" "$bin_url" \
+            || die "download ${bin_url} failed"
+        curl "${CURL_TIMEOUTS[@]}" -fsSL -o "$tmp_sha" "$sha_url" \
+            || die "download ${sha_url} failed"
+
+        expected=$(awk '{print $1}' "$tmp_sha")
+        actual=$(sha256sum "$tmp_bin" | awk '{print $1}')
+        if [ "$expected" != "$actual" ]; then
+            die "checksum mismatch: expected ${expected}, got ${actual}"
+        fi
+
+        chmod 0755 "$tmp_bin"
+        # Atomic rename, same filesystem.
+        mv "$tmp_bin" "$BIN_PATH"
+        tmp_bin=""
+
+        # Record the new version AFTER the binary is in place. Atomic write
+        # via tempfile + rename — the version marker never points at a
+        # binary that isn't actually installed.
+        mkdir -p "$(dirname "$VERSION_FILE")"
+        tmp_ver="${VERSION_FILE}.new"
+        printf '%s\n' "$latest_tag" > "$tmp_ver"
+        mv "$tmp_ver" "$VERSION_FILE"
+
+        should_restart_muzika=1
+        log "installed ${latest_tag} to ${BIN_PATH}"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Restart services whose binary or env changed.
+#
+#    muzika restarts on binary change OR muzika.env change.
+#    slskd  restarts on slskd.env change (credential rotation etc).
+# -----------------------------------------------------------------------------
+if [ "$should_restart_muzika" -eq 1 ]; then
+    systemctl restart muzika
+    log "restarted muzika.service"
+fi
+if [ "$should_restart_slskd" -eq 1 ]; then
+    systemctl restart slskd
+    log "restarted slskd.service"
+fi

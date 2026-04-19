@@ -1,0 +1,10 @@
+# SOPS configuration. See README for setup.
+# The age public key below is a placeholder — replace with the one from
+# `age-keygen` run on the Pi. The corresponding private key lives ONLY
+# at /etc/muzika/age.key on the Pi.
+
+creation_rules:
+  - path_regex: \.env\.sops$
+    # Replace with your age recipient (public key) after running age-keygen
+    # on the Pi. Example: age1abcdef0123456789...
+    age: age1REPLACEME

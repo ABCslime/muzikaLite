@@ -1,0 +1,200 @@
+// Command muzika is the single-binary entry point. It owns process lifecycle:
+// load config, open DB, run migrations, wire services, start worker pools,
+// mount HTTP routes, serve, and shut down gracefully on signal.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"runtime"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/macabc/muzika/internal/auth"
+	"github.com/macabc/muzika/internal/bandcamp"
+	"github.com/macabc/muzika/internal/bus"
+	"github.com/macabc/muzika/internal/config"
+	"github.com/macabc/muzika/internal/db"
+	"github.com/macabc/muzika/internal/httpx"
+	"github.com/macabc/muzika/internal/playlist"
+	"github.com/macabc/muzika/internal/queue"
+	"github.com/macabc/muzika/internal/slskd"
+	"github.com/macabc/muzika/internal/soulseek"
+	"github.com/macabc/muzika/internal/web"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	log := newLogger(cfg.LogLevel)
+
+	// GC tuning: pairs with GOMEMLIMIT set in docker-compose.yml.
+	// See ARCHITECTURE.md §1 memory budget.
+	runtime.SetBlockProfileRate(0)
+
+	// ---- DB + migrations ----
+	database, err := db.Open(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+
+	if err := db.Migrate(database, "file:///migrations"); err != nil {
+		return fmt.Errorf("migrations: %w", err)
+	}
+	log.Info("migrations applied")
+
+	// ---- Bus + outbox ----
+	b := bus.New(cfg.BusBufferSize, log)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	dispatcher := bus.StartOutboxDispatcher(ctx, database, b, log)
+
+	// ---- Soulseek backend selection ----
+	var sk soulseek.Client
+	switch cfg.SoulseekBackend {
+	case "slskd":
+		sk = soulseek.NewSlskdClient(cfg.SlskdURL, cfg.SlskdUsername, cfg.SlskdPassword)
+	case "native":
+		return errors.New("SOULSEEK_BACKEND=native is not available in v1 (gosk unfinished); use slskd")
+	default:
+		return fmt.Errorf("unknown SOULSEEK_BACKEND %q", cfg.SoulseekBackend)
+	}
+
+	// ---- Services ----
+	authSvc := auth.NewService(database, cfg.JWTSecret, cfg.JWTExpiration, b, dispatcher)
+	plSvc := playlist.NewService(database, b)
+	defaultGenre := ""
+	if len(cfg.BandcampDefaultTags) > 0 {
+		defaultGenre = cfg.BandcampDefaultTags[0]
+	}
+	qSvc := queue.NewService(database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre, b, dispatcher)
+	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), b)
+	skSvc := slskd.NewService(database, sk, cfg.MusicStoragePath, b, dispatcher)
+
+	// ---- Start worker pools ----
+	plSvc.StartWorkers(ctx)
+	qSvc.StartWorkers(ctx)
+	bcSvc.StartWorkers(ctx, cfg.BandcampWorkers)
+	skSvc.StartWorkers(ctx, cfg.SlskdWorkers)
+
+	// ---- HTTP ----
+	srv := buildServer(cfg, log, authSvc, plSvc, qSvc)
+	go func() {
+		log.Info("http listening", "addr", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http server stopped", "err", err)
+			cancel()
+		}
+	}()
+
+	// ---- Wait for signal ----
+	<-ctx.Done()
+	log.Info("shutdown signal received")
+
+	// ---- Graceful shutdown ----
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("http shutdown", "err", err)
+	}
+	dispatcher.Stop()
+	b.Close()
+	b.Wait()
+	log.Info("exited cleanly")
+	return nil
+}
+
+func buildServer(
+	cfg config.Config,
+	log *slog.Logger,
+	a *auth.Service,
+	p *playlist.Service,
+	q *queue.Service,
+) *http.Server {
+	mux := http.NewServeMux()
+
+	authH := auth.NewHandler(a)
+	plH := playlist.NewHandler(p)
+	qH := queue.NewHandler(q)
+
+	withAuth := httpx.WithAuth(a.Verifier())
+
+	// --- Public ---
+	mux.HandleFunc("POST /api/auth/user", authH.Register)
+	mux.HandleFunc("POST /api/auth/login", authH.Login)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	// --- Protected — each wrapped explicitly ---
+	mux.Handle("DELETE /api/auth/user/{id}", withAuth(http.HandlerFunc(authH.Delete)))
+	mux.Handle("POST /api/auth/logout-all", withAuth(http.HandlerFunc(authH.LogoutAll)))
+
+	mux.Handle("GET /api/playlist/", withAuth(http.HandlerFunc(plH.List)))
+	mux.Handle("GET /api/playlist/{id}", withAuth(http.HandlerFunc(plH.Get)))
+	mux.Handle("POST /api/playlist/", withAuth(http.HandlerFunc(plH.Create)))
+	mux.Handle("DELETE /api/playlist/{id}", withAuth(http.HandlerFunc(plH.Delete)))
+	mux.Handle("POST /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.AddSong)))
+	mux.Handle("DELETE /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.RemoveSong)))
+
+	mux.Handle("GET /api/queue/queue", withAuth(http.HandlerFunc(qH.GetQueue)))
+	mux.Handle("POST /api/queue/queue", withAuth(http.HandlerFunc(qH.AddSong)))
+	mux.Handle("POST /api/queue/queue/check", withAuth(http.HandlerFunc(qH.Check)))
+	mux.Handle("POST /api/queue/queue/skipped", withAuth(http.HandlerFunc(qH.Skipped)))
+	mux.Handle("POST /api/queue/queue/finished", withAuth(http.HandlerFunc(qH.Finished)))
+	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
+	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))
+	mux.Handle("POST /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.Like)))
+	mux.Handle("POST /api/queue/songs/{id}/unliked", withAuth(http.HandlerFunc(qH.Unlike)))
+
+	// --- SPA (fallback for everything else) ---
+	mux.Handle("GET /", web.SPAHandler())
+
+	// Wrap globally with panic recovery, CORS, request log.
+	handler := httpx.Recover(log)(
+		httpx.CORS(httpx.CORSConfig{Origins: cfg.CORSOrigins})(
+			httpx.RequestLog(log)(mux),
+		),
+	)
+
+	return &http.Server{
+		Addr:              ":" + strconv.Itoa(cfg.HTTPPort),
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+}
+
+func newLogger(level string) *slog.Logger {
+	var lv slog.Level
+	switch level {
+	case "debug":
+		lv = slog.LevelDebug
+	case "warn":
+		lv = slog.LevelWarn
+	case "error":
+		lv = slog.LevelError
+	default:
+		lv = slog.LevelInfo
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv}))
+}

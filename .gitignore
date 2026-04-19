@@ -1,0 +1,31 @@
+# Go
+/bin/
+/out/
+*.test
+*.out
+coverage.txt
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+
+# Local env — only .env.example and .env.sops are tracked.
+.env
+.env.local
+.env.*.local
+
+# Local data (DB, music, slskd state). On the Pi these live under
+# /srv/muzika/data, not in the repo; this keeps local-dev runs tidy.
+/data/
+/deploy/data/
+
+# Frontend build artifacts (populated by the Docker-less CI build or by
+# `npm run build` locally; embedded via //go:embed).
+/internal/web/dist/*
+!/internal/web/dist/.keep
+/frontend/dist/
+/frontend/node_modules/
+
+# macOS
+.DS_Store

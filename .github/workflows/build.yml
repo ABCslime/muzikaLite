@@ -1,0 +1,74 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - run: go vet ./...
+      - run: go test ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend (sanity check)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build -- --mode=production
+
+  binary:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build muzika binary
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          # Embed frontend first
+          cd frontend && npm ci && npm run build && cd ..
+          mkdir -p internal/web/dist
+          cp -r frontend/dist/* internal/web/dist/
+          # Cross-compile (pure Go: modernc.org/sqlite has no CGO)
+          go build -trimpath -ldflags="-s -w" -o muzika-linux-arm64 ./cmd/muzika
+          sha256sum muzika-linux-arm64 > muzika-linux-arm64.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: muzika-binary
+          path: |
+            muzika-linux-arm64
+            muzika-linux-arm64.sha256
+          retention-days: 14

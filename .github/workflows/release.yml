@@ -1,0 +1,53 @@
+name: release
+
+# Pushing a v* tag builds the ARM64 binary fresh and creates a GitHub Release.
+# The Pi's muzika-updater.timer polls /releases/latest every 5 min and pulls
+# the new binary on the next tick.
+#
+# Rebuilding on tag (instead of reusing a prior build artifact) adds ~2 min
+# of CI time but keeps this workflow self-contained. No download-artifact
+# cross-workflow plumbing.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build muzika binary
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: 0
+        run: |
+          cd frontend && npm ci && npm run build && cd ..
+          mkdir -p internal/web/dist
+          cp -r frontend/dist/* internal/web/dist/
+          go build -trimpath -ldflags="-s -w" -o muzika-linux-arm64 ./cmd/muzika
+          sha256sum muzika-linux-arm64 > muzika-linux-arm64.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            muzika-linux-arm64
+            muzika-linux-arm64.sha256
+          generate_release_notes: true

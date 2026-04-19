@@ -1,0 +1,14 @@
+[Unit]
+Description=Trigger Muzika auto-updater every 5 minutes
+
+[Timer]
+# Wait 2 minutes after boot to let networking settle.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Persistent=true replays missed ticks after reboot — useful on a Pi that
+# gets power-cycled occasionally.
+Persistent=true
+Unit=muzika-updater.service
+
+[Install]
+WantedBy=timers.target

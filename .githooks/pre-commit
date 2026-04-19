@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Muzika pre-commit hook: block any plaintext .env* from being committed.
+# Only .env.example and .env.sops (and deploy/.env.sops) are allowed.
+#
+# Enable once per clone: git config core.hooksPath .githooks
+
+set -e
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep -E '(^|/)\.env' || true)
+for f in $staged; do
+    case "$f" in
+        .env.example|.env.sops|deploy/.env.sops) ;;
+        *)
+            echo "ERROR: refusing to commit $f (looks like a plaintext env file)."
+            echo "If this is intentional, bypass with 'git commit --no-verify' — but"
+            echo "check first that you're not about to publish secrets."
+            exit 1
+            ;;
+    esac
+done

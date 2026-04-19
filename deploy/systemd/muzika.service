@@ -1,0 +1,43 @@
+[Unit]
+Description=Muzika music platform
+Documentation=https://github.com/macabc/muzika
+After=network-online.target slskd.service
+Wants=network-online.target
+# slskd is a soft dependency (Wants on .target, After on slskd.service).
+# muzika can start without it — the slskd HTTP client tolerates connection
+# failures and retries on the next request.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=muzika
+Group=muzika
+WorkingDirectory=/srv/muzika
+EnvironmentFile=/etc/muzika/muzika.env
+# Mirrors the old docker-compose GOMEMLIMIT/GOGC values.
+# GOMEMLIMIT=120MiB leaves 30 MB headroom under MemoryMax=150M for
+# transient allocation spikes.
+Environment=GOMEMLIMIT=120MiB
+Environment=GOGC=50
+ExecStart=/usr/local/bin/muzika
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# cgroup v2 memory caps. Requires systemd >= 247 (Raspberry Pi OS Bookworm ships 252).
+MemoryMax=150M
+MemoryHigh=130M
+
+# Sandboxing.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/srv/muzika/data
+
+# slog JSON to journald — follow with `journalctl -u muzika -f`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

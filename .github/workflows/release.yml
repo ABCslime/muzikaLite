@@ -25,11 +25,32 @@ jobs:
           go-version: '1.22'
           cache: true
 
+      - name: Check frontend exists
+        id: frontend
+        run: |
+          if [ -f frontend/package-lock.json ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping frontend build; frontend/ not yet in repo."
+          fi
+
       - uses: actions/setup-node@v4
+        if: steps.frontend.outputs.exists == 'true'
         with:
           node-version: '20'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        if: steps.frontend.outputs.exists == 'true'
+        run: cd frontend && npm ci && npm run build -- --mode=production
+
+      - name: Stage frontend dist for embed
+        if: steps.frontend.outputs.exists == 'true'
+        run: |
+          mkdir -p internal/web/dist
+          cp -r frontend/dist/* internal/web/dist/
 
       - name: Build muzika binary
         env:
@@ -37,9 +58,6 @@ jobs:
           GOARCH: arm64
           CGO_ENABLED: 0
         run: |
-          cd frontend && npm ci && npm run build && cd ..
-          mkdir -p internal/web/dist
-          cp -r frontend/dist/* internal/web/dist/
           go build -trimpath -ldflags="-s -w" -o muzika-linux-arm64 ./cmd/muzika
           sha256sum muzika-linux-arm64 > muzika-linux-arm64.sha256
 

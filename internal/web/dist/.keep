@@ -1,3 +1,0 @@
-This directory is populated by the Docker build stage from frontend/dist/.
-In local development (`go run ./cmd/muzika`) it is empty and the HTTP
-layer returns 404 for /, expecting `vite dev` on :3000 instead.

@@ -1,9 +1,15 @@
 // Package web serves the embedded Vue SPA.
 //
-// The Docker build copies frontend/dist/ into internal/web/dist/ before
-// compiling the binary. In local development with `go run`, dist/ is empty
-// (just a .keep sentinel), and SPAHandler returns 404 for all requests.
-// Developers run `vite dev` on :3000 directly and proxy /api/* to :8080.
+// The frontend is deferred to a post-backend phase. Until it lands,
+// dist/ holds a committed placeholder index.html and a .gitkeep. The
+// //go:embed all:dist directive requires at least one matching file;
+// .gitkeep satisfies that invariant and is hidden so `cp -r dist/*`
+// from a future `npm run build` step won't clobber it.
+//
+// When the frontend arrives, CI's "Stage frontend dist for embed" step
+// overwrites index.html with the real Vue build output before `go build`.
+// Developers running `vite dev` on :3000 proxy /api/* to :8080 and never
+// hit the Go binary at /.
 package web
 
 import (
@@ -16,8 +22,9 @@ import (
 var distFS embed.FS
 
 // SPAHandler returns an http.Handler that serves the embedded Vue build.
-// If dist/ is empty (dev mode), every request yields 404 — the dev server
-// is responsible for serving the SPA on :3000.
+// With the committed placeholder at dist/index.html, this always has
+// something to serve; the 404 branch below is defensive cover in case
+// someone ever wipes the placeholder.
 func SPAHandler() http.Handler {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
@@ -30,7 +37,7 @@ func SPAHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(sub))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Detect empty dist (dev mode) by checking for index.html.
+		// Defensive: 404 if someone wiped the placeholder.
 		if _, err := fs.Stat(sub, "index.html"); err != nil {
 			http.NotFound(w, r)
 			return

@@ -10,6 +10,13 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design and
 **Status:** Phase 3 scaffold. Modules are stubs; business logic ports
 land module-by-module in Phases 4–9.
 
+**Frontend deferred.** The Vue SPA is not yet in the repo — it's being
+brought in after the `auth`, `playlist`, and `queue` modules are
+ported. Until then, the backend binary serves a minimal placeholder
+page at `/`, and every endpoint under `/api/*` returns
+`ErrNotImplemented` until its module lands. CI workflows detect the
+missing `frontend/` and skip the Node build steps automatically.
+
 ---
 
 ## Quick start (local dev)

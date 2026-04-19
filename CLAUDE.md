@@ -245,6 +245,13 @@ See `ARCHITECTURE.md` §7 for the gosk evolution plan.
 - Don't bring back Kafka.
 - Don't bring back Docker. We measured the Pi 3 1 GB budget; Docker
   daemon + Watchtower cost ~160 MB we don't have. See §1 and §11.
+- Don't assume the frontend exists. It's deferred. When `frontend/` gets
+  added in a later phase, remove the
+  `if: steps.frontend.outputs.exists` gates from both workflows
+  (`.github/workflows/build.yml`, `.github/workflows/release.yml`) and
+  remove the placeholder `internal/web/dist/index.html`. Leave
+  `internal/web/dist/.gitkeep` in place so the directory survives when
+  the real Vue build overwrites index.html.
 
 ---
 

@@ -15,7 +15,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 MUZIKA_USER="muzika"
-MUZIKA_UID=1000
+MUZIKA_UID=1001
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 

@@ -7,7 +7,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.17.1
 	github.com/google/uuid v1.6.0
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/macabc/gosk v0.0.0-00010101000000-000000000000
+	github.com/ABCslime/gosk v0.0.0-00010101000000-000000000000
 	golang.org/x/crypto v0.23.0
 	modernc.org/sqlite v1.49.1
 )
@@ -33,4 +33,8 @@ require (
 
 // Run `go mod tidy` after cloning to populate indirect requirements.
 
-replace github.com/macabc/gosk => /Users/macabc/gosk
+// Local replace used during development on this workstation. Drop this
+// line (or point it at a pseudoversion) once gosk is published as a
+// tagged release on github.com/ABCslime/gosk and CI can fetch it via
+// the Go module proxy.
+replace github.com/ABCslime/gosk => /Users/macabc/gosk

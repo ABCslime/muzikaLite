@@ -5,10 +5,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/macabc/gosk"
+	"github.com/ABCslime/gosk"
 )
 
-// NativeClient adapts github.com/macabc/gosk to this package's Client
+// NativeClient adapts github.com/ABCslime/gosk to this package's Client
 // interface. Activate with MUZIKA_SOULSEEK_BACKEND=native in production.
 //
 // Field-for-field translation only — gosk defines its public API with

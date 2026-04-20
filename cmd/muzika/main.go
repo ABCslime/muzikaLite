@@ -28,7 +28,7 @@ import (
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
-	"github.com/macabc/gosk"
+	"github.com/ABCslime/gosk"
 )
 
 func main() {

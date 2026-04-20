@@ -242,7 +242,7 @@ Two implementations behind `internal/soulseek.Client`, selected by
 - `slskd` (default) — talks HTTP to the [slskd daemon](https://github.com/slskd/slskd)
   running as a systemd sidecar. **This is what ships and what you should
   use.**
-- `native` — [gosk](https://github.com/macabc/gosk) (separate Go module,
+- `native` — [gosk](https://github.com/ABCslime/gosk) (separate Go module,
   not in this repo). Returns `ErrNotImplemented` in v1; muzika refuses
   to start. See `ARCHITECTURE.md` §7 for the gosk roadmap.
 

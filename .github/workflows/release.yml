@@ -52,7 +52,11 @@ jobs:
           mkdir -p internal/web/dist
           cp -r frontend/dist/* internal/web/dist/
 
-      - name: Build muzika binary
+      # Build both Pi 3 targets: arm64 (64-bit Ubuntu/Raspberry Pi OS) and
+      # armv7 (32-bit Ubuntu/Raspberry Pi OS — same CPU, smaller userland).
+      # deploy/bin/muzika-update picks the right asset at install time via
+      # `uname -m`.
+      - name: Build muzika binary (arm64)
         env:
           GOOS: linux
           GOARCH: arm64
@@ -61,6 +65,16 @@ jobs:
           go build -trimpath -ldflags="-s -w" -o muzika-linux-arm64 ./cmd/muzika
           sha256sum muzika-linux-arm64 > muzika-linux-arm64.sha256
 
+      - name: Build muzika binary (armv7)
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: '7'
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w" -o muzika-linux-armv7 ./cmd/muzika
+          sha256sum muzika-linux-armv7 > muzika-linux-armv7.sha256
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -68,4 +82,6 @@ jobs:
           files: |
             muzika-linux-arm64
             muzika-linux-arm64.sha256
+            muzika-linux-armv7
+            muzika-linux-armv7.sha256
           generate_release_notes: true

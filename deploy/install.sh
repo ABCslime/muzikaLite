@@ -21,6 +21,28 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SOPS_VERSION="${SOPS_VERSION:-v3.8.1}"
 
+# Pick binary flavors matching the running kernel. Pi 3 CPU is aarch64 but
+# a 32-bit Ubuntu/Raspberry Pi OS userland only loads ARMv7 ELFs.
+#   aarch64 / arm64  → linux-arm64 assets  (64-bit userland)
+#   armv7l / armv6l  → linux-arm assets    (32-bit userland)
+arch=$(uname -m)
+case "$arch" in
+    aarch64|arm64)
+        SLSKD_ARCH_MATCH="linux-arm64"
+        SOPS_ARCH="arm64"
+        ;;
+    armv7l|armv6l)
+        # slskd's 32-bit asset is named "linux-arm" (no 64). Anchor with
+        # regex to avoid matching linux-arm64 by accident.
+        SLSKD_ARCH_MATCH='linux-arm[^0-9]'
+        SOPS_ARCH="arm"
+        ;;
+    *)
+        echo "unsupported architecture: $arch" >&2
+        exit 1
+        ;;
+esac
+
 log() {
     echo "[install] $*"
 }
@@ -65,7 +87,7 @@ else
 fi
 
 if [ "$install_slskd" -eq 1 ]; then
-    log "downloading slskd latest linux-arm64 release"
+    log "downloading slskd latest ${SLSKD_ARCH_MATCH} release"
     command -v jq     >/dev/null 2>&1 || { apt-get update && apt-get install -y jq; }
     command -v curl   >/dev/null 2>&1 || { apt-get update && apt-get install -y curl; }
     command -v unzip  >/dev/null 2>&1 || { apt-get update && apt-get install -y unzip; }
@@ -73,10 +95,10 @@ if [ "$install_slskd" -eq 1 ]; then
     api=$(curl -fsSL https://api.github.com/repos/slskd/slskd/releases/latest)
     tarball=$(
         echo "$api" \
-        | jq -r '.assets[] | select(.name | test("linux-arm64")) | .browser_download_url' \
+        | jq -r --arg re "$SLSKD_ARCH_MATCH" '.assets[] | select(.name | test($re)) | .browser_download_url' \
         | head -n1
     )
-    [ -n "$tarball" ] || { echo "no linux-arm64 asset in slskd latest release" >&2; exit 1; }
+    [ -n "$tarball" ] || { echo "no ${SLSKD_ARCH_MATCH} asset in slskd latest release" >&2; exit 1; }
 
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064
@@ -133,7 +155,7 @@ fi
 if ! command -v sops >/dev/null 2>&1; then
     log "installing sops ${SOPS_VERSION} (static binary)"
     curl -fsSL -o /usr/local/bin/sops \
-        "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.arm64"
+        "https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.${SOPS_ARCH}"
     chmod 0755 /usr/local/bin/sops
 else
     log "sops already installed"

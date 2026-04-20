@@ -41,6 +41,17 @@ LOG_TAG="muzika-updater"
 #   --max-time 300        — cap total time at 5 min (< timer interval)
 CURL_TIMEOUTS=(--connect-timeout 15 --max-time 300)
 
+# Pick the release asset matching the running kernel. Pi 3 CPU is aarch64
+# but a 32-bit Ubuntu/Raspberry Pi OS userland only loads ARMv7 ELFs.
+#   aarch64 / arm64  → muzika-linux-arm64  (64-bit userland)
+#   armv7l / armv6l  → muzika-linux-armv7  (32-bit userland)
+arch=$(uname -m)
+case "$arch" in
+    aarch64|arm64) ASSET="muzika-linux-arm64" ;;
+    armv7l|armv6l) ASSET="muzika-linux-armv7" ;;
+    *) die "unsupported architecture: $arch" ;;
+esac
+
 # Temp-file variables initialized empty so the cleanup trap is safe under set -u.
 tmp_api=""
 tmp_bin=""
@@ -190,8 +201,8 @@ if [ "$api_ok" -eq 1 ]; then
     else
         log "updating muzika from ${current} to ${latest_tag}"
 
-        bin_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/muzika-linux-arm64"
-        sha_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/muzika-linux-arm64.sha256"
+        bin_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/${ASSET}"
+        sha_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_tag}/${ASSET}.sha256"
 
         # Download the binary to a tempfile ON THE SAME FILESYSTEM as the
         # destination so the final mv is an atomic rename (not a cross-FS

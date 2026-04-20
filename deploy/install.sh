@@ -187,7 +187,7 @@ Next steps (do these in order):
         git tag v0.1.0
         git push --tags
 
-    Wait for the release workflow to finish (github.com/macabc/muzika/actions).
+    Wait for the release workflow to finish (github.com/ABCslime/muzikaLite/actions).
 
  4. On this Pi, start the updater timer — it pulls the new binary on the
     next tick and decrypts the env files:

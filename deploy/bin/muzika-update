@@ -27,7 +27,7 @@ if ! flock -n 9; then
     exit 0
 fi
 
-GITHUB_REPO="${GITHUB_REPO:-macabc/muzika}"
+GITHUB_REPO="${GITHUB_REPO:-ABCslime/muzikaLite}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BIN_PATH="${INSTALL_DIR}/muzika"
 VERSION_FILE="${VERSION_FILE:-/var/lib/muzika/version}"

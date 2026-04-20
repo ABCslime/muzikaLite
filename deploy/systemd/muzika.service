@@ -1,6 +1,6 @@
 [Unit]
 Description=Muzika music platform
-Documentation=https://github.com/macabc/muzika
+Documentation=https://github.com/ABCslime/muzikaLite
 After=network-online.target slskd.service
 Wants=network-online.target
 # slskd is a soft dependency (Wants on .target, After on slskd.service).

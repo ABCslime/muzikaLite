@@ -1,6 +1,6 @@
 [Unit]
 Description=Muzika auto-updater (oneshot, timer-driven)
-Documentation=https://github.com/macabc/muzika
+Documentation=https://github.com/ABCslime/muzikaLite
 After=network-online.target
 Wants=network-online.target
 

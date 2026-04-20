@@ -22,7 +22,7 @@ missing `frontend/` and skip the Node build steps automatically.
 ## Quick start (local dev)
 
 ```sh
-git clone git@github.com:macabc/muzika.git
+git clone https://github.com/ABCslime/muzikaLite.git
 cd muzika
 git config core.hooksPath .githooks        # enable .env pre-commit guard
 
@@ -52,7 +52,7 @@ GitHub Releases for new `muzika-linux-arm64` binaries every 5 min.
 ```sh
 sudo mkdir -p /srv/muzika
 sudo chown "$USER:" /srv/muzika
-git clone https://github.com/macabc/muzika.git /srv/muzika/repo
+git clone https://github.com/ABCslime/muzikaLite.git /srv/muzika/repo
 ```
 
 ### 2. Run the installer
@@ -105,7 +105,7 @@ git push --tags
 
 The `release.yml` workflow builds `muzika-linux-arm64` and publishes a
 GitHub Release. Wait for it to finish
-(<https://github.com/macabc/muzika/actions>).
+(<https://github.com/ABCslime/muzikaLite/actions>).
 
 ### 6. Enable services on the Pi
 

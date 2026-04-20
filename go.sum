@@ -1,3 +1,5 @@
+github.com/ABCslime/gosk v0.1.0 h1:VmZgCbnwPajQNxTFB3nqUIfEAX2BTvcUG07RRl9kmHA=
+github.com/ABCslime/gosk v0.1.0/go.mod h1:a+tDzYbIwn4LUyS5YEePWDdTGrva+R0m2IJw6TawSJk=
 github.com/bh90210/soul v1.1.0 h1:CciuD3r78iAlVBErvXUleloMU53dKsZeIQ9uCyfuJyI=
 github.com/bh90210/soul v1.1.0/go.mod h1:UJuvKsPhp2J9MhRwIDbULKIBu49Lok2VJNjP0N5jt4I=
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=

@@ -5,6 +5,10 @@
 *.out
 coverage.txt
 
+# go.work pins a local gosk checkout for dev; CI uses the go.mod version.
+/go.work
+/go.work.sum
+
 # IDE
 /.idea/
 /.vscode/

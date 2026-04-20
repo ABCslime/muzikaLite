@@ -112,10 +112,20 @@ func (d *OutboxDispatcher) drainOnce(ctx context.Context) error {
 		}
 		for _, r := range batch {
 			if err := d.dispatchByType(ctx, r.eventType, r.payload); err != nil {
-				d.log.Error("outbox: dispatch failed; leaving for retry",
+				// Poisoned row: an unknown event_type or an unmarshal failure
+				// will fail forever. Leaving the row here would spin the
+				// dispatcher in an infinite retry loop and block every later
+				// row behind it (SELECT ... ORDER BY id). Drop it and keep
+				// draining so healthy rows still flow.
+				//
+				// TODO: later: move to dead_letter_outbox table instead of
+				// delete so operators can inspect and replay.
+				d.log.Error("outbox: dispatch failed; dropping poisoned row",
 					"id", r.id, "type", r.eventType, "err", err)
-				// Leave the row; next pass will retry.
-				return nil
+				if _, delErr := d.db.ExecContext(ctx, `DELETE FROM outbox WHERE id = ?`, r.id); delErr != nil {
+					return fmt.Errorf("delete poisoned id=%d: %w", r.id, delErr)
+				}
+				continue
 			}
 			if _, err := d.db.ExecContext(ctx, `DELETE FROM outbox WHERE id = ?`, r.id); err != nil {
 				return fmt.Errorf("delete id=%d: %w", r.id, err)

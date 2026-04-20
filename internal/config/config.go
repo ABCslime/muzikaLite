@@ -24,11 +24,22 @@ type Config struct {
 	// Empty = no CORS headers emitted. No wildcards; list explicit origins.
 	CORSOrigins []string `envconfig:"CORS_ORIGINS"`
 
-	// "slskd" (ships day one) or "native" (gosk, not available in v1).
+	// "slskd" (ships day one) or "native" (gosk).
 	SoulseekBackend string `envconfig:"SOULSEEK_BACKEND" default:"slskd"`
 	SlskdURL        string `envconfig:"SLSKD_URL"        default:"http://slskd:5030"`
 	SlskdUsername   string `envconfig:"SLSKD_USERNAME"`
 	SlskdPassword   string `envconfig:"SLSKD_PASSWORD"`
+
+	// Native (gosk) backend — required when SOULSEEK_BACKEND=native. These
+	// are your actual Soulseek network credentials (register free at
+	// https://www.slsknet.org/). Different from SLSKD_USERNAME/PASSWORD,
+	// which are slskd's local admin credentials.
+	SoulseekUsername      string `envconfig:"SOULSEEK_USERNAME"`
+	SoulseekPassword      string `envconfig:"SOULSEEK_PASSWORD"`
+	SoulseekServerAddress string `envconfig:"SOULSEEK_SERVER_ADDRESS" default:"server.slsknet.org"`
+	SoulseekServerPort    int    `envconfig:"SOULSEEK_SERVER_PORT"    default:"2242"`
+	SoulseekListenPort    int    `envconfig:"SOULSEEK_LISTEN_PORT"    default:"2234"`
+	GoskStatePath         string `envconfig:"GOSK_STATE_PATH"         default:"/data/gosk-state.db"`
 
 	MinQueueSize        int      `envconfig:"MIN_QUEUE_SIZE"        default:"10"`
 	BandcampWorkers     int      `envconfig:"BANDCAMP_WORKERS"      default:"2"`
@@ -58,7 +69,9 @@ func (c Config) validate() error {
 			return fmt.Errorf("config: SOULSEEK_BACKEND=slskd requires SLSKD_URL, SLSKD_USERNAME, SLSKD_PASSWORD")
 		}
 	case "native":
-		// gosk not available in v1; main.go will exit with a clearer message.
+		if c.SoulseekUsername == "" || c.SoulseekPassword == "" {
+			return fmt.Errorf("config: SOULSEEK_BACKEND=native requires SOULSEEK_USERNAME, SOULSEEK_PASSWORD")
+		}
 	default:
 		return fmt.Errorf("config: unknown SOULSEEK_BACKEND %q (want slskd|native)", c.SoulseekBackend)
 	}

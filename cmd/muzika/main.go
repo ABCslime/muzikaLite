@@ -27,6 +27,8 @@ import (
 	"github.com/macabc/muzika/internal/slskd"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
+
+	"github.com/macabc/gosk"
 )
 
 func main() {
@@ -74,7 +76,11 @@ func run() error {
 	case "slskd":
 		sk = soulseek.NewSlskdClient(cfg.SlskdURL, cfg.SlskdUsername, cfg.SlskdPassword)
 	case "native":
-		return errors.New("SOULSEEK_BACKEND=native is not available in v1 (gosk unfinished); use slskd")
+		native, err := soulseek.NewNativeClient(nativeGoskConfig(cfg))
+		if err != nil {
+			return fmt.Errorf("init gosk: %w", err)
+		}
+		sk = native
 	default:
 		return fmt.Errorf("unknown SOULSEEK_BACKEND %q", cfg.SoulseekBackend)
 	}
@@ -86,8 +92,8 @@ func run() error {
 	if len(cfg.BandcampDefaultTags) > 0 {
 		defaultGenre = cfg.BandcampDefaultTags[0]
 	}
-	qSvc := queue.NewService(database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre, b, dispatcher)
-	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), b)
+	qSvc := queue.NewService(ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre, b, dispatcher)
+	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), database, b, dispatcher)
 	skSvc := slskd.NewService(database, sk, cfg.MusicStoragePath, b, dispatcher)
 
 	// ---- Start worker pools ----
@@ -182,6 +188,20 @@ func buildServer(
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+}
+
+// nativeGoskConfig translates muzika's Config into a *gosk.Config for the
+// native Soulseek backend.
+func nativeGoskConfig(cfg config.Config) *gosk.Config {
+	g := gosk.DefaultConfig()
+	g.Username = cfg.SoulseekUsername
+	g.Password = cfg.SoulseekPassword
+	g.SoulSeekAddress = cfg.SoulseekServerAddress
+	g.SoulSeekPort = cfg.SoulseekServerPort
+	g.OwnPort = cfg.SoulseekListenPort
+	g.DownloadFolder = cfg.MusicStoragePath
+	g.StatePath = cfg.GoskStatePath
+	return g
 }
 
 func newLogger(level string) *slog.Logger {

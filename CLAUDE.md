@@ -178,6 +178,15 @@ default:
 The ticker is the safety net for rows inserted by other paths (crash
 recovery on boot). Don't remove it.
 
+### Known race: LikedSong vs song deletion
+`LikedSong` delivery can fail if the `queue_songs` row is deleted before
+the event is processed (unusual skip-then-like race). The playlist
+dispatcher's insert into `playlist_songs` hits the FK and returns an error;
+with the Phase 4 poison-row handling, the outbox row is dropped. The like
+is silently lost. Acceptable for v1 — if it becomes a real problem, either
+soft-delete songs or capture the song's metadata at like-time and re-create
+the row on demand.
+
 ---
 
 ## 6. Configuration

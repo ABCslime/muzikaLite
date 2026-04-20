@@ -41,8 +41,19 @@ type SearchResult struct {
 	FilesShared int
 }
 
-// DownloadHandle is a backend-opaque identifier.
+// DownloadHandle identifies an in-flight or completed download. It carries
+// both the raw (Peer, Filename) pair the slskd daemon uses to look up the
+// transfer and a backend-opaque ID used by the native gosk backend. Backends
+// read only the field(s) they need; the other side stays zero.
+//
+// Peer+Filename are kept as distinct fields (not a single encoded string) so
+// no escaping scheme has to be invented and no separator can collide with
+// user-provided content.
 type DownloadHandle struct {
+	// slskd fields
+	Peer     string
+	Filename string
+	// native (gosk) field — opaque transfer ID
 	ID string
 }
 

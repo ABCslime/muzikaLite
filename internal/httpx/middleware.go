@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -15,7 +16,9 @@ import (
 type JWTVerifier interface {
 	// Verify validates the token string, enforces the tv claim against the
 	// current stored token_version, and returns the userID on success.
-	Verify(token string) (uuid.UUID, error)
+	// ctx is the request context; implementations use it for the DB lookup
+	// that enforces revocation.
+	Verify(ctx context.Context, token string) (uuid.UUID, error)
 }
 
 // WithAuth returns a middleware that requires a valid JWT bearer token.
@@ -28,7 +31,7 @@ func WithAuth(v JWTVerifier) func(http.Handler) http.Handler {
 				WriteError(w, http.StatusUnauthorized, "missing bearer token")
 				return
 			}
-			userID, err := v.Verify(token)
+			userID, err := v.Verify(r.Context(), token)
 			if err != nil {
 				WriteError(w, http.StatusUnauthorized, "invalid or revoked token")
 				return
@@ -44,7 +47,13 @@ func bearerToken(r *http.Request) (string, bool) {
 	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
 		return "", false
 	}
-	return strings.TrimSpace(h[len(prefix):]), true
+	tok := strings.TrimSpace(h[len(prefix):])
+	if tok == "" {
+		// "Bearer   " (prefix present, token empty/whitespace) should 401,
+		// not fall through to v.Verify with an empty string.
+		return "", false
+	}
+	return tok, true
 }
 
 // Recover catches panics in downstream handlers, logs the stack, and returns 500.

@@ -53,7 +53,11 @@ const (
 
 type RequestRandomSong struct {
 	SongID uuid.UUID `json:"song_id"` // stub ID the caller has already inserted
-	Genre  string    `json:"genre"`
+	UserID uuid.UUID `json:"user_id"` // requester — the stub row carries it too,
+	//                                   but passing it in the event lets log
+	//                                   context and future downstream workers
+	//                                   (e.g. per-user metrics) avoid a DB hit.
+	Genre string `json:"genre"`
 }
 
 type RequestSlskdSong struct {

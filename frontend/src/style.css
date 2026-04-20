@@ -1,0 +1,159 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-gray-300;
+  }
+  
+  body {
+    @apply bg-vibrant-sky text-gray-900;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+      'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Custom Scrollbar */
+  ::-webkit-scrollbar {
+    width: 12px;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-vibrant-sky;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-vibrant-pink-light rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-vibrant-pink;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  /* Pixel Art Utilities */
+  .pixel-border {
+    border: 3px solid;
+    border-image-slice: 1;
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+  }
+
+  .pixel-border-inset {
+    border: 3px solid;
+    box-shadow: 
+      inset 2px 2px 0 rgba(0, 0, 0, 0.2),
+      inset -2px -2px 0 rgba(255, 255, 255, 0.3);
+  }
+
+  .pixel-border-outset {
+    border: 3px solid;
+    box-shadow: 
+      2px 2px 0 rgba(0, 0, 0, 0.2),
+      -2px -2px 0 rgba(255, 255, 255, 0.3);
+  }
+
+  /* 80s-style scanline texture - BIG horizontal lines like CRT monitors */
+  .pixel-texture {
+    background-image: 
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 8px,
+        rgba(0, 0, 0, 0.02) 8px,
+        rgba(0, 0, 0, 0.02) 12px,
+        transparent 12px,
+        transparent 16px
+      );
+    background-size: 100% 16px;
+  }
+
+  /* For white/light backgrounds - subtle darker scanlines */
+  .pixel-texture-light {
+    background-image: 
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 8px,
+        rgba(0, 0, 0, 0.015) 8px,
+        rgba(0, 0, 0, 0.015) 12px,
+        transparent 12px,
+        transparent 16px
+      );
+    background-size: 100% 16px;
+  }
+
+  /* For vibrant colored backgrounds - lighter scanlines for depth */
+  .pixel-texture-vibrant {
+    background-image: 
+      repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 8px,
+        rgba(255, 255, 255, 0.04) 8px,
+        rgba(255, 255, 255, 0.04) 12px,
+        transparent 12px,
+        transparent 16px
+      );
+    background-size: 100% 16px;
+  }
+
+  .pixelated {
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+    /* Scale down then up for bigger pixel effect */
+    image-rendering: -webkit-optimize-contrast;
+  }
+
+  .pixel-filter {
+    filter: contrast(1.15) brightness(0.98) saturate(1.1);
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+  }
+
+  /* Blocky borders - no rounded corners */
+  .pixel-card {
+    border: 3px solid;
+    box-shadow: 
+      4px 4px 0 rgba(0, 0, 0, 0.15),
+      inset 1px 1px 0 rgba(255, 255, 255, 0.2);
+  }
+
+  .pixel-button {
+    border: 3px solid;
+    box-shadow: 
+      3px 3px 0 rgba(0, 0, 0, 0.2),
+      inset 1px 1px 0 rgba(255, 255, 255, 0.3);
+  }
+
+  .pixel-button:active {
+    box-shadow: 
+      1px 1px 0 rgba(0, 0, 0, 0.2),
+      inset 2px 2px 0 rgba(0, 0, 0, 0.1);
+    transform: translate(2px, 2px);
+  }
+
+  .border-r-3 {
+    border-right-width: 3px;
+  }
+
+  .border-t-3 {
+    border-top-width: 3px;
+  }
+
+  .border-b-3 {
+    border-bottom-width: 3px;
+  }
+}
+

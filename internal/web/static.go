@@ -1,15 +1,17 @@
 // Package web serves the embedded Vue SPA.
 //
-// The frontend is deferred to a post-backend phase. Until it lands,
-// dist/ holds a committed placeholder index.html and a .gitkeep. The
-// //go:embed all:dist directive requires at least one matching file;
-// .gitkeep satisfies that invariant and is hidden so `cp -r dist/*`
-// from a future `npm run build` step won't clobber it.
+// Source lives in the top-level `frontend/` directory. Build output is
+// staged into dist/ before `go build` so //go:embed bakes it into the
+// released binary:
 //
-// When the frontend arrives, CI's "Stage frontend dist for embed" step
-// overwrites index.html with the real Vue build output before `go build`.
-// Developers running `vite dev` on :3000 proxy /api/* to :8080 and never
-// hit the Go binary at /.
+//	cd frontend && npm ci && npm run build
+//	cp -r frontend/dist/* internal/web/dist/
+//
+// dist/ ships with a .gitkeep so the //go:embed all:dist directive
+// stays valid on a clean checkout before the frontend has been built.
+// In that state SPAHandler serves a 404 at /; /api/* still works.
+// Developers running `vite dev` on :3000 proxy /api/* to :8080 and
+// never hit the Go binary at /.
 package web
 
 import (
@@ -22,9 +24,9 @@ import (
 var distFS embed.FS
 
 // SPAHandler returns an http.Handler that serves the embedded Vue build.
-// With the committed placeholder at dist/index.html, this always has
-// something to serve; the 404 branch below is defensive cover in case
-// someone ever wipes the placeholder.
+// On a clean checkout dist/ contains only .gitkeep; in that state the
+// handler returns 404 at /. After `npm run build` + the copy step,
+// dist/index.html exists and SPA fallback is active.
 func SPAHandler() http.Handler {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
@@ -37,7 +39,7 @@ func SPAHandler() http.Handler {
 	fileServer := http.FileServer(http.FS(sub))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Defensive: 404 if someone wiped the placeholder.
+		// Clean checkout or dev env where the frontend hasn't been built.
 		if _, err := fs.Stat(sub, "index.html"); err != nil {
 			http.NotFound(w, r)
 			return

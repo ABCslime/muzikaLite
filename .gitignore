@@ -20,14 +20,12 @@ coverage.txt
 /data/
 /deploy/data/
 
-# Frontend build artifacts. The committed placeholder index.html keeps
-# //go:embed internal/web/dist/* happy until the real Vue SPA lands in
-# a later phase. The CI `Stage frontend dist for embed` step overwrites
-# index.html with the real build output (`cp -r frontend/dist/*`) when
-# frontend/ exists; .gitkeep is hidden so `cp -r dist/*` leaves it alone.
+# Frontend build artifacts. CI (or a local `npm run build` + copy step)
+# stages built assets into internal/web/dist/ before `go build` so
+# //go:embed bakes them into the binary. Only .gitkeep is tracked; the
+# real dist payload is regenerated from frontend/ sources, not committed.
 /internal/web/dist/*
 !/internal/web/dist/.gitkeep
-!/internal/web/dist/index.html
 /frontend/dist/
 /frontend/node_modules/
 

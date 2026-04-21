@@ -406,6 +406,18 @@ const availabilityTimeout = 20 * time.Second
 // holdouts without adding real pressure.
 const artistFallbackConcurrency = 2
 
+// artistFallbackMaxProbes caps the TOTAL number of per-title probes
+// a single fallback pass may fire, regardless of how many titles
+// went unresolved in the broad phase. A thin-broad artist can have
+// 20+ misses; probing all of them at concurrency 2 with 2 s per
+// probe takes 20+ s, which overruns the handler deadline and
+// leaves every row showing "Not found" to the UI. Capping at 5
+// lets us rescue the most-likely winners (first misses seen,
+// which correlate with the start of the Discogs release list —
+// usually the more popular titles) while staying inside the
+// 15 s deadline.
+const artistFallbackMaxProbes = 5
+
 // artistThinBroadThreshold is the "broad was healthy" heuristic.
 // If an artist search returned more than this many filenames, we
 // trust the coverage — titles that didn't surface in that sample
@@ -413,6 +425,37 @@ const artistFallbackConcurrency = 2
 // probes would just waste gosk time. Below the threshold the
 // per-title fallback runs on unresolved titles.
 const artistThinBroadThreshold = 50
+
+// searchGate caps concurrent gosk.Search calls across ALL
+// availability endpoints and goroutines, process-wide. gosk /
+// soul's session gets increasingly slow once many searches are
+// in flight against it; past empirical testing showed that 5+
+// simultaneous searches started wedging the session to the
+// point where subsequent requests got 0 results even for
+// popular artists. 4 is the empirical ceiling for consistent
+// recall across artist + label navigation.
+//
+// Package-level (not per-Previewer) on purpose: this is a shared
+// limit on gosk's resource, not on any logical preview
+// subsystem. A background worker that grows to call gosk.Search
+// in the future should route through gatedSearch too.
+var searchGate = make(chan struct{}, 4)
+
+// gatedSearch acquires a slot on searchGate before calling
+// p.soulseek.Search, releasing it on return. Respects ctx: if
+// the gate is full and ctx cancels while we wait, returns
+// ctx.Err() without touching gosk. Callers already handle errors
+// as "not available" so a gated-out probe looks the same as a
+// zero-peer probe to the UI.
+func (p *Previewer) gatedSearch(ctx context.Context, query string, window time.Duration) ([]soulseek.SearchResult, error) {
+	select {
+	case searchGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-searchGate }()
+	return p.soulseek.Search(ctx, query, window)
+}
 
 // CheckAvailability probes Soulseek for every item in `items` in
 // parallel (capped at availabilityConcurrency) and returns results
@@ -480,7 +523,7 @@ func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQ
 			}
 			done := make(chan out, 1)
 			go func() {
-				res, err := p.soulseek.Search(ctx, q, availabilityProbeWindow)
+				res, err := p.gatedSearch(ctx, q, availabilityProbeWindow)
 				done <- out{res, err}
 			}()
 			select {
@@ -567,13 +610,19 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 	// Cache-first path: re-navigating to the same artist within the
 	// TTL window returns in microseconds, and keeps gosk's session
 	// from accumulating stress that degrades later searches.
+	//
+	// Critical: we DO NOT re-run the fallback here. The miss path
+	// runs fallback once on cache-miss; subsequent cache hits must
+	// reuse the same cached broad plus its fallback-accumulated
+	// results, not fire another 5 gosk.Search calls per visit.
+	// Per-visit fallback firing was causing gosk stress to snowball
+	// across a browsing session — every re-navigation added 5 more
+	// in-flight searches that gosk couldn't drain, until the whole
+	// session went to 0 results.
 	if broad, ok := p.broadCacheGet(artist); ok {
 		p.log.Debug("by-artist availability cache hit",
 			"artist", artist, "broad_count", len(broad))
 		p.applyBroad(broad, titles, results)
-		if len(broad) < artistThinBroadThreshold {
-			p.runPerTitleFallback(ctx, artist, titles, results)
-		}
 		return results, nil
 	}
 	p.log.Debug("by-artist availability cache miss",
@@ -592,7 +641,7 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 	}
 	done := make(chan searchOutcome, 1)
 	go func() {
-		res, err := p.soulseek.Search(ctx, artist, artistBroadWindow)
+		res, err := p.gatedSearch(ctx, artist, artistBroadWindow)
 		done <- searchOutcome{res, err}
 	}()
 
@@ -651,6 +700,7 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 func (p *Previewer) runPerTitleFallback(ctx context.Context, artist string, titles []string, results []AvailabilityResult) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, artistFallbackConcurrency)
+	probed := 0
 	for i, title := range titles {
 		if results[i].Available {
 			continue
@@ -662,6 +712,13 @@ func (p *Previewer) runPerTitleFallback(ctx context.Context, artist string, titl
 		if len(variants) == 0 {
 			continue
 		}
+		// Budget cap — leaves later misses as Not Found rather
+		// than overrunning the handler deadline. See
+		// artistFallbackMaxProbes.
+		if probed >= artistFallbackMaxProbes {
+			break
+		}
+		probed++
 		// Acquire a fallback slot. The select form matters: if sem
 		// is saturated and ctx has already fired, we bail instead
 		// of blocking the for-loop past the handler deadline.
@@ -687,7 +744,7 @@ func (p *Previewer) runPerTitleFallback(ctx context.Context, artist string, titl
 			}
 			done := make(chan out, 1)
 			go func() {
-				res, err := p.soulseek.Search(ctx, query, availabilityProbeWindow)
+				res, err := p.gatedSearch(ctx, query, availabilityProbeWindow)
 				done <- out{res, err}
 			}()
 			select {

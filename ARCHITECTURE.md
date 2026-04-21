@@ -226,10 +226,12 @@ func Publish[T any](b *Bus, ctx context.Context, event T) error {
 | `liked`                | `LikedSongEvent`       | `queue`       | `playlist` (1)                                      |
 | `unliked`              | `UnlikedSongEvent`     | `queue`       | `playlist` (1)                                      |
 | `loaded-song`          | `LoadedSongEvent`      | `download`    | `queue` (1)                                         |
-| `request-random-song`  | `RequestRandomSongEvent` | `queue` (refiller) | `bandcamp` (cfg `BANDCAMP_WORKERS`, default 2) |
+| `discovery-intent`     | `DiscoveryIntent`        | `queue` (refiller) | `bandcamp` (cfg `BANDCAMP_WORKERS`, default 2) — filters on `Strategy` (§4 note) |
 | `request-download`     | `RequestDownloadEvent`   | `bandcamp` | `download` (cfg `DOWNLOAD_WORKERS`, default 2), `queue` (1, for metadata update) |
 
 The two-subscriber case on `RequestDownloadEvent` (was `RequestSlskdSongEvent` before v0.3.0) works correctly: each of `download` and `queue` gets its own channel with its own backlog.
+
+**v0.4 rename — `RequestRandomSong` → `DiscoveryIntent`.** The refiller's request event was widened into `DiscoveryIntent { Strategy, Genre, Query, SeedSongID, SeedPlaylistID, PreferredSources }`. One event type now carries every discovery path — passive refill (`Strategy=random`), user-typed search (`Strategy=search`, v0.4 PR 3), similarity (`Strategy=similar_song` / `similar_playlist`, reserved for v0.5). Seeders subscribe once to `DiscoveryIntent` and filter on `Strategy` — bandcamp handles only `random` today. Outbox backward-compat: `dispatchByType` accepts legacy `TypeRequestRandomSong` rows and republishes them as `DiscoveryIntent{Strategy: StrategyRandom}`.
 
 ### Transactional outbox
 
@@ -247,8 +249,8 @@ State-change events must **never** be silently dropped. The outbox pattern guara
 - `LoadedSongEvent`
 
 **Events published directly** (regenerable, no outbox):
-- `RequestRandomSongEvent` — if lost, the next refiller call re-emits.
-- `RequestDownloadEvent` — if lost, the Bandcamp worker gets the same `RequestRandomSong` again next time the queue is short. (Was `RequestSlskdSongEvent` before v0.3.0.)
+- `DiscoveryIntent` — if lost, the next refiller call re-emits.
+- `RequestDownloadEvent` — if lost, the Bandcamp worker gets the same `DiscoveryIntent` again next time the queue is short. (Was `RequestSlskdSongEvent` before v0.3.0; the upstream request was `RequestRandomSong` before v0.4.)
 
 ### Outbox table
 
@@ -709,7 +711,7 @@ at startup. The pre-v0.3.0 `/etc/muzika/slskd.yml` file and its
 On-demand only. No background ticker. Matches old QueueManager behavior:
 - Every HTTP handler that removes from the queue (`/queue/skipped`, `/queue/finished`) calls `refiller.Trigger(userID)` fire-and-forget.
 - `GET /api/queue` also calls `refiller.Trigger(userID)` on its way out.
-- `refiller.Trigger` computes how short the queue is vs. `MIN_QUEUE_SIZE` and publishes that many `RequestRandomSongEvent`s.
+- `refiller.Trigger` computes how short the queue is vs. `MIN_QUEUE_SIZE` and publishes that many `DiscoveryIntent` events (`Strategy=StrategyRandom`).
 
 No ticker goroutine — if the user isn't interacting, the queue sits. Same as before. Future: if we ever want background refill, it's a single ticker goroutine added to `queue.service`. Out of scope for v2.
 
@@ -991,7 +993,7 @@ flowchart LR
             Outbox -- polls --> SQLite
             Outbox -- "Publish state-change" --> Bus
 
-            Queue -- "Publish RequestRandomSong" --> Bus
+            Queue -- "Publish DiscoveryIntent" --> Bus
             Bandcamp -- "Publish RequestDownload" --> Bus
 
             Bus -- per-subscriber chan --> Playlist

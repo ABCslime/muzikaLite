@@ -129,8 +129,8 @@ func (s *Service) OnRequestDownload(ctx context.Context, ev bus.RequestDownload)
 
 func (s *Service) onUserCreated(ctx context.Context, ev bus.UserCreated) error {
 	// Seed the user's queue by triggering the refiller: it inserts stubs and
-	// publishes RequestRandomSong events. The rest of the fan-out (Bandcamp
-	// search → download worker → LoadedSong → onLoadedSong) completes async.
+	// publishes DiscoveryIntent events. The rest of the fan-out (seeder →
+	// download worker → LoadedSong → onLoadedSong) completes async.
 	s.refiller.Trigger(ctx, ev.UserID)
 	return nil
 }

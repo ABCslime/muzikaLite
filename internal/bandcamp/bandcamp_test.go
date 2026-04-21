@@ -109,7 +109,7 @@ func TestSearch_ServerError(t *testing.T) {
 }
 
 // TestWorker_PublishesRequestDownload drives the full worker contract:
-// RequestRandomSong → bandcamp search → RequestDownload with the same SongID.
+// DiscoveryIntent{StrategyRandom} → bandcamp search → RequestDownload with the same SongID.
 func TestWorker_PublishesRequestDownload(t *testing.T) {
 	srv := httptest.NewServer(fakeDiscover(t, []bandcamp.DiscoverItem{
 		{Title: "Hit", BandName: "Band"},
@@ -126,8 +126,10 @@ func TestWorker_PublishesRequestDownload(t *testing.T) {
 	outCh := bus.Subscribe[bus.RequestDownload](b, "test/request-download")
 
 	stubID := uuid.New()
-	if err := svc.OnRequestRandomSong(context.Background(), bus.RequestRandomSong{
-		SongID: stubID, Genre: "electronic",
+	if err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
+		SongID:   stubID,
+		Strategy: bus.StrategyRandom,
+		Genre:    "electronic",
 	}); err != nil {
 		t.Fatalf("handler: %v", err)
 	}
@@ -157,8 +159,10 @@ func TestWorker_NoResultsIsNoop(t *testing.T) {
 
 	outCh := bus.Subscribe[bus.RequestDownload](b, "test/noop")
 
-	err := svc.OnRequestRandomSong(context.Background(), bus.RequestRandomSong{
-		SongID: uuid.New(), Genre: "electronic",
+	err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
+		SongID:   uuid.New(),
+		Strategy: bus.StrategyRandom,
+		Genre:    "electronic",
 	})
 	if err != nil {
 		t.Fatalf("handler: %v", err)
@@ -167,6 +171,46 @@ func TestWorker_NoResultsIsNoop(t *testing.T) {
 	select {
 	case ev := <-outCh:
 		t.Errorf("unexpected publish: %+v", ev)
+	case <-time.After(150 * time.Millisecond):
+		// expected — no publish
+	}
+}
+
+// TestWorker_IgnoresOtherStrategies verifies the seeder's Strategy filter:
+// DiscoveryIntents with strategies bandcamp doesn't handle must be silently
+// dropped — another seeder (e.g. the future Discogs worker or v0.5 similarity
+// engine) will pick them up from the shared channel.
+func TestWorker_IgnoresOtherStrategies(t *testing.T) {
+	srv := httptest.NewServer(fakeDiscover(t, []bandcamp.DiscoverItem{
+		{Title: "Hit", BandName: "Band"},
+	}, nil))
+	defer srv.Close()
+
+	client := bandcamp.NewClient(srv.URL, []string{"electronic"}, bandcamp.WithRand(fixedRand()))
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+	svc := bandcamp.NewService(client, nil, b, nil)
+
+	outCh := bus.Subscribe[bus.RequestDownload](b, "test/ignored")
+
+	for _, strat := range []bus.Strategy{
+		bus.StrategyGenre,
+		bus.StrategySearch,
+		bus.StrategySimilarSong,
+		bus.StrategySimilarPlaylist,
+	} {
+		if err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
+			SongID:   uuid.New(),
+			Strategy: strat,
+			Genre:    "electronic",
+		}); err != nil {
+			t.Fatalf("handler (%s): %v", strat, err)
+		}
+	}
+
+	select {
+	case ev := <-outCh:
+		t.Errorf("unexpected publish for non-random strategy: %+v", ev)
 	case <-time.After(150 * time.Millisecond):
 		// expected — no publish
 	}

@@ -11,8 +11,9 @@ import (
 )
 
 // Refiller keeps each user's queue topped up to minQueueSize by publishing
-// RequestRandomSong events when the queue is short. On-demand only — callers
-// invoke Trigger after queue-mutating HTTP handlers; no background ticker.
+// DiscoveryIntent events (Strategy=StrategyRandom) when the queue is short.
+// On-demand only — callers invoke Trigger after queue-mutating HTTP handlers;
+// no background ticker.
 type Refiller struct {
 	repo         *Repo
 	bus          *bus.Bus
@@ -39,7 +40,8 @@ func NewRefiller(
 }
 
 // Trigger counts the user's queue and, if short, inserts song stubs and
-// publishes RequestRandomSong events. Fire-and-forget; errors are logged.
+// publishes DiscoveryIntent events (Strategy=StrategyRandom). Fire-and-forget;
+// errors are logged.
 func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 	count, err := r.repo.CountEntries(ctx, userID)
 	if err != nil {
@@ -59,10 +61,11 @@ func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 			r.log.Error("refiller: insert stub", "err", err, "user_id", userID)
 			continue
 		}
-		ev := bus.RequestRandomSong{
-			SongID: stubID,
-			UserID: userID,
-			Genre:  r.defaultGenre,
+		ev := bus.DiscoveryIntent{
+			SongID:   stubID,
+			UserID:   userID,
+			Strategy: bus.StrategyRandom,
+			Genre:    r.defaultGenre,
 		}
 		// Request events publish directly with a short timeout — if the
 		// subscriber channel is full, the refiller will re-observe the short

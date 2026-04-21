@@ -1,6 +1,7 @@
 // Package bandcamp scrapes Bandcamp's discover endpoint to populate the song
-// catalog when the queue runs low. Consumes RequestRandomSong, produces
-// RequestDownload. Genre is honored (replaces the old hardcoded "hisa").
+// catalog when the queue runs low. Consumes DiscoveryIntent (StrategyRandom
+// only, see worker.go), produces RequestDownload. Genre is honored (replaces
+// the old hardcoded "hisa").
 package bandcamp
 
 import (
@@ -43,7 +44,7 @@ func WithRand(r *rand.Rand) Option {
 }
 
 // NewClient constructs a Client. If baseURL is empty, bandcamp.com is used.
-// defaultTags is the fallback when an incoming RequestRandomSong.Genre is empty.
+// defaultTags is the fallback when an incoming DiscoveryIntent.Genre is empty.
 func NewClient(baseURL string, defaultTags []string, opts ...Option) *Client {
 	if baseURL == "" {
 		baseURL = defaultBaseURL

@@ -62,14 +62,14 @@ func newService(t *testing.T) (*queue.Service, *sql.DB, string) {
 }
 
 // TestRefiller_InsertsStubsAndPublishes verifies that an empty queue triggers
-// exactly minSize stub inserts and RequestRandomSong publishes.
+// exactly minSize stub inserts and DiscoveryIntent publishes.
 func TestRefiller_InsertsStubsAndPublishes(t *testing.T) {
 	svc, d, _ := newService(t)
 	uid := seedUser(t, d)
 	ctx := context.Background()
 
 	// Subscribe BEFORE triggering so we observe the publishes.
-	ch := bus.Subscribe[bus.RequestRandomSong](busFromService(svc), "test/request-random")
+	ch := bus.Subscribe[bus.DiscoveryIntent](busFromService(svc), "test/discovery-intent")
 
 	svc.Refiller().Trigger(ctx, uid)
 
@@ -79,8 +79,14 @@ func TestRefiller_InsertsStubsAndPublishes(t *testing.T) {
 		t.Errorf("got %d published events, want %d", len(got), minSize)
 	}
 	for _, ev := range got {
+		if ev.Strategy != bus.StrategyRandom {
+			t.Errorf("event strategy %q, want %q", ev.Strategy, bus.StrategyRandom)
+		}
 		if ev.Genre != defaultGenre {
 			t.Errorf("event genre %q, want %q", ev.Genre, defaultGenre)
+		}
+		if ev.UserID != uid {
+			t.Errorf("event user_id %v, want %v", ev.UserID, uid)
 		}
 	}
 
@@ -111,7 +117,7 @@ func TestRefiller_NoOpWhenQueueFull(t *testing.T) {
 		}
 	}
 
-	ch := bus.Subscribe[bus.RequestRandomSong](busFromService(svc), "test/no-op")
+	ch := bus.Subscribe[bus.DiscoveryIntent](busFromService(svc), "test/no-op")
 	svc.Refiller().Trigger(ctx, uid)
 
 	got := drain(ch, 1, 150*time.Millisecond)

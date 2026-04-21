@@ -14,8 +14,14 @@ import (
 	"github.com/macabc/muzika/internal/db"
 )
 
-// Service consumes RequestRandomSong events, asks the Client for a song
+// Service consumes DiscoveryIntent events, asks the Client for a song
 // matching the requested genre, and publishes RequestDownload events.
+//
+// Strategy filter: the bandcamp seeder handles StrategyRandom only. Other
+// strategies (StrategyGenre, StrategySearch, StrategySimilarSong, ...) are
+// ignored — a future seeder subscribes to the same DiscoveryIntent channel
+// and handles those. This is the "seeders filter on Strategy" contract from
+// ROADMAP v0.4.
 //
 // On ErrNoResults (bandcamp returned no items for the tag) we emit a
 // LoadedSong{Status: Error} via the outbox. queue's onLoadedSong handler
@@ -44,18 +50,24 @@ func NewService(c *Client, sqlDB *sql.DB, b *bus.Bus, d *bus.OutboxDispatcher) *
 	}
 }
 
-// StartWorkers subscribes to RequestRandomSong with `workers` goroutines.
+// StartWorkers subscribes to DiscoveryIntent with `workers` goroutines.
 func (s *Service) StartWorkers(ctx context.Context, workers int) {
-	ch := bus.Subscribe[bus.RequestRandomSong](s.bus, "bandcamp/request-random-song")
-	bus.RunPool(ctx, s.bus, "bandcamp/request-random-song", workers, ch, s.onRequestRandomSong)
+	ch := bus.Subscribe[bus.DiscoveryIntent](s.bus, "bandcamp/discovery-intent")
+	bus.RunPool(ctx, s.bus, "bandcamp/discovery-intent", workers, ch, s.onDiscoveryIntent)
 }
 
-// OnRequestRandomSong is exported for tests.
-func (s *Service) OnRequestRandomSong(ctx context.Context, ev bus.RequestRandomSong) error {
-	return s.onRequestRandomSong(ctx, ev)
+// OnDiscoveryIntent is exported for tests.
+func (s *Service) OnDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent) error {
+	return s.onDiscoveryIntent(ctx, ev)
 }
 
-func (s *Service) onRequestRandomSong(ctx context.Context, ev bus.RequestRandomSong) error {
+func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent) error {
+	// Bandcamp only serves the random-refill strategy today. Ignore everything
+	// else silently — another seeder subscribed to the same channel will
+	// handle it. No error: the event isn't for us, it's not a failure.
+	if ev.Strategy != bus.StrategyRandom {
+		return nil
+	}
 	result, err := s.client.Search(ctx, ev.Genre)
 	if err != nil {
 		if errors.Is(err, ErrNoResults) {

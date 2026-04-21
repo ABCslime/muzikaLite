@@ -141,6 +141,14 @@ type outboxRow struct {
 }
 
 // dispatchByType deserializes and Publishes. Keep this switch in sync with events.go.
+//
+// TypeRequestRandomSong is kept as a backward-compat case for pre-v0.4 rows.
+// Request events were never routed through the outbox by design (see bus.go),
+// but any straggler row — from an ad-hoc insert or a pre-v0.4 experimental
+// path — would otherwise be treated as an unknown type and dropped as poison.
+// The legacy payload shape ({song_id, user_id, genre}) unmarshals cleanly
+// into DiscoveryIntent; we backfill Strategy=StrategyRandom before
+// republishing so downstream subscribers can filter uniformly.
 func (d *OutboxDispatcher) dispatchByType(ctx context.Context, evType string, payload []byte) error {
 	switch evType {
 	case TypeUserCreated:
@@ -153,9 +161,28 @@ func (d *OutboxDispatcher) dispatchByType(ctx context.Context, evType string, pa
 		return unmarshalAndPublish[UnlikedSong](ctx, d.bus, payload)
 	case TypeLoadedSong:
 		return unmarshalAndPublish[LoadedSong](ctx, d.bus, payload)
+	case TypeDiscoveryIntent:
+		return unmarshalAndPublish[DiscoveryIntent](ctx, d.bus, payload)
+	case TypeRequestRandomSong:
+		return unmarshalLegacyDiscoveryIntent(ctx, d.bus, payload)
 	default:
 		return fmt.Errorf("unknown event type: %s", evType)
 	}
+}
+
+// unmarshalLegacyDiscoveryIntent decodes a pre-v0.4 RequestRandomSong payload
+// into a DiscoveryIntent and publishes it with Strategy=StrategyRandom.
+// The legacy payload's JSON keys (song_id, user_id, genre) match the new
+// struct's JSON tags exactly; only the discriminator name differs.
+func unmarshalLegacyDiscoveryIntent(ctx context.Context, b *Bus, payload []byte) error {
+	var ev DiscoveryIntent
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return fmt.Errorf("unmarshal legacy RequestRandomSong: %w", err)
+	}
+	if ev.Strategy == "" {
+		ev.Strategy = StrategyRandom
+	}
+	return Publish(ctx, b, ev, PublishOpts{})
 }
 
 func unmarshalAndPublish[T any](ctx context.Context, b *Bus, payload []byte) error {

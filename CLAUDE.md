@@ -147,9 +147,12 @@ always add a new one.
   the row in the **same transaction** as the state mutation, then call
   `dispatcher.Wake()` after commit. This is the at-least-once contract;
   subscribers MUST be idempotent.
-- **Request events** (`RequestRandomSong`, `RequestDownload`) are
+- **Request events** (`DiscoveryIntent`, `RequestDownload`) are
   published directly with `bus.Publish`. If lost on process crash, the
   refiller regenerates them on the next short-queue observation.
+  (`DiscoveryIntent` replaced `RequestRandomSong` in v0.4; the outbox
+  dispatcher keeps a backward-compat case for legacy rows — see
+  `internal/bus/outbox.go`.)
 
 ### When you add a new event type
 1. Add the struct in `internal/bus/events.go`.

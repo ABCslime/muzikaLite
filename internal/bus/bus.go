@@ -2,7 +2,7 @@
 //
 // Two delivery modes:
 //   - State-change events go through the transactional outbox (see outbox.go).
-//   - Request events (RequestRandomSong, RequestDownload) are Published directly.
+//   - Request events (DiscoveryIntent, RequestDownload) are Published directly.
 //
 // Fan-out model: each call to Subscribe[T] returns a fresh channel. Publish[T]
 // iterates all subscribers and sends to each. Two consumers on the same event

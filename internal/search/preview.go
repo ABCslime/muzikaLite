@@ -70,11 +70,40 @@ type Preview struct {
 // v0.4.2 PR D: now also holds a soulseek.Client for the bulk
 // availability-probe path. Kept optional — nil is tolerated and the
 // availability endpoint returns ErrSoulseekDisabled.
+//
+// v0.4.2 PR E (post-QA): also holds a short-TTL cache of broad
+// artist-search results. Re-navigating to the same artist within
+// the cache window skips Soulseek entirely — typical user pattern
+// "artist → album → back to artist" is now instant instead of
+// paying another 10 s broad search.
 type Previewer struct {
 	client   *discogs.Client
 	soulseek soulseek.Client
 	log      *slog.Logger
+
+	broadCache   map[string]broadCacheEntry
+	broadCacheMu sync.Mutex
 }
+
+// broadCacheEntry is one artist's cached Soulseek broad-search
+// results. Results are the raw SearchResults; callers filter them
+// against title variants. Entries expire at ExpiresAt.
+type broadCacheEntry struct {
+	results   []soulseek.SearchResult
+	expiresAt time.Time
+}
+
+// broadCacheTTL is how long a cached broad-search result stays
+// fresh. 60 s is long enough for the typical "artist → album →
+// back" round trip but short enough that peer availability
+// updates propagate within a minute of a refresh.
+const broadCacheTTL = 60 * time.Second
+
+// broadCacheMaxEntries caps the cache to bound memory. 64 artists
+// is plenty for interactive browsing; once hit, the whole cache
+// is pruned of expired entries, which in steady-state keeps it
+// well under the limit.
+const broadCacheMaxEntries = 64
 
 // NewPreviewer constructs a Previewer. A nil *discogs.Client is valid —
 // Preview returns (Preview{}, ErrDiscogsDisabled) so the handler can map
@@ -82,8 +111,9 @@ type Previewer struct {
 // for the v0.4.2 PR D availability-probe endpoint.
 func NewPreviewer(c *discogs.Client) *Previewer {
 	return &Previewer{
-		client: c,
-		log:    slog.Default().With("mod", "search"),
+		client:     c,
+		log:        slog.Default().With("mod", "search"),
+		broadCache: make(map[string]broadCacheEntry),
 	}
 }
 
@@ -525,6 +555,18 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		return results, nil
 	}
 
+	// Cache-first path: re-navigating to the same artist within the
+	// TTL window returns in microseconds, and keeps gosk's session
+	// from accumulating stress that degrades later searches.
+	if broad, ok := p.broadCacheGet(artist); ok {
+		p.log.Debug("by-artist availability cache hit",
+			"artist", artist, "broad_count", len(broad))
+		p.applyBroad(broad, titles, results)
+		return results, nil
+	}
+	p.log.Debug("by-artist availability cache miss",
+		"artist", artist)
+
 	// Overall timeout so a wedged gosk doesn't leave the HTTP
 	// request hanging forever — a partial answer is more useful
 	// than no answer. Just over artistBroadWindow to absorb a small
@@ -569,6 +611,20 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		return results, nil
 	}
 
+	// Cache the raw broad results; the per-title filter is cheap
+	// and callers' title lists vary across pages (artist detail
+	// shows all releases; album page asks about one title).
+	p.broadCachePut(artist, broad)
+	p.log.Debug("by-artist availability cache put",
+		"artist", artist, "broad_count", len(broad))
+	p.applyBroad(broad, titles, results)
+	return results, nil
+}
+
+// applyBroad fills `results` in place: for each title, count how
+// many filenames in `broad` match any of its variants. Extracted
+// so the cache-hit and cache-miss paths share one loop body.
+func (p *Previewer) applyBroad(broad []soulseek.SearchResult, titles []string, results []AvailabilityResult) {
 	for i, title := range titles {
 		variants := filematch.TitleVariants(title)
 		if len(variants) == 0 {
@@ -584,7 +640,53 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 			results[i] = AvailabilityResult{Available: true, PeerCount: count}
 		}
 	}
-	return results, nil
+}
+
+// broadCacheGet returns the cached broad-search results for `artist`
+// (case-insensitive) if the entry is still fresh; otherwise false.
+func (p *Previewer) broadCacheGet(artist string) ([]soulseek.SearchResult, bool) {
+	key := strings.ToLower(artist)
+	p.broadCacheMu.Lock()
+	defer p.broadCacheMu.Unlock()
+	entry, ok := p.broadCache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(p.broadCache, key)
+		return nil, false
+	}
+	return entry.results, true
+}
+
+// broadCachePut stores `results` under `artist` (case-insensitive)
+// with a TTL. Evicts expired entries when the cache hits the size
+// cap — simple pass, fine at 64 entries; a real LRU would be
+// overkill for browsing-scale traffic.
+func (p *Previewer) broadCachePut(artist string, results []soulseek.SearchResult) {
+	key := strings.ToLower(artist)
+	p.broadCacheMu.Lock()
+	defer p.broadCacheMu.Unlock()
+	if len(p.broadCache) >= broadCacheMaxEntries {
+		now := time.Now()
+		for k, e := range p.broadCache {
+			if now.After(e.expiresAt) {
+				delete(p.broadCache, k)
+			}
+		}
+		// If all entries are still fresh, drop the newest entry's
+		// neighbor to make room; we don't track access time.
+		if len(p.broadCache) >= broadCacheMaxEntries {
+			for k := range p.broadCache {
+				delete(p.broadCache, k)
+				break
+			}
+		}
+	}
+	p.broadCache[key] = broadCacheEntry{
+		results:   results,
+		expiresAt: time.Now().Add(broadCacheTTL),
+	}
 }
 
 // filterFilenamesByTitle is the search-package twin of

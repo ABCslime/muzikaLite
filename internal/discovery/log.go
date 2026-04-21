@@ -45,6 +45,13 @@ const (
 	StageGate   Stage = "gate"
 	StagePicked Stage = "picked"
 	StageFailed Stage = "failed"
+
+	// StageProbe is the v0.4.1 PR B availability-probe outcome —
+	// "did Soulseek have any peer for this query within probeWindow?"
+	// One row per StrategySearch RequestDownload. Lets analytics answer
+	// "% of Discogs picks not on Soulseek" — the Discogs-vs-Soulseek
+	// catalog drift question the ROADMAP asks us to track.
+	StageProbe Stage = "probe"
 )
 
 // Outcome summarizes what happened at this stage.

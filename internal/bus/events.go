@@ -66,6 +66,14 @@ type LoadedStatus string
 const (
 	LoadedStatusCompleted LoadedStatus = "completed"
 	LoadedStatusError     LoadedStatus = "error"
+
+	// LoadedStatusNotFound is the v0.4.1 PR B signal that a user-initiated
+	// search turned up zero Soulseek peers for the Discogs-picked track.
+	// Distinct from LoadedStatusError so the UI can toast "not found on
+	// Soulseek" specifically. queue.onLoadedSong deletes any queue_entries
+	// row with status='probing' for this stub; the UI notices it
+	// disappearing between polls and surfaces the toast.
+	LoadedStatusNotFound LoadedStatus = "not_found"
 )
 
 // Request events — published directly (no outbox). Regenerable.

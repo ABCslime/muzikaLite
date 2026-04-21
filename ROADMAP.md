@@ -136,9 +136,9 @@ stylistic + observability fixes. Every in-scope item below is live.
 Each PR is reviewed and merged before the next is prompted to
 Claude Code. No skipping.
 
-### v0.4.1 — Genre preferences + search availability probe
+### v0.4.1 — Shipped (genre preferences + search availability probe)
 
-Layered on v0.4. Two orthogonal features, two PRs.
+Two PRs landed on `main`. Both features are live.
 
 **PR 4.1.A — Genre preferences**
 

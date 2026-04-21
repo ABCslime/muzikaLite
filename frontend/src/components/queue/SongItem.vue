@@ -1,6 +1,13 @@
 <template>
   <div
-    class="flex items-center space-x-4 px-4 py-2 pixel-texture bg-pinkish-white hover:bg-pinkish-white-hover group cursor-pointer transition-colors"
+    class="flex items-center space-x-4 px-4 py-2 pixel-texture group transition-colors"
+    :class="[
+      isProbing
+        ? 'bg-blue-50 cursor-wait'
+        : isNotFound
+          ? 'bg-amber-50 cursor-not-allowed'
+          : 'bg-pinkish-white hover:bg-pinkish-white-hover cursor-pointer',
+    ]"
     @click="handlePlay"
   >
     <div class="w-10 h-10 bg-vibrant-pink-light pixel-border border-vibrant-pink flex items-center justify-center flex-shrink-0 relative overflow-hidden">
@@ -50,6 +57,23 @@
         {{ songTitle }}
       </p>
       <p class="text-gray-600 text-xs truncate">{{ songArtist }}</p>
+      <!-- v0.4.1 PR B — search availability status pill -->
+      <p
+        v-if="isProbing"
+        class="text-blue-700 text-xs italic flex items-center space-x-1 mt-1"
+      >
+        <svg class="w-3 h-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+        </svg>
+        <span>Checking Soulseek availability…</span>
+      </p>
+      <p
+        v-else-if="isNotFound"
+        class="text-amber-700 text-xs italic mt-1"
+      >
+        Not found on Soulseek.
+      </p>
     </div>
 
     <div class="flex items-center space-x-4">
@@ -122,6 +146,17 @@ const isPlaying = computed(() => {
   )
 })
 
+// v0.4.1 PR B — search availability.
+// 'probing' — seeder has metadata; worker hasn't confirmed peers. Spinner,
+//             disabled play.
+// 'not_found' — probe turned up zero peers on Soulseek. User sees the
+//               reason explicitly; dismisses via the "add to playlist +"
+//               adjacent remove button (in QueueView actions) or implicit
+//               queue flush.
+// Default (or 'ready') — playable.
+const isProbing = computed(() => props.song?.status === 'probing')
+const isNotFound = computed(() => props.song?.status === 'not_found')
+
 const songTitle = computed(() => getSongTitle(props.song))
 const songArtist = computed(() => getSongArtist(props.song))
 
@@ -156,6 +191,17 @@ const handleImageError = (event) => {
 }
 
 const handlePlay = () => {
+  // v0.4.1 PR B — don't try to stream a probing or not-found entry.
+  // The stream endpoint would 404, but catching it client-side avoids
+  // the network round-trip and lets the UI show a clearer message.
+  if (isProbing.value) {
+    queueStore.error = 'Still checking availability — hold on.'
+    return
+  }
+  if (isNotFound.value) {
+    queueStore.error = 'This track is not available on Soulseek.'
+    return
+  }
   if (isPlaying.value) {
     playerStore.togglePlay()
   } else {

@@ -481,6 +481,156 @@ func TestOnLoadedSong_NotRelaxedForPassivePath(t *testing.T) {
 	}
 }
 
+// TestOnRequestDownload_SearchIntentInsertsProbingEntry: v0.4.1 PR B. A
+// RequestDownload carrying Strategy=StrategySearch inserts a queue_entries
+// row with status='probing' for the requester. Passive refill intents
+// (StrategyRandom) do NOT insert an entry here — that happens later in
+// onLoadedSong.
+func TestOnRequestDownload_SearchIntentInsertsProbingEntry(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, requesting_user_id) VALUES (?, ?)`,
+		sid.String(), uid.String()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err := svc.OnRequestDownload(ctx, bus.RequestDownload{
+		SongID: sid, Title: "A Title", Artist: "An Artist",
+		Strategy: bus.StrategySearch,
+	})
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	var status string
+	_ = d.QueryRow(`SELECT status FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&status)
+	if status != "probing" {
+		t.Errorf("got status %q, want 'probing'", status)
+	}
+}
+
+func TestOnRequestDownload_PassiveIntentDoesNotInsertEntry(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, requesting_user_id) VALUES (?, ?)`,
+		sid.String(), uid.String()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	err := svc.OnRequestDownload(ctx, bus.RequestDownload{
+		SongID: sid, Title: "T", Artist: "A",
+		Strategy: bus.StrategyRandom,
+	})
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&n)
+	if n != 0 {
+		t.Errorf("passive intent should not insert entry; got %d", n)
+	}
+}
+
+// TestOnLoadedSong_NotFoundMarksEntryNotFound: v0.4.1 PR B. A LoadedSong
+// with status=not_found must mark an existing probing entry as
+// 'not_found' (not delete it), so the UI can show "not on Soulseek".
+func TestOnLoadedSong_NotFoundMarksEntryNotFound(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, requesting_user_id) VALUES (?, ?)`,
+		sid.String(), uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
+		 VALUES (?, ?, ?, 0, 'probing')`,
+		uuid.NewString(), uid.String(), sid.String()); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+
+	err := svc.OnLoadedSong(ctx, bus.LoadedSong{
+		SongID: sid,
+		Status: bus.LoadedStatusNotFound,
+	})
+	if err != nil {
+		t.Fatalf("onLoadedSong: %v", err)
+	}
+
+	var status string
+	_ = d.QueryRow(`SELECT status FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&status)
+	if status != "not_found" {
+		t.Errorf("got status %q, want 'not_found'", status)
+	}
+
+	// Stub is retained so the user can see the entry.
+	var songN int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs WHERE id = ?`, sid.String()).Scan(&songN)
+	if songN != 1 {
+		t.Errorf("stub should be retained on NotFound, count=%d", songN)
+	}
+}
+
+// TestOnLoadedSong_CompletedPromotesProbingToReady: when a probing entry
+// exists (from a search intent), Completed promotes it rather than
+// inserting a duplicate.
+func TestOnLoadedSong_CompletedPromotesProbingToReady(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, requesting_user_id) VALUES (?, ?)`,
+		sid.String(), uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
+		 VALUES (?, ?, ?, 0, 'probing')`,
+		uuid.NewString(), uid.String(), sid.String()); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+
+	err := svc.OnLoadedSong(ctx, bus.LoadedSong{
+		SongID:   sid,
+		FilePath: "song.mp3",
+		Status:   bus.LoadedStatusCompleted,
+	})
+	if err != nil {
+		t.Fatalf("onLoadedSong: %v", err)
+	}
+
+	// Single entry, now ready.
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&n)
+	if n != 1 {
+		t.Errorf("expected 1 entry (promoted), got %d", n)
+	}
+	var status string
+	_ = d.QueryRow(`SELECT status FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&status)
+	if status != "ready" {
+		t.Errorf("got status %q, want 'ready'", status)
+	}
+}
+
 func TestOnRequestDownload_UpdatesMetadata(t *testing.T) {
 	svc, d, _ := newService(t)
 	ctx := context.Background()

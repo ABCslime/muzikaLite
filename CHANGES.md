@@ -506,3 +506,118 @@ Modified:
 - `go vet ./...` clean
 - `go test ./...` all packages pass (new `internal/preferences` suite +
   2 new `internal/queue` tests)
+
+---
+
+## v0.4.1 PR B — Search availability probe
+
+UX improvement for user-initiated search. v0.4 PR 3 shipped with a
+silence gap: a search-triggered stub waited ~30s before either appearing
+(success) or silently never appearing (no Soulseek peers). This PR adds
+two points of feedback:
+
+1. **Immediate visibility**: as soon as Discogs picks (artist, title),
+   an entry appears in the queue marked `status='probing'` with a
+   spinner and disabled play.
+2. **Decisive "not found" signal**: a fast 5-second Soulseek probe runs
+   before the full ladder. Zero peers → the entry flips to
+   `status='not_found'` with a dismiss button and a toast in the UI.
+
+Only `StrategySearch` intents go through this flow. Passive refill
+(`StrategyRandom`) is untouched.
+
+### Data
+
+Migration 0006 adds `queue_entries.status TEXT NOT NULL DEFAULT
+'ready'`. Values: `probing`, `ready`, `not_found`. Index on
+`(user_id, status)` for future "count user's probing entries" queries.
+
+### Events
+
+- `bus.LoadedStatusNotFound` — new variant, distinct from `Error`.
+  Lets the UI toast "not on Soulseek" specifically rather than a
+  generic error.
+- `internal/discovery.StageProbe` — new log stage for probe
+  outcomes. One row per search intent.
+
+### Download worker
+
+- Constant `probeWindow = 5 * time.Second` (hardcoded; could graduate
+  to config if operators care).
+- New `probeAvailability(ctx, ev)` helper runs ONE short Soulseek
+  search with the best available query (catno > artist+title > title).
+  No gate — the probe asks "does anything exist?" not "does quality
+  exist?"
+- `onRequestDownload` routes `StrategySearch` intents through the
+  probe first; zero peers short-circuits to `emitNotFound`.
+- `emitNotFound(songID)` writes `LoadedSong{Status: NotFound}`.
+
+### Queue service
+
+- `Repo.InsertProbingEntry(userID, songID)` — appends with
+  `status='probing'`.
+- `Repo.PromoteToReady(userID, songID, relaxed)` — flips status to
+  `ready` on a completed download. Returns `ErrNotFound` if no row
+  matched (passive refill path).
+- `Repo.MarkNotFound(userID, songID)` — flips status to `not_found`
+  without deleting the stub.
+- `onRequestDownload` inserts a probing entry for `StrategySearch`
+  intents (after updating metadata). Passive refill unchanged.
+- `onLoadedSong`:
+  - `Completed` tries `PromoteToReady` first; falls back to
+    `AppendEntry{,Relaxed}` for passive-refill stubs with no
+    pre-existing entry.
+  - `NotFound` marks the entry `status='not_found'`, keeps the stub.
+  - `Error` still deletes the stub (unchanged).
+- `GetQueue` includes `status` on every `SongDTO` (legacy empty
+  strings normalized to `'ready'`).
+
+### Frontend
+
+- `SongItem.vue` renders three visual states:
+  - `probing`: blue-tinted background, spinner + "Checking Soulseek
+    availability…" label, click disabled.
+  - `not_found`: amber-tinted background, "Not found on Soulseek."
+    italic label, click disabled (with toast).
+  - `ready`: default, playable.
+- `QueueView.vue`:
+  - `searchNotice` now reflects Discogs-pending vs Soulseek-probing.
+  - New `notFoundNotice` with a Dismiss button that hits
+    `DELETE /api/queue/queue/{id}`.
+  - `relaxedNotice` tightened to only fire when the entry is
+    `status='ready'`.
+
+### Files
+
+New:
+- `internal/db/migrations/0006_queue_entries_status.{up,down}.sql`
+
+Modified:
+- `internal/bus/events.go` — `LoadedStatusNotFound`
+- `internal/discovery/log.go` — `StageProbe`
+- `internal/download/worker.go` — probe step, `emitNotFound`,
+  `probeAvailability`, `bestProbeQuery`, `probeWindow` const
+- `internal/download/worker_test.go` — 3 new tests
+- `internal/queue/repo.go` — `InsertProbingEntry`, `PromoteToReady`,
+  `MarkNotFound`; `ListEntries` reads status
+- `internal/queue/service.go` — wire probing entry on search intents,
+  handle NotFound and probing→ready promotion in onLoadedSong
+- `internal/queue/models.go` — `QueueEntry.Status`, `SongDTO.Status`
+- `internal/queue/queue_test.go` — 4 new tests
+- `frontend/src/components/queue/SongItem.vue` — three-state render
+- `frontend/src/components/queue/QueueView.vue` — new notFoundNotice,
+  tightened relaxedNotice, Dismiss button
+- `CLAUDE.md`, `ROADMAP.md`
+
+### Verification
+
+- `go build ./...` clean
+- `go vet ./...` clean
+- `go test ./...` all packages pass
+
+### v0.4.1 complete
+
+Both PRs of v0.4.1 now on `main`:
+- PR A: genre preferences (per-user tables + refiller bias)
+- PR B: search availability probe (immediate UI feedback + decisive
+  not-found signal)

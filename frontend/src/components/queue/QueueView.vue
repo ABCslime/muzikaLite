@@ -41,6 +41,18 @@
       {{ searchNotice }}
     </div>
     <div
+      v-if="notFoundNotice"
+      class="mb-4 bg-amber-50 pixel-border border-amber-500 p-3 text-sm text-amber-900 pixel-texture flex items-center justify-between"
+    >
+      <span>{{ notFoundNotice }}</span>
+      <button
+        @click="handleDismissNotFound"
+        class="ml-4 px-3 py-1 bg-amber-200 text-amber-900 pixel-border border-amber-700 text-xs font-semibold hover:bg-amber-300"
+      >
+        Dismiss
+      </button>
+    </div>
+    <div
       v-if="relaxedNotice"
       class="mb-4 bg-amber-50 pixel-border border-amber-500 p-3 text-sm text-amber-900 pixel-texture"
     >
@@ -96,23 +108,48 @@ const selectedSong = ref(null)
 const searchQuery = ref('')
 const searchBusy = ref(false)
 
-// searchNotice: "Searching Discogs for X…" while the stub resolves.
-// Cleared when the stub's entry appears in the queue.
+// v0.4.1 PR B — search lifecycle is now visible on the entry itself via
+// song.status ('probing' | 'not_found' | 'ready'). We surface notices
+// only for the user's most recent search so they correlate the toast
+// with what they just typed.
+
+// searchNotice: "Searching Discogs for X…" while the seeder hasn't
+// returned metadata yet (entry not in queue OR in queue with no metadata
+// — treat absence-of-entry as probing from the user's POV).
 const searchNotice = computed(() => {
-  if (!queueStore.lastSearchSongId) return null
-  const resolved = queueStore.songs.some(s => s.id === queueStore.lastSearchSongId)
-  if (resolved) return null
-  return `Searching Discogs for "${queueStore.lastSearchQuery}"…`
+  const id = queueStore.lastSearchSongId
+  if (!id) return null
+  const match = queueStore.songs.find(s => s.id === id)
+  // Not in queue yet → Discogs still thinking.
+  if (!match) return `Searching Discogs for "${queueStore.lastSearchQuery}"…`
+  // In queue but probing Soulseek.
+  if (match.status === 'probing') {
+    return `Found "${match.title || queueStore.lastSearchQuery}" on Discogs — checking Soulseek availability…`
+  }
+  return null
+})
+
+// notFoundNotice (v0.4.1 PR B): the user's search picked something
+// Discogs knows but Soulseek doesn't have.
+const notFoundNotice = computed(() => {
+  const id = queueStore.lastSearchSongId
+  if (!id) return null
+  const match = queueStore.songs.find(s => s.id === id)
+  if (!match || match.status !== 'not_found') return null
+  const label = match.artist
+    ? `"${match.title}" by ${match.artist}`
+    : `"${queueStore.lastSearchQuery}"`
+  return `${label} — not available on Soulseek sadly.`
 })
 
 // relaxedNotice: ROADMAP §v0.4 item 6 — "no high-quality matches; showing
 // best available." Shown when the search-triggered entry arrives with
-// relaxed=true. Dismissed on the next search or manual clear.
+// relaxed=true.
 const relaxedNotice = computed(() => {
   const id = queueStore.lastSearchSongId
   if (!id) return null
   const match = queueStore.songs.find(s => s.id === id)
-  if (!match || !match.relaxed) return null
+  if (!match || !match.relaxed || match.status !== 'ready') return null
   return `"${queueStore.lastSearchQuery}" — no high-quality matches; showing best available.`
 })
 
@@ -128,14 +165,26 @@ const handleSearch = async () => {
     const result = await queueStore.searchAndQueue(q)
     if (result.success) {
       searchQuery.value = ''
-      // Refresh the queue a few times so the stub's entry shows up as
-      // soon as the download ladder finishes. Polling-based; keeps the
-      // frontend dumb. A future v0.5 WebSocket would replace this.
+      // Kick off one immediate refresh so the user sees the probing entry
+      // appear as soon as Discogs picks metadata (typically ~2s). Further
+      // polling is handled by the periodic refresh elsewhere; a future
+      // v0.5 WebSocket would replace this loop.
       await queueStore.fetchQueue(true)
     }
   } finally {
     searchBusy.value = false
   }
+}
+
+// Dismiss the not-found entry the user's last search produced. Removes
+// the entry from their queue. The backend does not auto-delete not_found
+// entries; the user's explicit action clears the toast.
+const handleDismissNotFound = async () => {
+  const id = queueStore.lastSearchSongId
+  if (!id) return
+  await queueStore.removeSongFromQueue(id)
+  queueStore.lastSearchSongId = null
+  queueStore.lastSearchQuery = null
 }
 
 const handlePlayAll = () => {

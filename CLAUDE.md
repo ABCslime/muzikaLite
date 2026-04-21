@@ -273,6 +273,27 @@ Passive refill never sets the flag — ROADMAP §v0.4 item 6. That's a
 deliberate silence, not a bug: the refiller keeps trying and a better
 source will land tomorrow.
 
+### Search availability probe (v0.4.1 PR B)
+
+Search intents (`StrategySearch`) run a fast 5-second Soulseek search
+BEFORE the full ladder, and get an early `queue_entries` row with
+`status='probing'` so the user sees the Discogs-picked track appear
+immediately. Three outcomes:
+
+- **Peers found** → ladder + gate run normally; entry promoted to
+  `status='ready'`.
+- **Zero peers** → `LoadedStatusNotFound` emitted; entry marked
+  `status='not_found'` (stub retained so the user sees the failure
+  reason and can dismiss via DELETE).
+- **Probe error** → treated as "not found"; same path.
+
+Passive refill (`StrategyRandom`) bypasses the probe entirely — the
+user isn't watching, and a failed passive refill triggers silent
+retry on the next short-queue observation.
+
+`discovery_log.stage='probe'` captures every probe outcome for
+"what % of Discogs picks aren't on Soulseek?" forensics.
+
 See `ARCHITECTURE.md` §7 for the gosk integration.
 
 ---

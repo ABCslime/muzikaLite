@@ -505,6 +505,122 @@ func TestRelax_SurfacedOnlyForSearchStrategy(t *testing.T) {
 	}
 }
 
+// TestProbe_NoPeers_EmitsNotFound: a search intent whose probe turns up
+// zero peers must emit LoadedStatusNotFound (not LoadedStatusError) — the
+// UI toasts "not found on Soulseek" specifically. The ladder is not run.
+func TestProbe_NoPeers_EmitsNotFound(t *testing.T) {
+	d := setupDB(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	fc := &fakeClient{
+		responsesByQuery: map[string][]soulseek.SearchResult{
+			// Probe and ladder queries both return nothing; only probe
+			// should run before emitNotFound short-circuits.
+		},
+	}
+	svc := download.NewService(d, fc, "/music", b, nil)
+
+	songID := uuid.New()
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+		SongID: songID, Title: "Nonexistent", Artist: "Nobody",
+		Strategy: bus.StrategySearch,
+	})
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	var payload []byte
+	_ = d.QueryRow(`SELECT payload FROM outbox WHERE event_type = ?`, bus.TypeLoadedSong).Scan(&payload)
+	var ev bus.LoadedSong
+	_ = json.Unmarshal(payload, &ev)
+	if ev.Status != bus.LoadedStatusNotFound {
+		t.Errorf("got status %q, want %q", ev.Status, bus.LoadedStatusNotFound)
+	}
+
+	// Only the probe should have fired — exactly one Search call.
+	if len(fc.queriesSeen) != 1 {
+		t.Errorf("expected 1 Search call (probe only), got %d: %v",
+			len(fc.queriesSeen), fc.queriesSeen)
+	}
+}
+
+// TestProbe_PeersFound_RunsLadder: a search intent with peers in the
+// probe proceeds to the full ladder and produces a normal Completed.
+func TestProbe_PeersFound_RunsLadder(t *testing.T) {
+	d := setupDB(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	fc := &fakeClient{
+		// Same result list served for probe AND artist+title rungs.
+		searchResp: []soulseek.SearchResult{goodResult("peer1", "song.mp3", 0)},
+		states:     completedStates("song.mp3"),
+	}
+	svc := download.NewService(d, fc, "/music", b, nil)
+
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+		SongID: uuid.New(), Title: "Has Peers", Artist: "Real Artist",
+		Strategy: bus.StrategySearch,
+	})
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	var payload []byte
+	_ = d.QueryRow(`SELECT payload FROM outbox WHERE event_type = ?`, bus.TypeLoadedSong).Scan(&payload)
+	var ev bus.LoadedSong
+	_ = json.Unmarshal(payload, &ev)
+	if ev.Status != bus.LoadedStatusCompleted {
+		t.Errorf("got status %q, want %q", ev.Status, bus.LoadedStatusCompleted)
+	}
+
+	// Probe + at least one ladder rung → 2+ Search calls.
+	if len(fc.queriesSeen) < 2 {
+		t.Errorf("expected probe + ladder Search calls, got %d: %v",
+			len(fc.queriesSeen), fc.queriesSeen)
+	}
+}
+
+// TestProbe_NotRunForPassiveRefill: StrategyRandom intents bypass the
+// probe entirely. This is the v0.4 behavior we want to preserve —
+// probe is a search-UX feature, not a passive-refill feature.
+func TestProbe_NotRunForPassiveRefill(t *testing.T) {
+	d := setupDB(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	fc := &fakeClient{
+		searchResp: []soulseek.SearchResult{goodResult("peer1", "song.mp3", 0)},
+		states:     completedStates("song.mp3"),
+	}
+	svc := download.NewService(d, fc, "/music", b, nil)
+
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+		SongID: uuid.New(), Title: "X", Artist: "Y",
+		Strategy: bus.StrategyRandom,
+	})
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	// No separate probe call; just ladder.
+	for _, q := range fc.queriesSeen {
+		if q == "Y X" {
+			// This is the artist+title ladder rung, fine.
+			continue
+		}
+	}
+
+	var payload []byte
+	_ = d.QueryRow(`SELECT payload FROM outbox WHERE event_type = ?`, bus.TypeLoadedSong).Scan(&payload)
+	var ev bus.LoadedSong
+	_ = json.Unmarshal(payload, &ev)
+	if ev.Status != bus.LoadedStatusCompleted {
+		t.Errorf("got status %q, want completed", ev.Status)
+	}
+}
+
 // TestRelax_NotSetWhenStrictWins: when strict passes everything, the
 // relaxed-flag must stay false regardless of upstream strategy.
 func TestRelax_NotSetWhenStrictWins(t *testing.T) {

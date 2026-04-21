@@ -206,20 +206,40 @@ func (s *Service) onLoadedSong(ctx context.Context, ev bus.LoadedSong) error {
 			return err
 		}
 		return nil
+	case bus.LoadedStatusNotFound:
+		// v0.4.1 PR B. Don't delete the stub — the user needs to see the
+		// entry with status='not_found' so they know their search failed
+		// rather than silently vanishing. The entry dismissal is a
+		// separate DELETE /api/queue/queue/{id} the user triggers.
+		userID, ok, err := s.repo.GetSongRequester(ctx, ev.SongID)
+		if err != nil {
+			return fmt.Errorf("get requester for not_found: %w", err)
+		}
+		if !ok {
+			// No requester means nobody's waiting on this — just drop it.
+			return s.repo.DeleteSong(ctx, ev.SongID)
+		}
+		defer s.lockFor(userID)()
+		return s.repo.MarkNotFound(ctx, userID, ev.SongID)
 	default:
 		return fmt.Errorf("unknown LoadedSong status: %q", ev.Status)
 	}
 }
 
-// appendForRequester reads the stub's requesting_user_id and appends the
-// completed song to that user's queue and only that user's. If the stub has
-// no requester (legacy rows, or rows inserted outside the refiller path), we
-// log and skip — those belong to no queue by definition.
+// appendForRequester reads the stub's requesting_user_id and surfaces the
+// completed song in that user's queue and only that user's. If the stub
+// has no requester (legacy rows, or rows inserted outside the refiller
+// path), we log and skip — those belong to no queue by definition.
 //
-// relaxed (v0.4 PR 3) is the LoadedSong.Relaxed flag: true iff the download
-// worker had to fall back to the relaxed gate AND the origin was a
-// user-initiated search. For passive refill, the download worker passes
-// false regardless of whether its relax-mode fired — ROADMAP §v0.4 item 6.
+// v0.4.1 PR B: if a probing queue_entries row already exists (created by
+// onRequestDownload for StrategySearch intents), promote it to ready
+// rather than inserting a duplicate. For passive refill there's no
+// pre-existing entry, so we fall through to AppendEntry{,Relaxed}.
+//
+// relaxed (v0.4 PR 3) is the LoadedSong.Relaxed flag: true iff the
+// download worker had to fall back to the relaxed gate AND the origin
+// was a user-initiated search. For passive refill, the download worker
+// passes false regardless — ROADMAP §v0.4 item 6.
 func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID, relaxed bool) error {
 	userID, ok, err := s.repo.GetSongRequester(ctx, songID)
 	if err != nil {
@@ -233,6 +253,16 @@ func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID, rela
 		return nil
 	}
 	defer s.lockFor(userID)()
+
+	// Try to promote a probing entry first (search path). If there isn't
+	// one, ErrNotFound is expected (passive refill path).
+	if err := s.repo.PromoteToReady(ctx, userID, songID, relaxed); err == nil {
+		return nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+
+	// No probing entry — insert a new ready one.
 	var appendErr error
 	if relaxed {
 		appendErr = s.repo.AppendEntryRelaxed(ctx, userID, songID)
@@ -246,10 +276,35 @@ func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID, rela
 }
 
 func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
-	// Fan-out: bandcamp published this; the download package consumes it to
-	// drive the transfer, we consume it to keep metadata in sync with the
-	// search result. UPDATE misses if the stub was already deleted — that's fine.
-	return s.repo.UpdateSongMetadata(ctx, ev.SongID, ev.Title, ev.Artist)
+	// Fan-out: a seeder published this; the download package consumes it
+	// to drive the transfer, we consume it to keep metadata in sync with
+	// the search result. UPDATE misses if the stub was already deleted —
+	// that's fine.
+	if err := s.repo.UpdateSongMetadata(ctx, ev.SongID, ev.Title, ev.Artist); err != nil {
+		return err
+	}
+
+	// v0.4.1 PR B: user-initiated search gets an early queue entry with
+	// status='probing'. Immediate UI feedback — the user sees the artist/
+	// title the moment Discogs picks it, rather than waiting ~30s for the
+	// download to finish. Passive refill keeps the old flow (entry inserts
+	// only on LoadedSong{Completed}).
+	if ev.Strategy != bus.StrategySearch {
+		return nil
+	}
+	userID, ok, err := s.repo.GetSongRequester(ctx, ev.SongID)
+	if err != nil || !ok {
+		// No requester means nobody to surface it to. Nothing to do.
+		return nil
+	}
+	defer s.lockFor(userID)()
+	if err := s.repo.InsertProbingEntry(ctx, userID, ev.SongID); err != nil && !errors.Is(err, ErrDuplicate) {
+		// Not fatal — the ready-state promotion path in appendForRequester
+		// will insert a fresh ready entry if this failed.
+		s.log.Warn("queue: insert probing entry failed",
+			"song_id", ev.SongID, "user_id", userID, "err", err)
+	}
+	return nil
 }
 
 // --- HTTP-facing methods ---
@@ -266,10 +321,17 @@ func (s *Service) GetQueue(ctx context.Context, userID uuid.UUID) (QueueResponse
 		if err != nil {
 			continue // skip missing songs rather than failing the whole list
 		}
+		status := e.Status
+		if status == "" {
+			// Legacy rows (pre-migration-0006) have empty string — treat
+			// as "ready" so the UI renders them normally.
+			status = "ready"
+		}
 		out.Songs = append(out.Songs, SongDTO{
 			ID: sg.ID, Title: sg.Title, Artist: sg.Artist,
 			Album: sg.Album, Genre: sg.Genre, Duration: sg.Duration,
 			Relaxed: e.Relaxed,
+			Status:  status,
 		})
 	}
 	// Fire-and-forget refill — don't block the response. svcCtx outlives the

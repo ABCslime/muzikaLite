@@ -44,6 +44,13 @@ const (
 	searchWindow       = 10 * time.Second
 	pollInterval       = 2 * time.Second
 	downloadMaxTimeout = 5 * time.Minute
+
+	// probeWindow is the shorter-than-searchWindow budget for the
+	// availability probe run before the full ladder for StrategySearch
+	// intents (v0.4.1 PR B). 5s balances UI responsiveness against
+	// false "not found" signals from slow-responding peers. ROADMAP
+	// §v0.4.1 PR B.
+	probeWindow = 5 * time.Second
 )
 
 // Config parametrizes the ladder + gate behavior. Populated from
@@ -134,6 +141,18 @@ func (s *Service) OnRequestDownload(ctx context.Context, ev bus.RequestDownload)
 }
 
 func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
+	// v0.4.1 PR B: user-initiated search runs a fast availability probe
+	// BEFORE the full ladder. Zero peers → emit LoadedStatusNotFound so
+	// the UI can toast "not found on Soulseek" and the probing queue
+	// entry disappears. Passive refill skips the probe entirely — its
+	// ladder+gate failure path already handles absence without needing
+	// a separate signal, and a probe would double the per-intent cost.
+	if ev.Strategy == bus.StrategySearch {
+		if !s.probeAvailability(ctx, ev) {
+			return s.emitNotFound(ctx, ev.SongID)
+		}
+	}
+
 	peer, file, usedRelax, ok := s.runLadder(ctx, ev)
 	if !ok {
 		s.recordFailed(ctx, ev, "no viable peer after ladder + gate")
@@ -391,6 +410,80 @@ func ternaryOutcome(cond bool, ifTrue, ifFalse discovery.Outcome) discovery.Outc
 	return ifFalse
 }
 
+// probeAvailability runs a single short Soulseek search as a fast "is this
+// track available at all?" check. Returns true if at least one peer
+// responded within probeWindow; false otherwise.
+//
+// Deliberately:
+//   - No gate. The gate might reject everything a probe turns up, but the
+//     probe's job is "does Soulseek have any copy?" — the ladder + gate
+//     decide quality later.
+//   - Best rung only (catno if available, else artist+title, else title)
+//     rather than the full ladder. Probe speed matters for UX.
+//   - Writes one discovery_log row at StageProbe so we can track Discogs-
+//     vs-Soulseek catalog drift ("% of Discogs picks not on Soulseek").
+func (s *Service) probeAvailability(ctx context.Context, ev bus.RequestDownload) bool {
+	query := bestProbeQuery(ev)
+	if query == "" {
+		// Nothing to probe on — treat as "not available" so the UI gets a
+		// quick signal rather than spinning on an impossible search.
+		s.logw.Record(ctx, discovery.Record{
+			SongID:  ev.SongID,
+			Source:  discovery.SourceDownload,
+			Stage:   discovery.StageProbe,
+			Query:   "",
+			Outcome: discovery.OutcomeNoResults,
+			Reason:  "no query fields on RequestDownload",
+		})
+		return false
+	}
+
+	results, err := s.soulseek.Search(ctx, query, probeWindow)
+	if err != nil {
+		// Treat probe errors as "not found" rather than bubbling —
+		// the UI wants a decisive signal, and the refiller/user can
+		// retry.
+		s.log.Warn("probe search failed",
+			"song_id", ev.SongID, "query", query, "err", err)
+		s.logw.Record(ctx, discovery.Record{
+			SongID:  ev.SongID,
+			Source:  discovery.SourceDownload,
+			Stage:   discovery.StageProbe,
+			Query:   query,
+			Outcome: discovery.OutcomeError,
+			Reason:  err.Error(),
+		})
+		return false
+	}
+
+	outcome := discovery.OutcomeOK
+	if len(results) == 0 {
+		outcome = discovery.OutcomeNoResults
+	}
+	s.logw.Record(ctx, discovery.Record{
+		SongID:      ev.SongID,
+		Source:      discovery.SourceDownload,
+		Stage:       discovery.StageProbe,
+		Query:       query,
+		Outcome:     outcome,
+		ResultCount: len(results),
+	})
+	return len(results) > 0
+}
+
+// bestProbeQuery picks the most specific query available for probing.
+// Prefers catno → artist+title → title → "". Mirrors the ladder's order
+// but stops at the first populated rung so we only make one Soulseek call.
+func bestProbeQuery(ev bus.RequestDownload) string {
+	if cn := strings.TrimSpace(ev.CatalogNumber); cn != "" {
+		return cn
+	}
+	if ev.Artist != "" && ev.Title != "" {
+		return strings.TrimSpace(ev.Artist + " " + ev.Title)
+	}
+	return strings.TrimSpace(ev.Title)
+}
+
 // recordFailed writes a terminal StageFailed row for post-mortem.
 func (s *Service) recordFailed(ctx context.Context, ev bus.RequestDownload, reason string) {
 	s.logw.Record(ctx, discovery.Record{
@@ -446,6 +539,18 @@ func (s *Service) emitError(ctx context.Context, songID uuid.UUID) error {
 	return s.emit(ctx, bus.LoadedSong{
 		SongID: songID,
 		Status: bus.LoadedStatusError,
+	})
+}
+
+// emitNotFound is the v0.4.1 PR B signal specifically for "the probe found
+// zero peers." Distinct from emitError (which means "we tried and the
+// download machinery failed"). queue.onLoadedSong deletes the stub + entry
+// on both paths, but the LoadedStatusNotFound value lets the frontend toast
+// "not found on Soulseek" rather than a generic error message.
+func (s *Service) emitNotFound(ctx context.Context, songID uuid.UUID) error {
+	return s.emit(ctx, bus.LoadedSong{
+		SongID: songID,
+		Status: bus.LoadedStatusNotFound,
 	})
 }
 

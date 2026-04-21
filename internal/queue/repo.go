@@ -23,10 +23,10 @@ type Repo struct{ db *sql.DB }
 func NewRepo(sqlDB *sql.DB) *Repo { return &Repo{db: sqlDB} }
 
 // ListEntries returns all queue entries for userID ordered by position.
-// The Relaxed flag (v0.4 PR 3) is filled from queue_entries.relaxed.
+// The Relaxed flag (v0.4 PR 3) and Status (v0.4.1 PR B) come through.
 func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, user_id, song_id, position, created_at, relaxed
+		`SELECT id, user_id, song_id, position, created_at, relaxed, status
 		 FROM queue_entries WHERE user_id = ? ORDER BY position`,
 		userID.String())
 	if err != nil {
@@ -40,8 +40,9 @@ func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry,
 			pos                   int
 			createdAt             int64
 			relaxed               int
+			status                string
 		)
-		if err := rows.Scan(&idStr, &uidStr, &sidStr, &pos, &createdAt, &relaxed); err != nil {
+		if err := rows.Scan(&idStr, &uidStr, &sidStr, &pos, &createdAt, &relaxed, &status); err != nil {
 			return nil, err
 		}
 		id, _ := uuid.Parse(idStr)
@@ -51,9 +52,77 @@ func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry,
 			ID: id, UserID: uid, SongID: sid, Position: pos,
 			CreatedAt: time.Unix(createdAt, 0).UTC(),
 			Relaxed:   relaxed != 0,
+			Status:    status,
 		})
 	}
 	return out, rows.Err()
+}
+
+// InsertProbingEntry adds a search-initiated entry with status='probing'
+// (v0.4.1 PR B). Called from onRequestDownload for StrategySearch intents
+// so the user sees immediate feedback rather than waiting ~30s for the
+// download to finish. ErrDuplicate on a repeat insert is expected —
+// `requesting_user_id` already guarantees per-user uniqueness on the stub.
+func (r *Repo) InsertProbingEntry(ctx context.Context, userID, songID uuid.UUID) error {
+	var maxPos sql.NullInt64
+	if err := r.db.QueryRowContext(ctx,
+		`SELECT MAX(position) FROM queue_entries WHERE user_id = ?`,
+		userID.String()).Scan(&maxPos); err != nil {
+		return fmt.Errorf("max position: %w", err)
+	}
+	next := 0
+	if maxPos.Valid {
+		next = int(maxPos.Int64) + 1
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
+		 VALUES (?, ?, ?, ?, 'probing')`,
+		uuid.New().String(), userID.String(), songID.String(), next)
+	if err != nil {
+		if db.IsUniqueErr(err) {
+			return ErrDuplicate
+		}
+		return fmt.Errorf("insert probing entry: %w", err)
+	}
+	return nil
+}
+
+// PromoteToReady flips an entry's status from 'probing' (or anything else)
+// to 'ready'. Returns ErrNotFound if no row matches (e.g. a LoadedSong
+// arrives for a song that was never probed — passive refill path).
+func (r *Repo) PromoteToReady(ctx context.Context, userID, songID uuid.UUID, relaxed bool) error {
+	relaxedVal := 0
+	if relaxed {
+		relaxedVal = 1
+	}
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE queue_entries
+		 SET status = 'ready', relaxed = ?
+		 WHERE user_id = ? AND song_id = ?`,
+		relaxedVal, userID.String(), songID.String())
+	if err != nil {
+		return fmt.Errorf("promote entry: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// MarkNotFound flips the entry status to 'not_found'. Unlike the Error path
+// (which deletes the stub), a NotFound-marked entry stays visible so the
+// user gets the "not on Soulseek" feedback; they dismiss it via the
+// existing DELETE /api/queue/queue/{id} route.
+func (r *Repo) MarkNotFound(ctx context.Context, userID, songID uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE queue_entries SET status = 'not_found'
+		 WHERE user_id = ? AND song_id = ?`,
+		userID.String(), songID.String())
+	if err != nil {
+		return fmt.Errorf("mark not_found: %w", err)
+	}
+	return nil
 }
 
 // CountEntries returns how many songs are queued for userID.

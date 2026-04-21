@@ -32,6 +32,15 @@ type QueueEntry struct {
 	// (StrategySearch). Passive refill relaxations never land in this flag —
 	// ROADMAP §v0.4 item 6 keeps that path silent.
 	Relaxed bool
+	// Status (v0.4.1 PR B) tracks the search availability lifecycle:
+	//   "probing"   — seeder has set metadata, download worker hasn't
+	//                 confirmed peers yet. UI disables play + spinner.
+	//   "ready"     — file downloaded, playable.
+	//   "not_found" — probe turned up zero peers. UI shows "not on
+	//                 Soulseek"; user dismisses via DELETE.
+	// Only StrategySearch entries ever enter probing/not_found. Passive
+	// refill inserts straight at "ready".
+	Status string
 }
 
 type UserSong struct {
@@ -47,6 +56,9 @@ type UserSong struct {
 // SongDTO mirrors the old Spring response so the frontend works unchanged.
 // Relaxed (v0.4 PR 3) lets the UI show "no high-quality matches; showing
 // best available" when a user-initiated search landed via the relaxed gate.
+// Status (v0.4.1 PR B) drives the search availability UX: "probing" shows
+// a spinner, "not_found" shows "not on Soulseek", "ready" is the default
+// playable state.
 type SongDTO struct {
 	ID       uuid.UUID `json:"id"`
 	Title    string    `json:"title,omitempty"`
@@ -55,6 +67,7 @@ type SongDTO struct {
 	Genre    string    `json:"genre,omitempty"`
 	Duration int       `json:"duration,omitempty"`
 	Relaxed  bool      `json:"relaxed,omitempty"`
+	Status   string    `json:"status,omitempty"`
 }
 
 type QueueResponse struct {

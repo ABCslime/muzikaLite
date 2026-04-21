@@ -7,10 +7,12 @@ design rationale; this file is the short rulebook.
 
 ## 1. Project shape
 
-- Single Go binary under `cmd/muzika`. Six internal domain packages
-  (`auth`, `playlist`, `queue`, `bandcamp`, `discogs`, `download`) that
-  never import each other. They communicate via `internal/bus`.
-  (`discogs` landed in v0.4 PR 2; before that only five.)
+- Single Go binary under `cmd/muzika`. Seven internal domain packages
+  (`auth`, `playlist`, `queue`, `bandcamp`, `discogs`, `download`,
+  `preferences`) that never import each other. They communicate via
+  `internal/bus` — or, in the case of preferences ↔ queue, via a
+  function hook (`queue.PreferredGenres`) wired in main.go. The
+  domain-package no-cross-import invariant stays intact.
 - An `internal/discovery` package owns the `discovery_log` write path —
   every seeder + download stage records a row there. `discovery/` is a
   leaf dep, imported by the seeders and the download worker; it doesn't
@@ -40,13 +42,17 @@ and §3 for the full layout.
 
 ```
 cmd/muzika  ─►  all internal/*
-internal/{auth,playlist,queue,bandcamp,discogs,download}
+internal/{auth,playlist,queue,bandcamp,discogs,download,preferences}
       ├─► internal/bus
       ├─► internal/db
       ├─► internal/httpx
       └─► internal/config
 internal/{bandcamp,discogs,download} ─► internal/discovery  (log writer only)
 internal/download  ─►  internal/soulseek   (stays thin)
+
+# Cross-domain lookups (no Go import; wired in main.go):
+internal/queue.Refiller  ─►  internal/preferences.Service
+                             (via queue.PreferredGenres func type)
 ```
 
 **No domain package imports another domain package.** If you feel tempted,

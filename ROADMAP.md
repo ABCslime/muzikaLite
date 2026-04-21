@@ -136,15 +136,40 @@ stylistic + observability fixes. Every in-scope item below is live.
 Each PR is reviewed and merged before the next is prompted to
 Claude Code. No skipping.
 
-### v0.4.1 — Genre preferences
+### v0.4.1 — Genre preferences + search availability probe
 
-Small release layered on v0.4.
+Layered on v0.4. Two orthogonal features, two PRs.
 
-- User preferences table with genre affinities.
+**PR 4.1.A — Genre preferences**
+
+- Per-user preferences tables with genre affinities (`user_bandcamp_tags`,
+  `user_discogs_genres`) — normalized, source-scoped, no cross-mapping
+  (that arrives in v0.6).
 - Settings UI for picking genres from a source-scoped vocabulary
-  (Bandcamp tags vs Discogs genres, kept separate — no mapping yet).
-- Refiller respects user's genre affinities when selecting
-  `DiscoveryIntent.Genre`.
+  (Bandcamp tags vs Discogs genres, kept separate).
+- Refiller respects the user's genre affinities when selecting
+  `DiscoveryIntent.Genre`. Source pick → genre pick from that source's
+  user-specific vocabulary, with `.env.example` defaults as fallback.
+
+**PR 4.1.B — Search availability probe**
+
+UX improvement for `POST /api/queue/search`. Today a search stub waits
+~30s with no feedback before appearing (or silently not appearing) in
+the queue. The probe splits that in two:
+
+1. Discogs picks artist/title → queue entry appears immediately marked
+   `status='probing'`.
+2. Download worker runs a fast (~5s) Soulseek search *before* the full
+   ladder. Zero peers → entry deleted with a `LoadedStatusNotFound`
+   signal so the UI can toast "not found on Soulseek." Non-zero peers
+   → normal ladder + gate path; entry transitions to `status='ready'`
+   on completion.
+
+Passive refill is untouched — the probe runs for `StrategySearch` only.
+
+Discovery-log gets a new `StageProbe` so we can track Discogs/Soulseek
+catalog drift over time: "how often does Discogs propose something
+that's not available on Soulseek?"
 
 ### v0.5 — Similar-to-song
 

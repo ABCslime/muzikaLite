@@ -98,6 +98,87 @@ func TestRefiller_InsertsStubsAndPublishes(t *testing.T) {
 	}
 }
 
+// TestRefiller_HonorsUserPreferences: v0.4.1 PR A. When a PreferredGenres
+// lookup returns non-empty lists, the refiller picks genres from them
+// (per source) instead of the configured default. Bandcamp-routed intents
+// draw from bandcampTags; Discogs-routed from discogsGenres.
+func TestRefiller_HonorsUserPreferences(t *testing.T) {
+	d, musicDir := setupDB(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	bandcampPrefs := []string{"progressive-house", "vaporwave"}
+	discogsPrefs := []string{"Electronic", "Jazz"}
+	lookup := func(_ context.Context, _ uuid.UUID) ([]string, []string) {
+		return bandcampPrefs, discogsPrefs
+	}
+
+	// Discogs disabled → all picks routed to Bandcamp → genre must come
+	// from bandcampPrefs, never the default "rock".
+	svc := queue.NewServiceFull(
+		ctx, d, musicDir, minSize,
+		"rock",     // defaultBandcamp (must not be used)
+		"Pop",      // defaultDiscogs (must not be used)
+		b, nil,
+		false, 0,   // discogs disabled
+		lookup,
+	)
+
+	ch := bus.Subscribe[bus.DiscoveryIntent](svc.RefillerBus(), "test/prefs-bandcamp")
+	svc.Refiller().Trigger(ctx, uid)
+	got := drain(ch, minSize, 500*time.Millisecond)
+
+	if len(got) == 0 {
+		t.Fatal("no events published")
+	}
+	for _, ev := range got {
+		if ev.Genre != "progressive-house" && ev.Genre != "vaporwave" {
+			t.Errorf("event genre %q not from bandcamp prefs %v", ev.Genre, bandcampPrefs)
+		}
+	}
+}
+
+// TestRefiller_FallsBackToDefaultsWithoutPrefs: when the PreferredGenres
+// lookup returns empty lists (user hasn't set any), the refiller uses
+// the configured default genre.
+func TestRefiller_FallsBackToDefaultsWithoutPrefs(t *testing.T) {
+	d, musicDir := setupDB(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	emptyLookup := func(_ context.Context, _ uuid.UUID) ([]string, []string) {
+		return nil, nil
+	}
+
+	svc := queue.NewServiceFull(
+		ctx, d, musicDir, minSize,
+		"house",    // defaultBandcamp (fallback)
+		"Pop",      // defaultDiscogs
+		b, nil,
+		false, 0,
+		emptyLookup,
+	)
+
+	ch := bus.Subscribe[bus.DiscoveryIntent](svc.RefillerBus(), "test/prefs-fallback")
+	svc.Refiller().Trigger(ctx, uid)
+	got := drain(ch, minSize, 500*time.Millisecond)
+
+	if len(got) == 0 {
+		t.Fatal("no events published")
+	}
+	for _, ev := range got {
+		if ev.Genre != "house" {
+			t.Errorf("event genre %q, want default %q", ev.Genre, "house")
+		}
+	}
+}
+
 // TestRefiller_NoOpWhenQueueFull ensures we don't re-emit when queue is at threshold.
 func TestRefiller_NoOpWhenQueueFull(t *testing.T) {
 	svc, d, _ := newService(t)

@@ -28,6 +28,13 @@ const router = createRouter({
       component: () => import('@/views/PlaylistDetailView.vue'),
       meta: { requiresAuth: true },
     },
+    // v0.4.1 PR A — genre preferences
+    {
+      path: '/settings',
+      name: 'Settings',
+      component: () => import('@/views/SettingsView.vue'),
+      meta: { requiresAuth: true },
+    },
   ],
 })
 

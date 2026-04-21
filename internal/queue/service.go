@@ -48,6 +48,7 @@ type Service struct {
 }
 
 // NewService wires a Service and its refiller with Bandcamp-only routing.
+// Retained for tests. Production calls NewServiceFull from main.go.
 //
 // ctx is the process-lifecycle context (main.go's signal.NotifyContext result).
 // It's stored and used by the HTTP-facing refill fire-and-forget goroutines
@@ -65,7 +66,8 @@ func NewService(
 }
 
 // NewServiceWithDiscogs wires a Service whose refiller may route DiscoveryIntents
-// to Discogs with probability discogsWeight. v0.4 PR 2 entry point from main.go.
+// to Discogs with probability discogsWeight. v0.4 PR 2 entry point. Retained
+// for tests; production uses NewServiceFull to also inject per-user prefs.
 func NewServiceWithDiscogs(
 	ctx context.Context,
 	sqlDB *sql.DB,
@@ -77,6 +79,27 @@ func NewServiceWithDiscogs(
 	discogsEnabled bool,
 	discogsWeight float64,
 ) *Service {
+	return NewServiceFull(ctx, sqlDB, musicPath, minQueueSize,
+		defaultGenre, defaultGenre, b, d, discogsEnabled, discogsWeight, nil)
+}
+
+// NewServiceFull is the v0.4.1 entry point: separate Bandcamp vs Discogs
+// default genres (from MUZIKA_BANDCAMP_DEFAULT_TAGS[0] and
+// MUZIKA_DISCOGS_DEFAULT_GENRES[0] respectively), plus a PreferredGenres
+// lookup so the refiller biases toward user preferences when set.
+// Pass prefs=nil to disable the pref lookup (legacy / tests).
+func NewServiceFull(
+	ctx context.Context,
+	sqlDB *sql.DB,
+	musicPath string,
+	minQueueSize int,
+	defaultBandcamp, defaultDiscogs string,
+	b *bus.Bus,
+	d *bus.OutboxDispatcher,
+	discogsEnabled bool,
+	discogsWeight float64,
+	prefs PreferredGenres,
+) *Service {
 	log := slog.Default().With("mod", "queue")
 	repo := NewRepo(sqlDB)
 	return &Service{
@@ -86,10 +109,11 @@ func NewServiceWithDiscogs(
 		dispatcher:       d,
 		musicStoragePath: musicPath,
 		minQueueSize:     minQueueSize,
-		refiller: NewRefillerWithDiscogs(
-			repo, b, minQueueSize, defaultGenre,
+		refiller: NewRefillerFull(
+			repo, b, minQueueSize,
+			defaultBandcamp, defaultDiscogs,
 			log.With("sub", "refiller"),
-			discogsEnabled, discogsWeight,
+			discogsEnabled, discogsWeight, prefs,
 		),
 		log:       log,
 		svcCtx:    ctx,

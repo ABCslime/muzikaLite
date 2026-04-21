@@ -26,9 +26,12 @@ import (
 	"github.com/macabc/muzika/internal/download"
 	"github.com/macabc/muzika/internal/httpx"
 	"github.com/macabc/muzika/internal/playlist"
+	"github.com/macabc/muzika/internal/preferences"
 	"github.com/macabc/muzika/internal/queue"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
+
+	"github.com/google/uuid"
 
 	"github.com/ABCslime/gosk"
 )
@@ -84,13 +87,31 @@ func run() error {
 	// ---- Services ----
 	authSvc := auth.NewService(database, cfg.JWTSecret, cfg.JWTExpiration, b, dispatcher)
 	plSvc := playlist.NewService(database, b)
-	defaultGenre := ""
+	prefSvc := preferences.NewService(preferences.NewRepo(database))
+	defaultBandcamp := ""
 	if len(cfg.BandcampDefaultTags) > 0 {
-		defaultGenre = cfg.BandcampDefaultTags[0]
+		defaultBandcamp = cfg.BandcampDefaultTags[0]
 	}
-	qSvc := queue.NewServiceWithDiscogs(
-		ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre,
-		b, dispatcher, cfg.DiscogsEnabled, cfg.DiscogsWeight,
+	defaultDiscogs := ""
+	if len(cfg.DiscogsDefaultGenres) > 0 {
+		defaultDiscogs = cfg.DiscogsDefaultGenres[0]
+	}
+	// Adapter: turn *preferences.Service into a queue.PreferredGenres function.
+	// Errors collapse to empty slices — the refiller falls back to defaults,
+	// which is the same behavior as a user with no prefs.
+	prefLookup := func(ctx context.Context, userID uuid.UUID) ([]string, []string) {
+		p, err := prefSvc.Get(ctx, userID)
+		if err != nil {
+			log.Warn("refiller: preferences lookup failed; falling back to defaults",
+				"user_id", userID, "err", err)
+			return nil, nil
+		}
+		return p.BandcampTags, p.DiscogsGenres
+	}
+	qSvc := queue.NewServiceFull(
+		ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize,
+		defaultBandcamp, defaultDiscogs,
+		b, dispatcher, cfg.DiscogsEnabled, cfg.DiscogsWeight, prefLookup,
 	)
 	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), database, b, dispatcher)
 
@@ -128,7 +149,7 @@ func run() error {
 	}
 
 	// ---- HTTP ----
-	srv := buildServer(cfg, log, authSvc, plSvc, qSvc)
+	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc)
 	go func() {
 		log.Info("http listening", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -161,12 +182,14 @@ func buildServer(
 	a *auth.Service,
 	p *playlist.Service,
 	q *queue.Service,
+	pref *preferences.Service,
 ) *http.Server {
 	mux := http.NewServeMux()
 
 	authH := auth.NewHandler(a)
 	plH := playlist.NewHandler(p)
 	qH := queue.NewHandler(q)
+	prefH := preferences.NewHandler(pref)
 
 	withAuth := httpx.WithAuth(a.Verifier())
 
@@ -199,6 +222,10 @@ func buildServer(
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))
 	mux.Handle("POST /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.Like)))
 	mux.Handle("POST /api/queue/songs/{id}/unliked", withAuth(http.HandlerFunc(qH.Unlike)))
+
+	// --- User preferences (v0.4.1 PR A) ---
+	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))
+	mux.Handle("PUT /api/user/preferences", withAuth(http.HandlerFunc(prefH.Put)))
 
 	// --- SPA (fallback for everything else) ---
 	mux.Handle("GET /", web.SPAHandler())

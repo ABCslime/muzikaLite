@@ -420,3 +420,89 @@ Modified:
 - Manual: `POST /api/queue/search` returns 201 with `{songId, query}`;
   empty query returns 400; stub appears in `queue_songs` with
   `requesting_user_id`.
+
+---
+
+## v0.4.1 PR A — Genre preferences
+
+Small release layered on v0.4. Per-user genre affinities. The refiller
+now consults each user's preferences when populating
+`DiscoveryIntent.Genre`, rather than using the single server-wide
+default from `MUZIKA_BANDCAMP_DEFAULT_TAGS[0]`.
+
+### Data
+
+Migration 0005 adds two normalized tables:
+
+```sql
+user_bandcamp_tags  (user_id, tag)   PRIMARY KEY (user_id, tag)
+user_discogs_genres (user_id, genre) PRIMARY KEY (user_id, genre)
+```
+
+Both have `ON DELETE CASCADE` on `auth_users(id)`. Empty tables for a
+user = "no preference" — the refiller falls back to the .env defaults.
+
+No cross-source mapping (Bandcamp tag ↔ Discogs genre). That's v0.6.
+
+### New package `internal/preferences`
+
+- `Repo.Get(ctx, userID) → Preferences`
+- `Repo.Replace(ctx, userID, Preferences)` — atomic overwrite in one tx
+- `Service` layer adds validation: max 50 items/source, max 64
+  chars/item, whitespace trim, case-insensitive dedupe preserving
+  first-occurrence casing.
+- `Handler` mounts `GET` and `PUT /api/user/preferences`.
+
+### Refiller rewiring
+
+`queue.NewRefillerFull` (and `queue.NewServiceFull`) accept separate
+Bandcamp/Discogs defaults plus a `PreferredGenres` lookup function.
+Lookup returns `(bandcampTags, discogsGenres)` slices for a user;
+the refiller:
+
+1. Picks source (Bandcamp vs Discogs) via existing weighted RNG.
+2. Picks genre: if the user has prefs for that source, random from
+   those; otherwise the configured default.
+
+Cross-domain discipline: `queue` doesn't import `preferences`. main.go
+constructs a closure over `*preferences.Service` that satisfies the
+`queue.PreferredGenres` function type.
+
+### Frontend
+
+- `frontend/src/api/preferences.js` — `get()` + `replace(preferences)`
+- `frontend/src/stores/preferences.js` — Pinia store, server-of-truth
+  mirror
+- `frontend/src/views/SettingsView.vue` — Bandcamp tags as free-form
+  textarea, Discogs genres as checkbox grid from a hardcoded closed
+  vocabulary list (Discogs' fixed set as of 2026)
+- `frontend/src/router/index.js` — new `/settings` route
+- `frontend/src/components/layout/Sidebar.vue` — Settings link
+
+### Files
+
+New:
+- `internal/db/migrations/0005_user_preferences.{up,down}.sql`
+- `internal/preferences/{repo,service,handler,preferences_test}.go`
+- `frontend/src/api/preferences.js`
+- `frontend/src/stores/preferences.js`
+- `frontend/src/views/SettingsView.vue`
+
+Modified:
+- `internal/queue/refiller.go` — `NewRefillerFull`, separate source
+  defaults, per-user pref lookup
+- `internal/queue/service.go` — `NewServiceFull` entry point
+- `internal/queue/queue_test.go` — 2 new tests (prefs honored, defaults
+  fallback)
+- `cmd/muzika/main.go` — wires `preferences.Service` + `prefLookup`
+  adapter + mounts GET/PUT routes
+- `frontend/src/utils/constants.js` — `USER` API base
+- `frontend/src/router/index.js` + `Sidebar.vue`
+- `CLAUDE.md`, `ROADMAP.md` — docs
+
+### Verification
+
+- `go build ./...` clean
+- `go vet ./...` clean
+- `go test ./...` all packages pass (new `internal/preferences` suite +
+  2 new `internal/queue` tests)

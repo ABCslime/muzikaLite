@@ -28,6 +28,7 @@ import (
 	"github.com/macabc/muzika/internal/playlist"
 	"github.com/macabc/muzika/internal/preferences"
 	"github.com/macabc/muzika/internal/queue"
+	"github.com/macabc/muzika/internal/search"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
@@ -134,9 +135,18 @@ func run() error {
 	bcSvc.StartWorkers(ctx, cfg.BandcampWorkers)
 	dlSvc.StartWorkers(ctx, cfg.DownloadWorkers)
 
-	// ---- Optional: Discogs seeder (v0.4 PR 2) ----
+	// ---- Optional: Discogs client (seeder + preview endpoint share it) ----
+	//
+	// The client instance is shared between the passive-refill seeder
+	// (StartWorkers) and the user-typeahead Previewer (v0.4.1 PR C). Both
+	// use the same 30-day SQLite cache, so the dropdown hits are free
+	// once any path has fetched a query.
+	//
+	// When Discogs is disabled, dgClient stays nil and the Previewer
+	// returns ErrDiscogsDisabled → /api/queue/search/preview answers 503.
+	var dgClient *discogs.Client
 	if cfg.DiscogsEnabled {
-		dgClient := discogs.NewClient(
+		dgClient = discogs.NewClient(
 			discogs.DefaultBaseURL,
 			cfg.DiscogsToken,
 			cfg.DiscogsDefaultGenres,
@@ -147,9 +157,10 @@ func run() error {
 		dgSvc.StartWorkers(ctx, cfg.DiscogsWorkers)
 		log.Info("discogs seeder enabled", "workers", cfg.DiscogsWorkers, "weight", cfg.DiscogsWeight)
 	}
+	previewer := search.NewPreviewer(dgClient)
 
 	// ---- HTTP ----
-	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc)
+	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer)
 	go func() {
 		log.Info("http listening", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -183,6 +194,7 @@ func buildServer(
 	p *playlist.Service,
 	q *queue.Service,
 	pref *preferences.Service,
+	previewer *search.Previewer,
 ) *http.Server {
 	mux := http.NewServeMux()
 
@@ -190,6 +202,7 @@ func buildServer(
 	plH := playlist.NewHandler(p)
 	qH := queue.NewHandler(q)
 	prefH := preferences.NewHandler(pref)
+	searchH := search.NewHandler(previewer)
 
 	withAuth := httpx.WithAuth(a.Verifier())
 
@@ -217,6 +230,8 @@ func buildServer(
 	mux.Handle("POST /api/queue/queue/skipped", withAuth(http.HandlerFunc(qH.Skipped)))
 	mux.Handle("POST /api/queue/queue/finished", withAuth(http.HandlerFunc(qH.Finished)))
 	mux.Handle("POST /api/queue/search", withAuth(http.HandlerFunc(qH.Search)))
+	// v0.4.1 PR C — typeahead preview. Stateless; wraps Discogs /database/search.
+	mux.Handle("GET /api/queue/search/preview", withAuth(http.HandlerFunc(searchH.Preview)))
 	mux.Handle("DELETE /api/queue/queue/{id}", withAuth(http.HandlerFunc(qH.RemoveSong)))
 	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))

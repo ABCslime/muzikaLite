@@ -147,20 +147,32 @@ export const useQueueStore = defineStore('queue', {
       }
     },
 
-    // v0.4 PR 3: user-initiated search. The backend accepts the raw query,
-    // normalizes it, creates a stub, and asynchronously resolves the stub
-    // via Discogs + download ladder. Returns { songId, query } on success.
-    //
-    // searchedQuery is retained in store state so the UI can show "you
-    // searched for X" feedback while the stub resolves.
-    async searchAndQueue(query) {
+    // v0.4.1 PR C: typeahead preview. Returns candidates without
+    // queueing anything. No store state change — the caller (TopBar)
+    // owns the dropdown state. Errors surface to caller for UX.
+    async previewSearch(query) {
+      try {
+        const candidates = await queueAPI.previewSearch(query)
+        return { success: true, data: candidates }
+      } catch (error) {
+        const status = error.response?.status
+        const msg = error.response?.data?.message || error.message || 'Preview failed'
+        return { success: false, error: msg, status }
+      }
+    },
+
+    // v0.4.1 PR C: queue a specific (pre-picked) release OR fall back to
+    // the legacy auto-pick path. Accepts either:
+    //   {title, artist, catalogNumber?, query?} — pre-picked (preferred)
+    //   {query}                                  — legacy auto-pick
+    // Returns { songId, query } on success. lastSearchQuery/lastSearchSongId
+    // drive the "searching for X…" banner until the entry appears.
+    async searchAndQueue(candidate) {
       this.error = null
       try {
-        const resp = await queueAPI.searchAndQueue(query)
-        this.lastSearchQuery = resp.query
+        const resp = await queueAPI.searchAndQueue(candidate)
+        this.lastSearchQuery = resp.query || candidate.query || candidate.title
         this.lastSearchSongId = resp.songId
-        // The entry will appear asynchronously; the caller can poll
-        // fetchQueue() or just wait for the next periodic refresh.
         return { success: true, data: resp }
       } catch (error) {
         this.error = error.response?.data?.message || error.message || 'Search failed'

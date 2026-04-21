@@ -141,17 +141,53 @@ export const queueAPI = {
     }
   },
 
-  // v0.4 PR 3: user-initiated search. POSTs the raw query; the backend
-  // normalizes (lowercase + strip punctuation + collapse whitespace). A
-  // stub is created synchronously; the queue entry appears asynchronously
-  // as the Discogs seeder + download ladder complete.
+  // v0.4.1 PR C: typeahead preview. Returns up to 10 Discogs release
+  // candidates for an in-progress query — stateless, no queue mutation.
+  // Frontend renders these as a dropdown; user picks one to queue.
   //
-  // Returns { songId, query } — songId is the stub's UUID, query is the
-  // normalized form actually used. Throws on 400 (empty normalized
-  // query) or network errors.
-  async searchAndQueue(query) {
+  // 200 with [] means "no results" (UI hides dropdown). 503 means Discogs
+  // isn't configured (UI shows an actionable message). 502 means upstream
+  // failure (typically transient).
+  async previewSearch(query) {
     try {
-      const response = await client.post(`${API_URLS.QUEUE}/search`, { query })
+      const response = await client.get(`${API_URLS.QUEUE}/search/preview`, {
+        params: { q: query },
+      })
+      return response.data
+    } catch (error) {
+      if (error.response) {
+        const status = error.response.status
+        if (status === 503) {
+          console.warn('Search preview unavailable — Discogs not configured')
+        } else if (status === 502) {
+          console.warn('Search preview backend error (transient?)')
+        } else if (status === 401) {
+          console.error('Unauthorized - please login again')
+        } else {
+          console.error(`Preview server error: ${status}`)
+        }
+      } else {
+        console.error('Error previewing search:', error.message)
+      }
+      throw error
+    }
+  },
+
+  // v0.4.1 PR C: pre-picked acquire. After the user clicks a specific
+  // release from the preview dropdown, the frontend POSTs its metadata
+  // and the backend inserts a stub + emits RequestDownload directly —
+  // no second Discogs round-trip, stub gets metadata synchronously.
+  //
+  // `candidate` is { title, artist, catalogNumber?, query? } — title and
+  // artist are required; query is the original user input (only used for
+  // the "searching for X…" UI label).
+  //
+  // Legacy shape (auto-pick on the backend) still supported: pass just
+  // { query }. Kept so scripted clients continue to work, but the UI
+  // uses preview + acquire.
+  async searchAndQueue(candidate) {
+    try {
+      const response = await client.post(`${API_URLS.QUEUE}/search`, candidate)
       return response.data
     } catch (error) {
       if (error.response) {
@@ -159,6 +195,8 @@ export const queueAPI = {
         if (status === 400) {
           const msg = error.response.data?.message || 'query is empty after normalization'
           console.error(`Bad search: ${msg}`)
+        } else if (status === 503) {
+          console.error('Search unavailable — Discogs not configured')
         } else if (status === 401) {
           console.error('Unauthorized - please login again')
         } else {

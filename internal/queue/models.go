@@ -88,12 +88,35 @@ type SongLikedResponse struct {
 	Liked bool `json:"liked"`
 }
 
-// SearchRequest is the body for POST /api/queue/search (v0.4 PR 3). The
-// server applies its own query normalization (internal/queue/normalize.go)
-// before handing the query to the Discogs seeder, so callers can send the
-// raw user input verbatim.
+// SearchRequest is the body for POST /api/queue/search.
+//
+// Two modes, discriminated by whether metadata is set:
+//
+//   - Auto-pick (v0.4 PR 3): only Query is set. The server normalizes,
+//     inserts a stub, publishes DiscoveryIntent{StrategySearch} and lets
+//     the Discogs seeder pick the best match. This path is retained as a
+//     fallback but the frontend now prefers Acquire via the preview
+//     dropdown.
+//
+//   - Pre-picked acquire (v0.4.1 PR C): Title + Artist are set, optionally
+//     CatalogNumber. The server skips the seeder step entirely — inserts a
+//     stub with the chosen metadata and publishes RequestDownload directly.
+//     Query is optional and used only for the correlation notice the UI
+//     shows (“searching for …”).
+//
+// Servers handle the legacy shape via h.svc.Search and the pre-picked
+// shape via h.svc.SearchAcquire. See queue/handler.go for the router.
 type SearchRequest struct {
-	Query string `json:"query"`
+	Query         string `json:"query,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Artist        string `json:"artist,omitempty"`
+	CatalogNumber string `json:"catalogNumber,omitempty"`
+}
+
+// PrePicked is true when the request carries enough metadata to skip
+// the seeder — Title and Artist, at minimum.
+func (r SearchRequest) PrePicked() bool {
+	return r.Title != "" && r.Artist != ""
 }
 
 // SearchResponse is returned synchronously after the stub is inserted.

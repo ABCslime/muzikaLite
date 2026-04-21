@@ -1,12 +1,19 @@
 <template>
-  <div class="min-h-screen bg-pinkish-white">
-    <div class="p-6 max-w-3xl">
-      <h1 class="text-3xl font-bold text-gray-900 mb-2">Settings</h1>
-      <p class="text-gray-600 mb-8">
-        Pick the genres you want Muzika to seed your queue from. Empty lists
-        fall back to the server defaults. Bandcamp and Discogs have separate
-        vocabularies — no cross-mapping yet.
-      </p>
+  <!-- v0.4.1 PR C: views self-compose the app shell (Sidebar + TopBar +
+       PlayerBar) — matches HomeView/PlaylistsView. Before this, the
+       Settings page rendered raw content and hid the whole chrome. -->
+  <div class="flex h-screen">
+    <Sidebar />
+    <div class="flex-1 flex flex-col overflow-hidden">
+      <TopBar />
+      <div class="flex-1 overflow-y-auto pb-24">
+        <div class="p-8 max-w-3xl">
+          <h1 class="text-3xl font-bold text-gray-900 mb-2">Settings</h1>
+          <p class="text-gray-600 mb-8">
+            Pick the genres you want Muzika to seed your queue from. Empty lists
+            fall back to the server defaults. Bandcamp and Discogs have separate
+            vocabularies — no cross-mapping yet.
+          </p>
 
       <div v-if="prefsStore.loading" class="text-gray-600">Loading…</div>
       <div
@@ -84,6 +91,9 @@
           </button>
         </div>
       </form>
+        </div>
+      </div>
+      <PlayerBar />
     </div>
   </div>
 </template>
@@ -91,6 +101,9 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { usePreferencesStore } from '@/stores/preferences'
+import Sidebar from '@/components/layout/Sidebar.vue'
+import TopBar from '@/components/layout/TopBar.vue'
+import PlayerBar from '@/components/layout/PlayerBar.vue'
 
 // Discogs' closed genre vocabulary as of 2026. Keep in sync with the
 // Discogs API — adding custom genres would fail their search endpoint.

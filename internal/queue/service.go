@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -22,6 +21,12 @@ var ErrNoFile = errors.New("queue: song has no file yet")
 // ErrEmptyQuery is returned by Search when the user-supplied query
 // collapses to empty after normalization + long-words fallback.
 var ErrEmptyQuery = errors.New("queue: empty query")
+
+// ErrSearchUnavailable is returned by the auto-pick Search path when
+// Discogs is disabled. With no seeder subscribed to DiscoveryIntent
+// {StrategySearch}, the stub would leak silently. v0.4.1 PR C — Bug #1
+// from the v0.4.x QA walk-through.
+var ErrSearchUnavailable = errors.New("queue: search unavailable — Discogs not configured")
 
 // Service owns per-user queues, the song catalog, and listen stats.
 //
@@ -42,6 +47,12 @@ type Service struct {
 	refiller         *Refiller
 	log              *slog.Logger
 	svcCtx           context.Context
+
+	// discogsEnabled gates the legacy auto-pick Search path: when false
+	// there's no subscriber to DiscoveryIntent{StrategySearch}, so
+	// returning ErrSearchUnavailable beats leaking a stuck stub.
+	// The pre-picked SearchAcquire path works regardless.
+	discogsEnabled bool
 
 	muUsers   sync.Mutex
 	userLocks map[uuid.UUID]*sync.Mutex
@@ -115,9 +126,10 @@ func NewServiceFull(
 			log.With("sub", "refiller"),
 			discogsEnabled, discogsWeight, prefs,
 		),
-		log:       log,
-		svcCtx:    ctx,
-		userLocks: make(map[uuid.UUID]*sync.Mutex),
+		log:            log,
+		svcCtx:         ctx,
+		discogsEnabled: discogsEnabled,
+		userLocks:      make(map[uuid.UUID]*sync.Mutex),
 	}
 }
 
@@ -340,21 +352,74 @@ func (s *Service) GetQueue(ctx context.Context, userID uuid.UUID) (QueueResponse
 	return out, nil
 }
 
-// Search handles POST /api/queue/search (v0.4 PR 3). Normalizes the user's
-// query, inserts a stub song row, and publishes a DiscoveryIntent with
-// Strategy=StrategySearch and PreferredSources=["discogs"] so Bandcamp
-// ignores it and Discogs handles it. Returns the stub's UUID so clients
-// can correlate the eventual queue entry.
+// Search handles POST /api/queue/search. Two modes, discriminated by the
+// request body (see SearchRequest.PrePicked):
 //
-// If the normalized query is empty, retry with words > 4 chars (ROADMAP
-// §v0.4 item 5). If still empty, return 400 — nothing to search on.
+//   - Pre-picked (v0.4.1 PR C): user chose from the TopBar dropdown. We
+//     skip the Discogs-seeder round-trip and emit RequestDownload directly.
+//   - Auto-pick (v0.4 PR 3): legacy path where the backend picks the first
+//     Discogs match for the query. Requires Discogs enabled — otherwise
+//     returns ErrSearchUnavailable to avoid leaking a stuck stub.
+//
+// Both modes require a non-empty normalized query for the UI correlation
+// label. Empty normalized query → ErrEmptyQuery (400).
 func (s *Service) Search(ctx context.Context, userID uuid.UUID, req SearchRequest) (SearchResponse, error) {
 	q := normalizeQuery(req.Query)
 	if q == "" {
 		q = retryLongWords(normalizeQuery(req.Query))
 	}
-	if q == "" {
+	if q == "" && !req.PrePicked() {
 		return SearchResponse{}, ErrEmptyQuery
+	}
+	if req.PrePicked() {
+		return s.searchAcquire(ctx, userID, req, q)
+	}
+	return s.searchAutoPick(ctx, userID, q)
+}
+
+// searchAcquire is the pre-picked path: the user already chose a specific
+// release from the preview dropdown. Insert the stub with metadata already
+// populated (UI sees artist/title immediately), then emit RequestDownload
+// directly with Strategy=StrategySearch. The download worker's probe →
+// ladder → promote-to-ready flow still drives status transitions.
+//
+// Works regardless of discogsEnabled — the Discogs HTTP call that produced
+// the candidates already happened during preview; now we're just asking
+// Soulseek to fetch the file.
+func (s *Service) searchAcquire(ctx context.Context, userID uuid.UUID, req SearchRequest, normalizedQuery string) (SearchResponse, error) {
+	stubID := uuid.New()
+	if err := s.repo.InsertSongStub(ctx, stubID, "", userID); err != nil {
+		return SearchResponse{}, fmt.Errorf("insert stub: %w", err)
+	}
+	if err := s.repo.UpdateSongMetadata(ctx, stubID, req.Title, req.Artist); err != nil {
+		// Stub inserted but metadata update failed — UI would see a blank
+		// entry. Rare, but prefer to fail the whole operation and let the
+		// user retry than ship a nameless row.
+		return SearchResponse{}, fmt.Errorf("update metadata: %w", err)
+	}
+	out := bus.RequestDownload{
+		SongID:        stubID,
+		Title:         req.Title,
+		Artist:        req.Artist,
+		CatalogNumber: req.CatalogNumber,
+		Strategy:      bus.StrategySearch,
+	}
+	// No SendTimeout — v0.4.1 PR C option D2. Back-pressure is preferable
+	// to silent loss when the download worker is saturated. Handler blocks
+	// a few ms at worst; the refiller pattern that needs timeouts doesn't
+	// apply here (user initiated this one event).
+	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{}); err != nil {
+		s.log.Warn("search-acquire: publish failed", "user_id", userID, "err", err)
+	}
+	return SearchResponse{SongID: stubID, Query: normalizedQuery}, nil
+}
+
+// searchAutoPick is the legacy path retained so direct API callers still
+// work. Publishes DiscoveryIntent{StrategySearch}; the Discogs seeder
+// picks the first well-formed result. 503-equivalent if Discogs is off.
+func (s *Service) searchAutoPick(ctx context.Context, userID uuid.UUID, query string) (SearchResponse, error) {
+	if !s.discogsEnabled {
+		return SearchResponse{}, ErrSearchUnavailable
 	}
 
 	stubID := uuid.New()
@@ -366,21 +431,15 @@ func (s *Service) Search(ctx context.Context, userID uuid.UUID, req SearchReques
 		SongID:           stubID,
 		UserID:           userID,
 		Strategy:         bus.StrategySearch,
-		Query:            q,
+		Query:            query,
 		PreferredSources: []string{"discogs"},
 	}
-	err := bus.Publish(ctx, s.bus, ev, bus.PublishOpts{
-		SendTimeout: 100 * time.Millisecond,
-	})
-	if err != nil {
-		// Keep the stub — the refiller won't help for a search intent, but
-		// the caller sees the stub ID so they can retry. Log and return the
-		// SearchResponse anyway; a Publish error on a non-full channel is
-		// rare and the Discogs worker will likely still drain when it
-		// arrives.
+	// No SendTimeout — same reasoning as searchAcquire. User initiated a
+	// single event; back-pressure a few ms > silent loss.
+	if err := bus.Publish(ctx, s.bus, ev, bus.PublishOpts{}); err != nil {
 		s.log.Warn("search: publish failed", "user_id", userID, "err", err)
 	}
-	return SearchResponse{SongID: stubID, Query: q}, nil
+	return SearchResponse{SongID: stubID, Query: query}, nil
 }
 
 // AddSong inserts a song at a specific position (appended to the end).

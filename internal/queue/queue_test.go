@@ -54,10 +54,22 @@ func seedUser(t *testing.T, d *sql.DB) uuid.UUID {
 
 func newService(t *testing.T) (*queue.Service, *sql.DB, string) {
 	t.Helper()
+	return newServiceWithDiscogs(t, true)
+}
+
+// newServiceWithDiscogs lets tests toggle the discogsEnabled flag that
+// gates the legacy auto-pick Search path. Default true (most tests just
+// want the method to work); TestSearch_UnavailableWhenDiscogsDisabled
+// explicitly sets false.
+func newServiceWithDiscogs(t *testing.T, discogsEnabled bool) (*queue.Service, *sql.DB, string) {
+	t.Helper()
 	d, musicDir := setupDB(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	b := bus.New(64, log)
-	svc := queue.NewService(context.Background(), d, musicDir, minSize, defaultGenre, b, nil)
+	svc := queue.NewServiceWithDiscogs(
+		context.Background(), d, musicDir, minSize, defaultGenre,
+		b, nil, discogsEnabled, 0,
+	)
 	return svc, d, musicDir
 }
 
@@ -406,6 +418,78 @@ func TestSearch_EmptyAfterNormalization(t *testing.T) {
 	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
 	if n != 0 {
 		t.Errorf("stub should not have been inserted, count=%d", n)
+	}
+}
+
+// TestSearch_UnavailableWhenDiscogsDisabled: v0.4.1 PR C Bug #1. The
+// legacy auto-pick Search path used to silently leak a stub when Discogs
+// was off (no subscriber for DiscoveryIntent{StrategySearch}). Now
+// returns ErrSearchUnavailable before inserting anything.
+func TestSearch_UnavailableWhenDiscogsDisabled(t *testing.T) {
+	svc, d, _ := newServiceWithDiscogs(t, false)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	_, err := svc.Search(ctx, uid, queue.SearchRequest{Query: "anything"})
+	if err != queue.ErrSearchUnavailable {
+		t.Errorf("got %v, want ErrSearchUnavailable", err)
+	}
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
+	if n != 0 {
+		t.Errorf("stub inserted despite disabled Discogs: %d", n)
+	}
+}
+
+// TestSearch_PrePickedEmitsRequestDownloadDirectly: v0.4.1 PR C. When
+// the request carries metadata (user picked from the preview dropdown),
+// Search skips the DiscoveryIntent → Discogs fan-out and publishes a
+// RequestDownload directly. Works even with Discogs disabled — the
+// Discogs API call already happened during preview.
+func TestSearch_PrePickedEmitsRequestDownloadDirectly(t *testing.T) {
+	svc, d, _ := newServiceWithDiscogs(t, false) // discogs off intentionally
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/pre-picked")
+
+	resp, err := svc.Search(ctx, uid, queue.SearchRequest{
+		Query:         "shanti people",
+		Title:         "Saraswati",
+		Artist:        "Shanti People",
+		CatalogNumber: "PAR-001",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	got := drain(ch, 1, 500*time.Millisecond)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 RequestDownload, got %d", len(got))
+	}
+	ev := got[0]
+	if ev.SongID != resp.SongID {
+		t.Errorf("event SongID %v, want %v", ev.SongID, resp.SongID)
+	}
+	if ev.Title != "Saraswati" || ev.Artist != "Shanti People" {
+		t.Errorf("event metadata: %+v", ev)
+	}
+	if ev.CatalogNumber != "PAR-001" {
+		t.Errorf("event catno = %q, want PAR-001", ev.CatalogNumber)
+	}
+	if ev.Strategy != bus.StrategySearch {
+		t.Errorf("event strategy = %q, want StrategySearch", ev.Strategy)
+	}
+
+	// Stub has metadata populated synchronously so the UI sees artist/title
+	// the moment the search returns.
+	var title, artist sql.NullString
+	_ = d.QueryRow(`SELECT title, artist FROM queue_songs WHERE id = ?`, resp.SongID.String()).Scan(&title, &artist)
+	if !title.Valid || title.String != "Saraswati" {
+		t.Errorf("stub title = %v, want Saraswati", title)
+	}
+	if !artist.Valid || artist.String != "Shanti People" {
+		t.Errorf("stub artist = %v, want Shanti People", artist)
 	}
 }
 

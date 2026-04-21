@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -137,9 +136,12 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		CatalogNumber: result.CatalogNumber,
 		Strategy:      ev.Strategy,
 	}
-	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{
-		SendTimeout: 100 * time.Millisecond,
-	}); err != nil {
+	// RequestDownload has no SendTimeout — v0.4.1 PR C (option D2). Same
+	// reasoning as internal/bandcamp/worker.go: a Discogs pick cost one API
+	// call + one discovery_log row, dropping the event orphans the stub.
+	// Blocking here propagates back-pressure to the refiller, which is
+	// bounded by minQueue - count.
+	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{}); err != nil {
 		s.log.Warn("discogs: publish failed", "song_id", ev.SongID, "err", err)
 	}
 	return nil

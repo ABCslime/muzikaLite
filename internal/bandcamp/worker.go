@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -100,9 +99,12 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		Artist:   result.Artist,
 		Strategy: ev.Strategy,
 	}
-	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{
-		SendTimeout: 100 * time.Millisecond,
-	}); err != nil {
+	// RequestDownload has no SendTimeout — v0.4.1 PR C (option D2). A seeder
+	// has already spent real work (Bandcamp API call + a discovery_log row)
+	// picking this (title, artist). Dropping the event orphans a stub and
+	// wastes the seed effort. Blocking here applies back-pressure up to the
+	// refiller, which is bounded by its own minQueue-count arithmetic.
+	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{}); err != nil {
 		s.log.Warn("bandcamp: publish failed", "song_id", ev.SongID, "err", err)
 	}
 	return nil

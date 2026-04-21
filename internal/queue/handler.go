@@ -87,11 +87,18 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := h.svc.Search(r.Context(), userID, req)
 	if err != nil {
-		if errors.Is(err, ErrEmptyQuery) {
+		switch {
+		case errors.Is(err, ErrEmptyQuery):
 			httpx.WriteError(w, http.StatusBadRequest, "query is empty after normalization")
-			return
+		case errors.Is(err, ErrSearchUnavailable):
+			// v0.4.1 PR C: rather than leak a stub with no seeder to pick
+			// it up, tell the caller search is off. Applies only to the
+			// legacy auto-pick body; pre-picked Acquire works unconditionally.
+			httpx.WriteError(w, http.StatusServiceUnavailable,
+				"search unavailable — Discogs integration is not enabled")
+		default:
+			httpx.WriteError(w, http.StatusInternalServerError, "search failed")
 		}
-		httpx.WriteError(w, http.StatusInternalServerError, "search failed")
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, resp)

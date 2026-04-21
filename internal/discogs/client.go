@@ -25,6 +25,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -112,10 +113,15 @@ func NewClient(baseURL, token string, defaultGenres []string, opts ...Option) *C
 }
 
 // SearchResult is one Discogs release picked by Search.
+//
+// Year is populated from the Discogs response when available; 0 means
+// unknown. Used by the preview dropdown (v0.4.1 PR C) so users can
+// distinguish reissues of the same title.
 type SearchResult struct {
 	Title         string
 	Artist        string
 	CatalogNumber string // "" if the release has no catno
+	Year          int    // 0 if unknown
 }
 
 // Search picks one random release from the top page of /database/search
@@ -230,6 +236,22 @@ func (c *Client) fetchSearch(ctx context.Context, key string, params url.Values)
 	return body, nil
 }
 
+// buildResult turns one releaseResult into a well-formed SearchResult, or
+// returns false if the title can't be split. Shared by all parse*
+// variants so field population stays consistent.
+func buildResult(r releaseResult) (SearchResult, bool) {
+	artist, title, ok := splitArtistTitle(r.Title)
+	if !ok {
+		return SearchResult{}, false
+	}
+	return SearchResult{
+		Title:         title,
+		Artist:        artist,
+		CatalogNumber: firstCatno(r.CatalogNumber),
+		Year:          parseYear(r.Year),
+	}, true
+}
+
 // parsePickRandom decodes a /database/search response and returns one
 // random well-formed item. Used by the genre-based Search path.
 func parsePickRandom(payload []byte, rng *rand.Rand) (SearchResult, error) {
@@ -242,43 +264,79 @@ func parsePickRandom(payload []byte, rng *rand.Rand) (SearchResult, error) {
 	}
 	order := rng.Perm(len(resp.Results))
 	for _, idx := range order {
-		r := resp.Results[idx]
-		artist, title, ok := splitArtistTitle(r.Title)
-		if !ok {
-			continue
+		if res, ok := buildResult(resp.Results[idx]); ok {
+			return res, nil
 		}
-		return SearchResult{
-			Title:         title,
-			Artist:        artist,
-			CatalogNumber: firstCatno(r.CatalogNumber),
-		}, nil
 	}
 	return SearchResult{}, ErrNoResults
 }
 
 // parsePickFirst decodes a /database/search response and returns the
 // first well-formed item (preserving Discogs' relevance ranking). Used
-// by the user-initiated SearchQuery path.
+// by the auto-pick SearchQuery path (legacy; v0.4.1 PR C prefers Preview).
 func parsePickFirst(payload []byte) (SearchResult, error) {
 	var resp searchResponse
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		return SearchResult{}, fmt.Errorf("discogs: unmarshal: %w", err)
 	}
-	if len(resp.Results) == 0 {
-		return SearchResult{}, ErrNoResults
-	}
 	for _, r := range resp.Results {
-		artist, title, ok := splitArtistTitle(r.Title)
+		if res, ok := buildResult(r); ok {
+			return res, nil
+		}
+	}
+	return SearchResult{}, ErrNoResults
+}
+
+// parsePickAll decodes a /database/search response and returns up to
+// `limit` well-formed items, preserving Discogs' relevance order.
+// Malformed titles (no " - " separator) are skipped rather than
+// occupying dropdown slots. v0.4.1 PR C.
+func parsePickAll(payload []byte, limit int) ([]SearchResult, error) {
+	var resp searchResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return nil, fmt.Errorf("discogs: unmarshal: %w", err)
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	out := make([]SearchResult, 0, limit)
+	for _, r := range resp.Results {
+		res, ok := buildResult(r)
 		if !ok {
 			continue
 		}
-		return SearchResult{
-			Title:         title,
-			Artist:        artist,
-			CatalogNumber: firstCatno(r.CatalogNumber),
-		}, nil
+		out = append(out, res)
+		if len(out) >= limit {
+			break
+		}
 	}
-	return SearchResult{}, ErrNoResults
+	return out, nil
+}
+
+// Preview returns up to `limit` candidates for a free-text user query.
+// ROADMAP §v0.4 item 5's "user-initiated search" — same Discogs endpoint
+// as SearchQuery, but the caller picks the winner instead of auto-
+// selecting the head. Empty query → empty slice (not an error; the UI
+// treats it as "hide dropdown").
+//
+// Cache key matches SearchQuery's so the two paths share the 30-day
+// response cache.
+func (c *Client) Preview(ctx context.Context, query string, limit int) ([]SearchResult, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	key := "search:q=" + query
+	params := url.Values{}
+	params.Set("type", "release")
+	params.Set("q", query)
+	payload, err := c.fetchSearch(ctx, key, params)
+	if err != nil {
+		return nil, err
+	}
+	return parsePickAll(payload, limit)
 }
 
 // SweepCache is an optional maintenance hook: drops cache rows older than
@@ -310,6 +368,19 @@ type releaseResult struct {
 	// grab the first as representative; Soulseek users tag with one catno
 	// per file, not a list.
 	CatalogNumber string `json:"catno"`
+	// Year is a string in Discogs' JSON (occasionally "" or "0000" for
+	// unknown). We parse to int and treat anything non-positive as unknown.
+	Year string `json:"year"`
+}
+
+// parseYear turns Discogs' year string into a non-negative int.
+// "1972" -> 1972; "" / "0" / "unknown" -> 0.
+func parseYear(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // splitArtistTitle turns "Artist Name - Release Title" into ("Artist Name",

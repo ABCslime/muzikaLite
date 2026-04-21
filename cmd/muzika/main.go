@@ -21,6 +21,8 @@ import (
 	"github.com/macabc/muzika/internal/bus"
 	"github.com/macabc/muzika/internal/config"
 	"github.com/macabc/muzika/internal/db"
+	"github.com/macabc/muzika/internal/discogs"
+	"github.com/macabc/muzika/internal/discovery"
 	"github.com/macabc/muzika/internal/download"
 	"github.com/macabc/muzika/internal/httpx"
 	"github.com/macabc/muzika/internal/playlist"
@@ -46,7 +48,7 @@ func run() error {
 
 	log := newLogger(cfg.LogLevel)
 
-	// GC tuning: pairs with GOMEMLIMIT set in docker-compose.yml.
+	// GC tuning: pairs with GOMEMLIMIT set in systemd unit.
 	// See ARCHITECTURE.md §1 memory budget.
 	runtime.SetBlockProfileRate(0)
 
@@ -76,6 +78,9 @@ func run() error {
 		return fmt.Errorf("init gosk: %w", err)
 	}
 
+	// ---- Discovery observability (v0.4 PR 2) ----
+	logw := discovery.NewWriter(database)
+
 	// ---- Services ----
 	authSvc := auth.NewService(database, cfg.JWTSecret, cfg.JWTExpiration, b, dispatcher)
 	plSvc := playlist.NewService(database, b)
@@ -83,15 +88,44 @@ func run() error {
 	if len(cfg.BandcampDefaultTags) > 0 {
 		defaultGenre = cfg.BandcampDefaultTags[0]
 	}
-	qSvc := queue.NewService(ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre, b, dispatcher)
+	qSvc := queue.NewServiceWithDiscogs(
+		ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre,
+		b, dispatcher, cfg.DiscogsEnabled, cfg.DiscogsWeight,
+	)
 	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), database, b, dispatcher)
-	dlSvc := download.NewService(database, sk, cfg.MusicStoragePath, b, dispatcher)
+
+	dlCfg := download.Config{
+		Gate: download.GateConfig{
+			MinBitrateKbps: cfg.DownloadMinBitrateKbps,
+			MinFileBytes:   cfg.DownloadMinFileBytes,
+			MaxFileBytes:   cfg.DownloadMaxFileBytes,
+			PeerMaxQueue:   cfg.DownloadPeerMaxQueue,
+		},
+		LadderEnabled:  cfg.DownloadLadderEnabled,
+		LadderEnough:   cfg.DownloadLadderEnoughResults,
+		LadderRungWait: cfg.DownloadLadderRungWindow,
+	}
+	dlSvc := download.NewServiceWithConfig(database, sk, cfg.MusicStoragePath, b, dispatcher, logw, dlCfg)
 
 	// ---- Start worker pools ----
 	plSvc.StartWorkers(ctx)
 	qSvc.StartWorkers(ctx)
 	bcSvc.StartWorkers(ctx, cfg.BandcampWorkers)
 	dlSvc.StartWorkers(ctx, cfg.DownloadWorkers)
+
+	// ---- Optional: Discogs seeder (v0.4 PR 2) ----
+	if cfg.DiscogsEnabled {
+		dgClient := discogs.NewClient(
+			discogs.DefaultBaseURL,
+			cfg.DiscogsToken,
+			cfg.DiscogsDefaultGenres,
+			discogs.WithCache(database),
+		)
+		dgClient.SweepCache(ctx) // best-effort prune of >30-day rows
+		dgSvc := discogs.NewService(dgClient, database, b, dispatcher, logw)
+		dgSvc.StartWorkers(ctx, cfg.DiscogsWorkers)
+		log.Info("discogs seeder enabled", "workers", cfg.DiscogsWorkers, "weight", cfg.DiscogsWeight)
+	}
 
 	// ---- HTTP ----
 	srv := buildServer(cfg, log, authSvc, plSvc, qSvc)

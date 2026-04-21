@@ -7,9 +7,14 @@ design rationale; this file is the short rulebook.
 
 ## 1. Project shape
 
-- Single Go binary under `cmd/muzika`. Five internal domain packages
-  (`auth`, `playlist`, `queue`, `bandcamp`, `download`) that never import
-  each other. They communicate via `internal/bus`.
+- Single Go binary under `cmd/muzika`. Six internal domain packages
+  (`auth`, `playlist`, `queue`, `bandcamp`, `discogs`, `download`) that
+  never import each other. They communicate via `internal/bus`.
+  (`discogs` landed in v0.4 PR 2; before that only five.)
+- An `internal/discovery` package owns the `discovery_log` write path —
+  every seeder + download stage records a row there. `discovery/` is a
+  leaf dep, imported by the seeders and the download worker; it doesn't
+  import from any domain package.
 - Replaces five Spring Boot services (authManager, PlaylistManager,
   QueueManager, BandcampApi, SlskdDownloader) and embeds the Vue SPA.
 - Target: Raspberry Pi 3, 1 GB RAM. Memory budgets are load-bearing.
@@ -35,12 +40,13 @@ and §3 for the full layout.
 
 ```
 cmd/muzika  ─►  all internal/*
-internal/{auth,playlist,queue,bandcamp,download}
+internal/{auth,playlist,queue,bandcamp,discogs,download}
       ├─► internal/bus
       ├─► internal/db
       ├─► internal/httpx
       └─► internal/config
-internal/download  ─►  internal/soulseek   (only — stays thin)
+internal/{bandcamp,discogs,download} ─► internal/discovery  (log writer only)
+internal/download  ─►  internal/soulseek   (stays thin)
 ```
 
 **No domain package imports another domain package.** If you feel tempted,
@@ -228,12 +234,24 @@ All runtime knobs are in `internal/config/Config`, prefix `MUZIKA_`.
   The pre-v0.3.0 HTTP-to-slskd-daemon backend and its
   `MUZIKA_SOULSEEK_BACKEND` switch were retired — there's a single code
   path now.
-- `internal/download` is **thin**: it consumes `RequestDownload`, calls
-  `soulseek.Client` methods, and publishes `LoadedSong` via the outbox.
-  It was named `internal/slskd` before v0.3.0; the event was
-  `RequestSlskdSong`. The package and event were renamed because the name
-  "slskd" no longer describes what the code does — it drives gosk, not an
-  external daemon.
+- `internal/download` is **thin**: it consumes `RequestDownload`, runs
+  the catalog-number ladder (v0.4 PR 2), applies the quality gate
+  (v0.4 PR 2), and publishes `LoadedSong` via the outbox. It was named
+  `internal/slskd` before v0.3.0; the event was `RequestSlskdSong`.
+
+### Ladder + gate invariants (v0.4 PR 2)
+
+- **Ladder rungs are closed**: `[catno, artist+title, title]`. Adding a
+  fourth rung requires a ROADMAP edit first — the ladder's hit-rate log
+  (`discovery_log`, stage=`ladder`) is how we decide whether rung 0
+  earns its keep.
+- **Gate is strict by default**. If every rung under strict rejects
+  everything, one relax pass (halved floors, doubled ceilings) runs
+  before the worker gives up. Relax is silent in PR 2 — PR 3 splits the
+  relaxation signal by intent origin so user-initiated search can
+  surface it.
+- **Every pass/fail writes discovery_log**. Never sample. The table is
+  never deleted. v0.5's similarity engine will read it.
 
 See `ARCHITECTURE.md` §7 for the gosk integration.
 

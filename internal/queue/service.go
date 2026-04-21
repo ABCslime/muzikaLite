@@ -42,7 +42,7 @@ type Service struct {
 	userLocks map[uuid.UUID]*sync.Mutex
 }
 
-// NewService wires a Service and its refiller.
+// NewService wires a Service and its refiller with Bandcamp-only routing.
 //
 // ctx is the process-lifecycle context (main.go's signal.NotifyContext result).
 // It's stored and used by the HTTP-facing refill fire-and-forget goroutines
@@ -56,6 +56,22 @@ func NewService(
 	b *bus.Bus,
 	d *bus.OutboxDispatcher,
 ) *Service {
+	return NewServiceWithDiscogs(ctx, sqlDB, musicPath, minQueueSize, defaultGenre, b, d, false, 0)
+}
+
+// NewServiceWithDiscogs wires a Service whose refiller may route DiscoveryIntents
+// to Discogs with probability discogsWeight. v0.4 PR 2 entry point from main.go.
+func NewServiceWithDiscogs(
+	ctx context.Context,
+	sqlDB *sql.DB,
+	musicPath string,
+	minQueueSize int,
+	defaultGenre string,
+	b *bus.Bus,
+	d *bus.OutboxDispatcher,
+	discogsEnabled bool,
+	discogsWeight float64,
+) *Service {
 	log := slog.Default().With("mod", "queue")
 	repo := NewRepo(sqlDB)
 	return &Service{
@@ -65,10 +81,14 @@ func NewService(
 		dispatcher:       d,
 		musicStoragePath: musicPath,
 		minQueueSize:     minQueueSize,
-		refiller:         NewRefiller(repo, b, minQueueSize, defaultGenre, log.With("sub", "refiller")),
-		log:              log,
-		svcCtx:           ctx,
-		userLocks:        make(map[uuid.UUID]*sync.Mutex),
+		refiller: NewRefillerWithDiscogs(
+			repo, b, minQueueSize, defaultGenre,
+			log.With("sub", "refiller"),
+			discogsEnabled, discogsWeight,
+		),
+		log:       log,
+		svcCtx:    ctx,
+		userLocks: make(map[uuid.UUID]*sync.Mutex),
 	}
 }
 

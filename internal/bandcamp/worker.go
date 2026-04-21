@@ -23,6 +23,13 @@ import (
 // and handles those. This is the "seeders filter on Strategy" contract from
 // ROADMAP v0.4.
 //
+// Source filter: v0.4 PR 2 added the Discogs seeder on the same
+// DiscoveryIntent channel. The refiller (queue.Refiller.pickSource) routes
+// each intent to exactly one seeder by writing a one-element
+// PreferredSources list. Bandcamp silently ignores intents whose list is
+// non-empty and excludes "bandcamp". Empty list = legacy (pre-PR-2) or
+// Discogs-disabled path; bandcamp handles it as before.
+//
 // On ErrNoResults (bandcamp returned no items for the tag) we emit a
 // LoadedSong{Status: Error} via the outbox. queue's onLoadedSong handler
 // deletes the orphaned stub; otherwise stubs accumulate forever whenever
@@ -68,6 +75,9 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 	if ev.Strategy != bus.StrategyRandom {
 		return nil
 	}
+	if !sourceAllowed(ev.PreferredSources, "bandcamp") {
+		return nil
+	}
 	result, err := s.client.Search(ctx, ev.Genre)
 	if err != nil {
 		if errors.Is(err, ErrNoResults) {
@@ -95,6 +105,23 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		s.log.Warn("bandcamp: publish failed", "song_id", ev.SongID, "err", err)
 	}
 	return nil
+}
+
+// sourceAllowed returns true if prefs is empty or contains want.
+// Empty means "any seeder is fine"; a non-empty list restricts routing.
+// Mirrors the discogs package's identical helper — kept duplicated (not
+// extracted to bus) to avoid dragging bandcamp and discogs into a shared
+// utility package for three lines.
+func sourceAllowed(prefs []string, want string) bool {
+	if len(prefs) == 0 {
+		return true
+	}
+	for _, p := range prefs {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }
 
 // emitLoadedError writes a LoadedSong{Error} row to the outbox and wakes the

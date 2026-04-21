@@ -233,6 +233,16 @@ The two-subscriber case on `RequestDownloadEvent` (was `RequestSlskdSongEvent` b
 
 **v0.4 rename — `RequestRandomSong` → `DiscoveryIntent`.** The refiller's request event was widened into `DiscoveryIntent { Strategy, Genre, Query, SeedSongID, SeedPlaylistID, PreferredSources }`. One event type now carries every discovery path — passive refill (`Strategy=random`), user-typed search (`Strategy=search`, v0.4 PR 3), similarity (`Strategy=similar_song` / `similar_playlist`, reserved for v0.5). Seeders subscribe once to `DiscoveryIntent` and filter on `Strategy` — bandcamp handles only `random` today. Outbox backward-compat: `dispatchByType` accepts legacy `TypeRequestRandomSong` rows and republishes them as `DiscoveryIntent{Strategy: StrategyRandom}`.
 
+**v0.4 PR 2 — Discogs, gate, ladder, observability.** Four coordinated changes on top of the rename:
+
+1. **Second seeder: `internal/discogs`.** Discogs API via a Personal Access Token. 30-day SQLite cache of API responses (`discogs_cache` table, migration 0003) so we never re-fetch. Per-client token bucket (1 req/s refill, 5 burst) so the worker pool can't accidentally exceed Discogs' 60/min quota. Produces `RequestDownload` with `CatalogNumber` populated — that's what feeds the ladder's rung 0.
+
+2. **Weighted refiller routing.** Both seeders subscribe to the same `DiscoveryIntent` channel. For per-intent exclusivity, the refiller writes a one-element `PreferredSources` list (`["bandcamp"]` or `["discogs"]`) drawn from a weighted RNG (`MUZIKA_DISCOGS_WEIGHT`, default 0.3). Seeders return early on mismatch. Empty list = "any seeder is fine" (legacy path when Discogs is disabled).
+
+3. **Quality gate + catalog-number ladder** in `internal/download`. See `internal/download/gate.go`, `worker.go`. The ladder walks `[catno, artist+title, title]` at each configured rung window, filtering each rung's results through the gate (192 kbps / 2 MB / 200 MB / peer queue ≤ 50). First rung with ≥ `MUZIKA_DOWNLOAD_LADDER_ENOUGH_RESULTS` post-gate passes wins. If strict rejects everything, one relax pass (halved floors, doubled ceilings) runs before giving up. Codec preference: flac > mp3 > other.
+
+4. **`discovery_log`** (migration 0003). Every seeder pick, every ladder rung, every gate outcome, every picked peer writes a row via `internal/discovery.Writer`. Never deleted — historical data feeds v0.5 similarity and the "is rung 0 earning its keep?" question the ROADMAP asks us to revisit in three months.
+
 ### Transactional outbox
 
 State-change events must **never** be silently dropped. The outbox pattern guarantees at-least-once delivery across process crashes:

@@ -1,0 +1,290 @@
+// Package discogs is the second seeder. It consumes DiscoveryIntent
+// (StrategyRandom only in PR 2; StrategySearch in PR 3) and produces
+// RequestDownload with CatalogNumber populated so the download ladder's
+// rung 0 has something to try.
+//
+// Integration shape:
+//   - HTTP against api.discogs.com via a Personal Access Token
+//   - Per-client token bucket: 1 token/s, 5 burst (Discogs' quota is
+//     60/min authenticated; we cap well under it)
+//   - 30-day SQLite cache (discogs_cache table, migration 0003) so we
+//     never hit the API for data we've already fetched
+//   - No uploads, no OAuth dance, no collection/wantlist writes — read-only.
+//
+// ROADMAP §v0.4 item 2 lives here.
+package discogs
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+// DefaultBaseURL is api.discogs.com. Tests inject an httptest server URL.
+const DefaultBaseURL = "https://api.discogs.com"
+
+// DefaultUserAgent is required by Discogs' ToS. Tests override via WithUserAgent.
+const DefaultUserAgent = "muzika/0.4 (+https://github.com/ABCslime/muzikaLite)"
+
+// Client wraps the HTTP traffic to api.discogs.com. Safe for concurrent
+// use by multiple worker goroutines sharing one rate limiter + cache.
+type Client struct {
+	baseURL       string
+	token         string
+	userAgent     string
+	defaultGenres []string
+	httpClient    *http.Client
+	rng           *rand.Rand
+	limiter       *tokenBucket
+	cache         *cache
+	log           *slog.Logger
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithHTTPClient overrides the default http.Client (useful in tests).
+func WithHTTPClient(c *http.Client) Option {
+	return func(d *Client) { d.httpClient = c }
+}
+
+// WithRand overrides the random source (useful in tests).
+func WithRand(r *rand.Rand) Option {
+	return func(d *Client) { d.rng = r }
+}
+
+// WithUserAgent overrides the User-Agent header (tests mostly).
+func WithUserAgent(ua string) Option {
+	return func(d *Client) { d.userAgent = ua }
+}
+
+// WithCache plugs a SQLite-backed response cache. Pass nil *sql.DB to disable.
+func WithCache(db *sql.DB) Option {
+	return func(d *Client) { d.cache = newCache(db) }
+}
+
+// WithLimiter overrides the rate limiter. Useful for tests that want an
+// infinitely fast bucket.
+func WithLimiter(maxTokens, refillPerSec float64) Option {
+	return func(d *Client) { d.limiter = newTokenBucket(maxTokens, refillPerSec) }
+}
+
+// NewClient constructs a Client with sane defaults.
+//
+//   - baseURL: DefaultBaseURL if empty
+//   - defaultGenres: fallback when a DiscoveryIntent.Genre is empty
+//   - token: required (Personal Access Token); unauthenticated requests work
+//     for some endpoints but limit to 25/min and don't get the User-Agent
+//     goodwill boost. We always authenticate.
+func NewClient(baseURL, token string, defaultGenres []string, opts ...Option) *Client {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	c := &Client{
+		baseURL:       baseURL,
+		token:         token,
+		userAgent:     DefaultUserAgent,
+		defaultGenres: defaultGenres,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		//nolint:gosec // G404: non-crypto random is fine for result selection
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		// 1 token/s refill, 5 burst — headroom above our single-worker
+		// worst case (~1 req per DiscoveryIntent) without coming near
+		// the 60/min quota.
+		limiter: newTokenBucket(5, 1),
+		log:     slog.Default().With("mod", "discogs"),
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// SearchResult is one Discogs release picked by Search.
+type SearchResult struct {
+	Title         string
+	Artist        string
+	CatalogNumber string // "" if the release has no catno
+}
+
+// Search picks one random release from the top page of /database/search
+// filtered by genre. Respects the rate limiter and the 30-day cache.
+//
+// If every result has a malformed title (no " - " separator between
+// artist and release) we return ErrNoResults rather than ship garbage.
+func (c *Client) Search(ctx context.Context, genre string) (SearchResult, error) {
+	if genre == "" {
+		if len(c.defaultGenres) == 0 {
+			return SearchResult{}, fmt.Errorf("discogs: empty genre and no defaults")
+		}
+		genre = c.defaultGenres[c.rng.Intn(len(c.defaultGenres))]
+	}
+
+	payload, err := c.fetchSearch(ctx, genre)
+	if err != nil {
+		return SearchResult{}, err
+	}
+
+	var resp searchResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return SearchResult{}, fmt.Errorf("discogs: unmarshal: %w", err)
+	}
+	if len(resp.Results) == 0 {
+		return SearchResult{}, ErrNoResults
+	}
+
+	// Shuffle and try until one parses — Discogs titles are "Artist - Release"
+	// by convention, but malformed ones (bootlegs, compilations, mixes with
+	// multiple dashes) do appear. Skip rather than ship bad data.
+	order := c.rng.Perm(len(resp.Results))
+	for _, idx := range order {
+		r := resp.Results[idx]
+		artist, title, ok := splitArtistTitle(r.Title)
+		if !ok {
+			continue
+		}
+		return SearchResult{
+			Title:         title,
+			Artist:        artist,
+			CatalogNumber: firstCatno(r.CatalogNumber),
+		}, nil
+	}
+	return SearchResult{}, ErrNoResults
+}
+
+// fetchSearch returns the raw JSON body for (genre). Consults the cache
+// first; on miss hits the API, stores the result, and returns it.
+func (c *Client) fetchSearch(ctx context.Context, genre string) ([]byte, error) {
+	key := "search:genre=" + strings.ToLower(genre)
+	if c.cache != nil {
+		if payload, err := c.cache.Get(ctx, key); err == nil {
+			return payload, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			c.log.Warn("discogs: cache read failed (falling through)", "err", err)
+		}
+	}
+
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	u, _ := url.Parse(c.baseURL + "/database/search")
+	q := u.Query()
+	q.Set("type", "release")
+	q.Set("genre", genre)
+	q.Set("per_page", "100")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: new request: %w", err)
+	}
+	req.Header.Set("Authorization", "Discogs token="+c.token)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: http get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// fallthrough
+	case http.StatusTooManyRequests:
+		return nil, ErrRateLimited
+	default:
+		return nil, fmt.Errorf("discogs: http %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: read body: %w", err)
+	}
+
+	if c.cache != nil {
+		if err := c.cache.Put(ctx, key, body); err != nil {
+			// Cache write is best-effort. Don't fail the search.
+			c.log.Warn("discogs: cache write failed", "err", err)
+		}
+	}
+	return body, nil
+}
+
+// SweepCache is an optional maintenance hook: drops cache rows older than
+// cacheTTL. Main.go calls it once at startup if Discogs is enabled.
+func (c *Client) SweepCache(ctx context.Context) {
+	if c.cache == nil {
+		return
+	}
+	n, err := c.cache.Sweep(ctx)
+	if err != nil {
+		c.log.Warn("discogs: cache sweep failed", "err", err)
+		return
+	}
+	if n > 0 {
+		c.log.Info("discogs: cache swept", "rows", n)
+	}
+}
+
+// ---- JSON shapes (we only extract what we need; rest is ignored by encoding/json) ----
+
+type searchResponse struct {
+	Results []releaseResult `json:"results"`
+}
+
+type releaseResult struct {
+	// Title is "Artist - Release" by Discogs convention.
+	Title string `json:"title"`
+	// CatalogNumber can be "" or "CAT-001, CAT-002" (comma-separated). We
+	// grab the first as representative; Soulseek users tag with one catno
+	// per file, not a list.
+	CatalogNumber string `json:"catno"`
+}
+
+// splitArtistTitle turns "Artist Name - Release Title" into ("Artist Name",
+// "Release Title", true). Returns (_, _, false) for malformed titles
+// (no separator or empty halves).
+//
+// We intentionally only split on the first " - " so "DJ Shadow - Endtroducing.....
+// Pre-Millennium Mix" stays intact as the title.
+func splitArtistTitle(s string) (artist, title string, ok bool) {
+	s = strings.TrimSpace(s)
+	const sep = " - "
+	i := strings.Index(s, sep)
+	if i <= 0 {
+		return "", "", false
+	}
+	artist = strings.TrimSpace(s[:i])
+	title = strings.TrimSpace(s[i+len(sep):])
+	if artist == "" || title == "" {
+		return "", "", false
+	}
+	return artist, title, true
+}
+
+// firstCatno returns the first catalog number from a comma-separated list.
+// Whitespace-trimmed. "" if input is empty or whitespace.
+func firstCatno(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, ","); i > 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return s
+}
+

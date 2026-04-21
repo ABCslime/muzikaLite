@@ -155,3 +155,131 @@ backend that fulfills it — matching the shape of `RequestRandomSong`.
   against slskd (Phases 4–8); muzika ran fully on slskd through v0.2.x;
   gosk stabilized in Phase 8.5; v0.3.0 deleted slskd once gosk was
   proven.
+
+---
+
+## v0.4 PR 2 — Discogs + quality gate + catalog-number ladder + observability
+
+Second of three v0.4 PRs. Ships real product change (not just plumbing)
+in four coordinated pieces, all gated by ROADMAP §v0.4.
+
+### 1. Second seeder: Discogs (`internal/discogs`)
+
+Discogs API integration as the second discovery source. Bandcamp is the
+reliability floor, Discogs is the higher-variance long-tail catalog.
+
+- **Auth**: Personal Access Token via `Authorization: Discogs token=<PAT>`.
+  Read-only; no OAuth dance. `MUZIKA_DISCOGS_TOKEN` required when enabled.
+- **Rate limit**: per-client token bucket, 1 token/s refill, 5 burst.
+  Well under Discogs' 60/min authenticated quota.
+- **Cache**: 30-day SQLite cache of API responses (`discogs_cache`
+  table, migration 0003). Expired rows hidden by readers and swept at
+  startup.
+- **Genre vocabulary**: separate `MUZIKA_DISCOGS_DEFAULT_GENRES`
+  (Discogs' closed vocabulary) from `MUZIKA_BANDCAMP_DEFAULT_TAGS`
+  (Bandcamp's free-form tags). v0.6 introduces cross-source mapping.
+- **Default off**: `MUZIKA_DISCOGS_ENABLED=false` so upgrades from
+  v0.3.x don't require ops action.
+
+### 2. Weighted refiller routing
+
+Both seeders subscribe to the `DiscoveryIntent` channel. For per-intent
+exclusivity (not doubling the download rate), the refiller writes a
+one-element `PreferredSources` list picked by a weighted RNG:
+
+| `MUZIKA_DISCOGS_WEIGHT` | Bandcamp share | Discogs share |
+|-------------------------|----------------|---------------|
+| 0.0 (Discogs disabled)  | 100%           | 0%            |
+| 0.3 (default, enabled)  | 70%            | 30%           |
+| 0.5                     | 50%            | 50%           |
+| 1.0                     | 0%             | 100%          |
+
+Seeders return early on source mismatch — the intent isn't for them.
+
+### 3. Quality gate + catalog-number ladder (`internal/download`)
+
+Gate thresholds (defaults, all configurable):
+
+| Floor                  | Default      | Env                              |
+|------------------------|--------------|----------------------------------|
+| Min bitrate            | 192 kbps     | `MUZIKA_DOWNLOAD_MIN_BITRATE_KBPS` |
+| Min file size          | 2 MB         | `MUZIKA_DOWNLOAD_MIN_FILE_BYTES`   |
+| Max file size          | 200 MB       | `MUZIKA_DOWNLOAD_MAX_FILE_BYTES`   |
+| Peer queue ceiling     | 50           | `MUZIKA_DOWNLOAD_PEER_MAX_QUEUE`   |
+| Codec preference       | flac > mp3 > other | (hardcoded)                 |
+
+Zero-valued bitrate/FilesShared are treated as "unknown" (gosk leaves
+them at 0 when the wire-level response omits them); rejecting on 0
+would silently drop every result.
+
+Ladder rungs in priority order:
+
+0. `catno` — present only when `RequestDownload.CatalogNumber` is
+   non-empty (Discogs seeder populates; Bandcamp leaves blank). On
+   probation per ROADMAP — instrumented via `discovery_log` so we can
+   measure hit rate over three months.
+1. `artist + " " + title`.
+2. `title`.
+
+First rung with `MUZIKA_DOWNLOAD_LADDER_ENOUGH_RESULTS` post-gate passes
+(default 3) wins; remaining rungs are skipped. Rung 0 uses the full
+search window; later rungs use `MUZIKA_DOWNLOAD_LADDER_RUNG_WINDOW`
+(default 5s) to cap worst-case miss latency.
+
+If strict rejects everything at every rung, one relax pass (halved
+floors, doubled ceilings) runs before the worker emits
+`LoadedSong{Error}`. PR 2's relax is silent; PR 3 splits it by intent
+origin so user-initiated search can surface the relaxation.
+
+### 4. `discovery_log` observability (migration 0003)
+
+Every seeder pick, every ladder rung, every gate outcome, every picked
+peer writes a row. Columns: `song_id, user_id, source, strategy, stage,
+rung, query, outcome, reason, result_count, filename, peer, bitrate,
+size`. Never deleted.
+
+Seed-stage rows carry the originating `DiscoveryIntent.Strategy`.
+Download-stage rows leave strategy NULL — aggregations self-join on
+`song_id` to recover it.
+
+Writer lives in `internal/discovery/log.go`. Synchronous INSERTs on
+the shared single-writer `*sql.DB`; a nil `*Writer` is a valid receiver
+so tests can skip observability.
+
+### Files
+
+New packages:
+- `internal/discogs/` — client, rate limiter, cache, worker, errors, tests
+- `internal/discovery/` — `Writer` + `Record`
+
+New files:
+- `internal/db/migrations/0003_discovery_log.{up,down}.sql`
+- `internal/download/gate.go`, `gate_test.go`
+- `internal/download/discoverywriter_helper_test.go`
+
+Modified:
+- `cmd/muzika/main.go` — wires `discovery.Writer`, `discogs.Service`
+  (behind `MUZIKA_DISCOGS_ENABLED`), passes ladder/gate config into
+  `download.NewServiceWithConfig`
+- `internal/bus/events.go` — `RequestDownload.CatalogNumber` added
+- `internal/config/config.go` — 9 new knobs, new validation
+- `internal/download/worker.go` — rewritten around the ladder + gate
+- `internal/download/worker_test.go` — ladder + gate + relax tests
+- `internal/queue/refiller.go` — `NewRefillerWithDiscogs`, weighted
+  `pickSource()`
+- `internal/queue/service.go` — `NewServiceWithDiscogs` constructor
+- `internal/bandcamp/worker.go` — PreferredSources filter
+- `.env.example` — 10 new lines documenting every knob
+- `CLAUDE.md`, `ARCHITECTURE.md` — inline notes
+
+### Verification
+
+- `go build ./...` clean
+- `go vet ./...` clean
+- `go test ./...` all packages pass:
+  `auth, bandcamp, bus, discogs, download, playlist, queue`
+
+### Scope lock honored
+
+This commit explicitly does not ship ROADMAP §v0.4 PR 3 (user search
+endpoint + typo handling + relax-mode split). PR 3 follows on review.

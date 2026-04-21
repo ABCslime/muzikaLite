@@ -147,8 +147,14 @@ type DiscoveryIntent struct {
 // and consumed by the download worker pool (and by queue, for a metadata
 // sync-up). The event name reflects the intent — "please obtain this track" —
 // rather than which backend ultimately fetches it.
+//
+// CatalogNumber is populated by seeders that have one (Discogs) and left
+// empty by seeders that don't (Bandcamp). The download ladder (ROADMAP §v0.4
+// item 4) uses it as rung 0 of the search fallthrough — catno → artist+title
+// → title. Rung 0 is skipped when the field is empty.
 type RequestDownload struct {
-	SongID uuid.UUID `json:"song_id"`
-	Title  string    `json:"title"`
-	Artist string    `json:"artist"`
+	SongID        uuid.UUID `json:"song_id"`
+	Title         string    `json:"title"`
+	Artist        string    `json:"artist"`
+	CatalogNumber string    `json:"catalog_number,omitempty"`
 }

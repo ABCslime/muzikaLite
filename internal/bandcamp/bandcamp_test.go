@@ -176,11 +176,12 @@ func TestWorker_NoResultsIsNoop(t *testing.T) {
 	}
 }
 
-// TestWorker_IgnoresOtherStrategies verifies the seeder's Strategy filter:
-// DiscoveryIntents with strategies bandcamp doesn't handle must be silently
-// dropped — another seeder (e.g. the future Discogs worker or v0.5 similarity
-// engine) will pick them up from the shared channel.
-func TestWorker_IgnoresOtherStrategies(t *testing.T) {
+// TestWorker_IgnoresNonRandomStrategy verifies the seeder's Strategy filter:
+// a DiscoveryIntent with a Strategy bandcamp doesn't handle (StrategySearch
+// here as the representative non-random case) must be silently dropped —
+// another seeder (the Discogs worker in PR 2, the v0.5 similarity engine
+// later) picks it up from the shared channel.
+func TestWorker_IgnoresNonRandomStrategy(t *testing.T) {
 	srv := httptest.NewServer(fakeDiscover(t, []bandcamp.DiscoverItem{
 		{Title: "Hit", BandName: "Band"},
 	}, nil))
@@ -193,19 +194,12 @@ func TestWorker_IgnoresOtherStrategies(t *testing.T) {
 
 	outCh := bus.Subscribe[bus.RequestDownload](b, "test/ignored")
 
-	for _, strat := range []bus.Strategy{
-		bus.StrategyGenre,
-		bus.StrategySearch,
-		bus.StrategySimilarSong,
-		bus.StrategySimilarPlaylist,
-	} {
-		if err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
-			SongID:   uuid.New(),
-			Strategy: strat,
-			Genre:    "electronic",
-		}); err != nil {
-			t.Fatalf("handler (%s): %v", strat, err)
-		}
+	if err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
+		SongID:   uuid.New(),
+		Strategy: bus.StrategySearch,
+		Genre:    "electronic",
+	}); err != nil {
+		t.Fatalf("handler: %v", err)
 	}
 
 	select {

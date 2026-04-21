@@ -164,25 +164,21 @@ func (d *OutboxDispatcher) dispatchByType(ctx context.Context, evType string, pa
 	case TypeDiscoveryIntent:
 		return unmarshalAndPublish[DiscoveryIntent](ctx, d.bus, payload)
 	case TypeRequestRandomSong:
-		return unmarshalLegacyDiscoveryIntent(ctx, d.bus, payload)
+		// Pre-v0.4 legacy branch. Inlined (not factored into a helper) to
+		// keep the whole backward-compat case visible in one place; it's
+		// small and tied to a transitional event name that should
+		// disappear once no pre-v0.4 deployment remains in the wild.
+		var ev DiscoveryIntent
+		if err := json.Unmarshal(payload, &ev); err != nil {
+			return fmt.Errorf("unmarshal legacy RequestRandomSong: %w", err)
+		}
+		if ev.Strategy == "" {
+			ev.Strategy = StrategyRandom
+		}
+		return Publish(ctx, d.bus, ev, PublishOpts{})
 	default:
 		return fmt.Errorf("unknown event type: %s", evType)
 	}
-}
-
-// unmarshalLegacyDiscoveryIntent decodes a pre-v0.4 RequestRandomSong payload
-// into a DiscoveryIntent and publishes it with Strategy=StrategyRandom.
-// The legacy payload's JSON keys (song_id, user_id, genre) match the new
-// struct's JSON tags exactly; only the discriminator name differs.
-func unmarshalLegacyDiscoveryIntent(ctx context.Context, b *Bus, payload []byte) error {
-	var ev DiscoveryIntent
-	if err := json.Unmarshal(payload, &ev); err != nil {
-		return fmt.Errorf("unmarshal legacy RequestRandomSong: %w", err)
-	}
-	if ev.Strategy == "" {
-		ev.Strategy = StrategyRandom
-	}
-	return Publish(ctx, b, ev, PublishOpts{})
 }
 
 func unmarshalAndPublish[T any](ctx context.Context, b *Bus, payload []byte) error {

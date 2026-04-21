@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,21 +29,9 @@ const (
 	testExpiration = 24 * time.Hour
 )
 
-// migrationsURL returns a file:// URL pointing at the repo's migrations/
-// directory, resolved via runtime.Caller so it's independent of the test's
-// working directory.
-func migrationsURL(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	return "file://" + filepath.Join(filepath.Dir(file), "..", "..", "migrations")
-}
-
 // setupTestDB opens a fresh SQLite DB in t.TempDir() with the production
 // pragmas (WAL does NOT work on :memory:, so we use a temp file), runs
-// migrations, and registers a cleanup.
+// the embedded migrations, and registers a cleanup.
 func setupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "muzika-test.db")
@@ -53,8 +40,8 @@ func setupTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("db.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.Migrate(sqlDB, migrationsURL(t)); err != nil {
-		t.Fatalf("db.Migrate: %v", err)
+	if err := db.MigrateEmbedded(sqlDB); err != nil {
+		t.Fatalf("db.MigrateEmbedded: %v", err)
 	}
 	return sqlDB
 }

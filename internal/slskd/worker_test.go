@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -21,12 +20,6 @@ import (
 	"github.com/macabc/muzika/internal/soulseek"
 )
 
-func migrationsURL(t *testing.T) string {
-	t.Helper()
-	_, file, _, _ := runtime.Caller(0)
-	return "file://" + filepath.Join(filepath.Dir(file), "..", "..", "migrations")
-}
-
 func setupDB(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "muzika-test.db")
@@ -35,7 +28,7 @@ func setupDB(t *testing.T) *sql.DB {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	if err := db.Migrate(d, migrationsURL(t)); err != nil {
+	if err := db.MigrateEmbedded(d); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return d
@@ -97,7 +90,7 @@ func TestWorker_HappyPath(t *testing.T) {
 	fc := &fakeClient{
 		searchResp: []soulseek.SearchResult{
 			{Peer: "peer1", Filename: "/x/song.mp3", Size: 100, FilesShared: 500, QueueLen: 0},
-			{Peer: "peer-tiny", Filename: "/y/song.mp3", Size: 100, FilesShared: 0, QueueLen: 0}, // filtered
+			{Peer: "peer-busy", Filename: "/y/song.mp3", Size: 100, FilesShared: 250, QueueLen: 9999}, // filtered (queue too long)
 		},
 		states: []soulseek.DownloadState{
 			{State: soulseek.DownloadQueued},

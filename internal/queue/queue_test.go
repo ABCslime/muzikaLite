@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -23,12 +22,6 @@ const (
 	defaultGenre = "electronic"
 )
 
-func migrationsURL(t *testing.T) string {
-	t.Helper()
-	_, file, _, _ := runtime.Caller(0)
-	return "file://" + filepath.Join(filepath.Dir(file), "..", "..", "migrations")
-}
-
 func setupDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	tmp := t.TempDir()
@@ -42,7 +35,7 @@ func setupDB(t *testing.T) (*sql.DB, string) {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	if err := db.Migrate(d, migrationsURL(t)); err != nil {
+	if err := db.MigrateEmbedded(d); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return d, musicDir

@@ -132,10 +132,17 @@ func (s *Service) waitForDownload(ctx context.Context, h soulseek.DownloadHandle
 
 // pickBest filters results by peer quality heuristics, then returns the peer
 // and file with the most shared files (a rough proxy for peer reliability).
+//
+// FilesShared == 0 is treated as "unknown" rather than "zero-share peer":
+// the slskd backend populates it from the API's FileCount (always >=1 when
+// the peer responds to a search, so nothing gets incorrectly admitted), but
+// the native/gosk backend leaves it at 0 because the Soulseek wire-level
+// FileSearchResponse doesn't carry a per-peer shared count. Rejecting 0s
+// here would silently drop every gosk result.
 func pickBest(results []soulseek.SearchResult) (string, soulseek.SearchResult) {
 	var candidates []soulseek.SearchResult
 	for _, r := range results {
-		if r.FilesShared < peerMinFiles {
+		if r.FilesShared > 0 && r.FilesShared < peerMinFiles {
 			continue
 		}
 		if r.QueueLen > peerMaxQueue {

@@ -38,7 +38,7 @@ func fakeDiscover(t *testing.T, items []bandcamp.DiscoverItem, lastReqBody *band
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(bandcamp.DiscoverResponse{Items: items})
+		_ = json.NewEncoder(w).Encode(bandcamp.DiscoverResponse{Results: items})
 	}
 }
 
@@ -60,8 +60,8 @@ func TestSearch_HonorsGenre(t *testing.T) {
 	if got.Title != "Song A" || got.Artist != "Artist A" {
 		t.Errorf("got %+v, want Song A / Artist A", got)
 	}
-	if reqBody.Tag != "progressive-house" {
-		t.Errorf("tag sent to bandcamp was %q, want progressive-house", reqBody.Tag)
+	if len(reqBody.TagNormNames) != 1 || reqBody.TagNormNames[0] != "progressive-house" {
+		t.Errorf("tag_norm_names sent to bandcamp was %v, want [progressive-house]", reqBody.TagNormNames)
 	}
 }
 
@@ -76,8 +76,8 @@ func TestSearch_EmptyGenreFallsBackToDefault(t *testing.T) {
 	if _, err := client.Search(context.Background(), ""); err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if reqBody.Tag != "jazz" {
-		t.Errorf("tag sent to bandcamp was %q, want jazz", reqBody.Tag)
+	if len(reqBody.TagNormNames) != 1 || reqBody.TagNormNames[0] != "jazz" {
+		t.Errorf("tag_norm_names sent to bandcamp was %v, want [jazz]", reqBody.TagNormNames)
 	}
 }
 

@@ -64,19 +64,28 @@ func NewClient(baseURL string, defaultTags []string, opts ...Option) *Client {
 }
 
 // DiscoverRequest is the POST body for /api/discover/1/discover_web.
-// Bandcamp accepts (at least) tag, slice, and page fields; other fields are
-// ignored. Keep this struct small — we only need tag-based random discovery.
+//
+// As of 2026 Bandcamp's discover page (DiscoverApp.vue_en bundle) ships
+// these exact params. The endpoint rejects the older tag/slice/page shape
+// with {"error_type":"Endpoints::MissingParamError"}, so every field here
+// is mandatory even if null. See makeParams() in the Vite bundle for
+// upstream definition.
 type DiscoverRequest struct {
-	Tag   string `json:"tag"`
-	Slice string `json:"slice,omitempty"`
-	Page  int    `json:"page,omitempty"`
+	CategoryID         int      `json:"category_id"`
+	TagNormNames       []string `json:"tag_norm_names"`
+	GeonameID          int      `json:"geoname_id"`
+	Slice              string   `json:"slice"`
+	TimeFacetID        *int     `json:"time_facet_id"`
+	Cursor             *string  `json:"cursor"`
+	Size               int      `json:"size"`
+	IncludeResultTypes []string `json:"include_result_types"`
 }
 
 // DiscoverResponse is the JSON shape returned by /api/discover/1/discover_web.
 // We only extract the fields we need (title + band name). Unknown fields are
 // tolerated because encoding/json ignores them by default.
 type DiscoverResponse struct {
-	Items []DiscoverItem `json:"items"`
+	Results []DiscoverItem `json:"results"`
 }
 
 // DiscoverItem is a single discover-API hit.
@@ -89,8 +98,14 @@ type DiscoverItem struct {
 // returns the parsed response.
 func (c *Client) discover(ctx context.Context, tag string) (DiscoverResponse, error) {
 	body, err := json.Marshal(DiscoverRequest{
-		Tag:   tag,
-		Slice: "top",
+		CategoryID:         0,             // "all categories"
+		TagNormNames:       []string{tag}, // single-tag search
+		GeonameID:          0,             // "all locations"
+		Slice:              "top",         // most popular this week
+		TimeFacetID:        nil,           // no time filter
+		Cursor:             nil,           // first page
+		Size:               60,            // maxBatchSize in bundle
+		IncludeResultTypes: []string{"a"}, // albums only (s = songs, we want albums for slskd)
 	})
 	if err != nil {
 		return DiscoverResponse{}, fmt.Errorf("marshal: %w", err)

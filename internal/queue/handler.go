@@ -88,6 +88,25 @@ func (h *Handler) Finished(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// RemoveSong handles DELETE /api/queue/queue/{id} (protected). Used by
+// the frontend to drop a song from the user's queue without marking it
+// skipped/finished (e.g. manual "remove from queue" action).
+func (h *Handler) RemoveSong(w http.ResponseWriter, r *http.Request) {
+	userID, songID, ok := userAndSongID(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.RemoveSong(r.Context(), userID, songID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			httpx.WriteError(w, http.StatusNotFound, "song not in queue")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "remove failed")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // StreamSong handles GET /api/queue/songs/{id} (protected). Uses
 // http.ServeContent so Range requests work, and sniffs Content-Type from
 // the file extension.

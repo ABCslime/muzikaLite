@@ -28,11 +28,11 @@ func (c *Client) Search(ctx context.Context, genre string) (SearchResult, error)
 	if err != nil {
 		return SearchResult{}, err
 	}
-	if len(resp.Items) == 0 {
+	if len(resp.Results) == 0 {
 		return SearchResult{}, ErrNoResults
 	}
-	idx := c.rng.Intn(len(resp.Items))
-	it := resp.Items[idx]
+	idx := c.rng.Intn(len(resp.Results))
+	it := resp.Results[idx]
 	return SearchResult{
 		Title:  it.Title,
 		Artist: it.BandName,

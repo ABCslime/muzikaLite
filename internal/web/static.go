@@ -18,6 +18,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"strings"
 )
 
 //go:embed all:dist
@@ -27,6 +28,13 @@ var distFS embed.FS
 // On a clean checkout dist/ contains only .gitkeep; in that state the
 // handler returns 404 at /. After `npm run build` + the copy step,
 // dist/index.html exists and SPA fallback is active.
+//
+// We deliberately don't delegate the root (or unknown paths) to
+// http.FileServer — that handler 301s `/index.html` to `./` for URL
+// canonicalization, which creates an infinite redirect loop once we
+// rewrite `/` to `/index.html`. Instead we serve index.html directly
+// via http.ServeFileFS for the fallback, and fall through to FileServer
+// only for paths that map to real on-disk assets.
 func SPAHandler() http.Handler {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
@@ -45,21 +53,19 @@ func SPAHandler() http.Handler {
 			return
 		}
 
-		// SPA fallback: if the requested path doesn't exist as a file,
-		// serve index.html so Vue Router can handle client-side routes.
-		p := r.URL.Path
-		if p == "" || p == "/" {
-			p = "/index.html"
-			r = cloneRequestWithPath(r, p)
-		} else if _, err := fs.Stat(sub, p[1:]); err != nil {
-			r = cloneRequestWithPath(r, "/index.html")
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p == "" || p == "index.html" {
+			http.ServeFileFS(w, r, sub, "index.html")
+			return
 		}
-		fileServer.ServeHTTP(w, r)
-	})
-}
 
-func cloneRequestWithPath(r *http.Request, path string) *http.Request {
-	r2 := r.Clone(r.Context())
-	r2.URL.Path = path
-	return r2
+		// Real asset on disk → let FileServer stream it (with ETag, MIME, etc).
+		if _, err := fs.Stat(sub, p); err == nil {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		// Unknown path → Vue Router handles client-side, serve index.html.
+		http.ServeFileFS(w, r, sub, "index.html")
+	})
 }

@@ -57,7 +57,7 @@ func run() error {
 	}
 	defer database.Close()
 
-	if err := db.Migrate(database, "file:///migrations"); err != nil {
+	if err := db.MigrateEmbedded(database); err != nil {
 		return fmt.Errorf("migrations: %w", err)
 	}
 	log.Info("migrations applied")
@@ -168,6 +168,7 @@ func buildServer(
 	mux.Handle("POST /api/queue/queue/check", withAuth(http.HandlerFunc(qH.Check)))
 	mux.Handle("POST /api/queue/queue/skipped", withAuth(http.HandlerFunc(qH.Skipped)))
 	mux.Handle("POST /api/queue/queue/finished", withAuth(http.HandlerFunc(qH.Finished)))
+	mux.Handle("DELETE /api/queue/queue/{id}", withAuth(http.HandlerFunc(qH.RemoveSong)))
 	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))
 	mux.Handle("POST /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.Like)))

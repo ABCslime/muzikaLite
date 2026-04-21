@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/google/uuid"
@@ -16,12 +15,6 @@ import (
 	"github.com/macabc/muzika/internal/playlist"
 )
 
-func migrationsURL(t *testing.T) string {
-	t.Helper()
-	_, file, _, _ := runtime.Caller(0)
-	return "file://" + filepath.Join(filepath.Dir(file), "..", "..", "migrations")
-}
-
 func setupDB(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "muzika-test.db")
@@ -30,7 +23,7 @@ func setupDB(t *testing.T) *sql.DB {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
-	if err := db.Migrate(d, migrationsURL(t)); err != nil {
+	if err := db.MigrateEmbedded(d); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	return d

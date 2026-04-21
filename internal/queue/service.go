@@ -279,6 +279,18 @@ func (s *Service) CheckQueue(ctx context.Context, userID uuid.UUID) error {
 	return nil
 }
 
+// RemoveSong removes songID from userID's queue without recording it as
+// played or skipped — used for explicit user-driven removals from the UI.
+// Triggers a refill pass so the queue doesn't stay short.
+func (s *Service) RemoveSong(ctx context.Context, userID, songID uuid.UUID) error {
+	defer s.lockFor(userID)()
+	if err := s.repo.RemoveEntry(ctx, userID, songID); err != nil {
+		return err
+	}
+	go s.refiller.Trigger(s.svcCtx, userID)
+	return nil
+}
+
 // ResolveSongPath returns the absolute filesystem path for songID.
 func (s *Service) ResolveSongPath(ctx context.Context, songID uuid.UUID) (string, error) {
 	sg, err := s.repo.GetSong(ctx, songID)

@@ -47,5 +47,17 @@ export const usePreferencesStore = defineStore('preferences', {
         this.loading = false
       }
     },
+
+    // v0.4.2 PR B — toggle a Discogs genre. Called from the TopBar
+    // search dropdown when the user clicks a Genres-section row.
+    // Idempotent: clicking an already-pinned genre unpins it. The
+    // chip on Home updates via the shared store state.
+    async toggleDiscogsGenre(genre) {
+      const present = this.discogsGenres.some(g => g.toLowerCase() === genre.toLowerCase())
+      const next = present
+        ? this.discogsGenres.filter(g => g.toLowerCase() !== genre.toLowerCase())
+        : [...this.discogsGenres, genre]
+      return this.save({ bandcampTags: this.bandcampTags, discogsGenres: next })
+    },
   },
 })

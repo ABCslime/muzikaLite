@@ -353,6 +353,97 @@ func (c *Client) Preview(ctx context.Context, query string, limit int) ([]Search
 	return parsePickAll(payload, limit)
 }
 
+// Entity is the JSON shape for artist + label search hits. ID lets the
+// frontend (v0.4.2 PR C) link to a detail view; Name is the display text;
+// Thumb is an optional thumbnail URL from Discogs that the UI can render
+// in the dropdown row.
+type Entity struct {
+	ID    int
+	Name  string
+	Thumb string
+}
+
+// SearchArtists returns up to `limit` artist hits for a free-text query.
+// v0.4.2 PR B — the TopBar dropdown surfaces these alongside releases.
+// Empty query → nil slice (treated as "hide section").
+func (c *Client) SearchArtists(ctx context.Context, query string, limit int) ([]Entity, error) {
+	return c.searchEntity(ctx, "artist", query, limit)
+}
+
+// SearchLabels returns up to `limit` label hits for a free-text query.
+// Same semantics as SearchArtists; Discogs' label catalog is narrower
+// than its artist catalog so expect fewer results per query.
+func (c *Client) SearchLabels(ctx context.Context, query string, limit int) ([]Entity, error) {
+	return c.searchEntity(ctx, "label", query, limit)
+}
+
+// searchEntity is the shared implementation for artist/label preview. The
+// only difference is the type= param; response parsing uses the same
+// entityResult shape. Cache key includes `type=` so artist and label
+// queries for the same string don't collide with each other or with the
+// release search's cache.
+func (c *Client) searchEntity(ctx context.Context, entityType, query string, limit int) ([]Entity, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, nil
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	key := "search:type=" + entityType + ":q=" + query
+	params := url.Values{}
+	params.Set("type", entityType)
+	params.Set("q", query)
+	payload, err := c.fetchSearch(ctx, key, params)
+	if err != nil {
+		return nil, err
+	}
+	return parseEntities(payload, limit)
+}
+
+// parseEntities decodes a /database/search response for type=artist or
+// type=label. Dedupes by case-insensitive name (Discogs' "Daft Punk" and
+// "Daft Punk (2)" are treated as distinct here — that's a real profile
+// distinction in Discogs' data; we only collapse exact-name dupes).
+func parseEntities(payload []byte, limit int) ([]Entity, error) {
+	var resp struct {
+		Results []entityResult `json:"results"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return nil, fmt.Errorf("discogs: unmarshal entity: %w", err)
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	out := make([]Entity, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	for _, r := range resp.Results {
+		name := strings.TrimSpace(r.Title)
+		if name == "" || r.ID == 0 {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, Entity{
+			ID:    r.ID,
+			Name:  name,
+			Thumb: r.Thumb,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+type entityResult struct {
+	ID    int    `json:"id"`
+	Title string `json:"title"` // "Daft Punk" for artists, "Warp Records" for labels
+	Thumb string `json:"thumb"`
+}
+
 // SweepCache is an optional maintenance hook: drops cache rows older than
 // cacheTTL. Main.go calls it once at startup if Discogs is enabled.
 func (c *Client) SweepCache(ctx context.Context) {

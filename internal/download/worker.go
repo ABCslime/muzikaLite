@@ -471,17 +471,26 @@ func (s *Service) probeAvailability(ctx context.Context, ev bus.RequestDownload)
 	return len(results) > 0
 }
 
-// bestProbeQuery picks the most specific query available for probing.
-// Prefers catno → artist+title → title → "". Mirrors the ladder's order
-// but stops at the first populated rung so we only make one Soulseek call.
+// bestProbeQuery picks the most likely-to-hit query for a "does Soulseek
+// have this at all?" probe. Prefers artist+title → title → catno.
+//
+// Order is inverted from the ladder's (which tries catno first) on
+// purpose: catno is great for disambiguating which pressing wins, but
+// Soulseek users name files by artist+title, not Discogs catnos. A
+// one-shot probe on catno misses real popular songs — Daft Punk's
+// "One More Time" has catno VST1791 but exactly zero Soulseek peers
+// will have "VST1791" in their filename, while "Daft Punk One More
+// Time" finds hundreds. Catno stays as a last resort in case the
+// seeder omitted (title, artist) for some reason; the ladder's rung 0
+// will still try catno if it fires.
 func bestProbeQuery(ev bus.RequestDownload) string {
-	if cn := strings.TrimSpace(ev.CatalogNumber); cn != "" {
-		return cn
-	}
 	if ev.Artist != "" && ev.Title != "" {
 		return strings.TrimSpace(ev.Artist + " " + ev.Title)
 	}
-	return strings.TrimSpace(ev.Title)
+	if t := strings.TrimSpace(ev.Title); t != "" {
+		return t
+	}
+	return strings.TrimSpace(ev.CatalogNumber)
 }
 
 // recordFailed writes a terminal StageFailed row for post-mortem.

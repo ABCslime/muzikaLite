@@ -304,33 +304,56 @@ func (s *Service) runRung(
 		ResultCount: len(results),
 	})
 
-	passed, _ := filterGate(results, g)
+	passed, verdicts := filterGate(results, g)
 
-	// Single gate-stage record summarizing this rung's filter outcome.
-	gateOutcome := discovery.OutcomeOK
-	reason := fmt.Sprintf("passed=%d/%d", len(passed), len(results))
-	if len(passed) == 0 {
-		if mode == GateModeRelaxed {
-			gateOutcome = discovery.OutcomeRelaxed
-		} else {
-			gateOutcome = discovery.OutcomeRejectedStrict
-		}
-	} else if mode == GateModeRelaxed {
-		gateOutcome = discovery.OutcomeRelaxed
+	// Per-candidate gate logging. ROADMAP §v0.4 item 3 requires that "every
+	// candidate that passes or fails the gate is logged with reason." One
+	// StageGate row per SearchResult, carrying the per-file detail that
+	// makes forensic "why did bitrate X get rejected" queries answerable.
+	//
+	// Pass rows: Outcome=ok (or Relaxed when mode=GateModeRelaxed), empty
+	// Reason. Reject rows: Outcome=rejected_strict (or relaxed), Reason
+	// carries classify()'s message, e.g. "bitrate 96 < 192".
+	//
+	// Volume: ~3 rungs × ~100 results = ~300 rows per song acquired. SQLite
+	// handles this fine at Pi scale; the inserts run on the shared single
+	// writer and are microseconds each.
+	for _, v := range verdicts {
+		s.logw.Record(ctx, discovery.Record{
+			SongID:   ev.SongID,
+			Source:   discovery.SourceDownload,
+			Stage:    discovery.StageGate,
+			Rung:     rungIndex,
+			Query:    query,
+			Outcome:  gateOutcomeFor(v.Pass, mode),
+			Reason:   v.Reason,
+			Filename: v.Result.Filename,
+			Peer:     v.Result.Peer,
+			Bitrate:  v.Result.Bitrate,
+			Size:     v.Result.Size,
+		})
 	}
-	s.logw.Record(ctx, discovery.Record{
-		SongID:      ev.SongID,
-		Source:      discovery.SourceDownload,
-		Stage:       discovery.StageGate,
-		Rung:        rungIndex,
-		Query:       query,
-		Outcome:     gateOutcome,
-		Reason:      reason,
-		ResultCount: len(passed),
-	})
 
 	peer, file, ok := pickFromPassed(passed)
 	return peer, file, len(passed), ok
+}
+
+// gateOutcomeFor maps (verdict, mode) to the discovery_log Outcome string.
+// A passed result under strict mode is "ok"; passed under relaxed mode is
+// "relaxed" so aggregations can count how often relax actually saved a song.
+// Failed results carry "rejected_strict" or "relaxed" depending on which
+// pass produced them.
+func gateOutcomeFor(pass bool, mode GateMode) discovery.Outcome {
+	switch {
+	case pass && mode == GateModeRelaxed:
+		return discovery.OutcomeRelaxed
+	case pass:
+		return discovery.OutcomeOK
+	case mode == GateModeRelaxed:
+		return discovery.OutcomeRelaxed
+	default:
+		return discovery.OutcomeRejectedStrict
+	}
 }
 
 // runSingleRung is the fallback used when LadderEnabled=false. Same

@@ -492,8 +492,15 @@ func TestDiscoveryLog_NilWriterIsSafe(t *testing.T) {
 }
 
 // TestDiscoveryLog_RecordsLadderAndPicked: with a real *discovery.Writer,
-// a 3-rung fallthrough should emit one ladder + one gate row per rung, plus
-// one picked row at the end.
+// a 3-rung fallthrough should emit one ladder row per rung plus one gate
+// row per SearchResult across all rungs (per-candidate logging, ROADMAP
+// §v0.4 item 3), plus one picked row at the end.
+//
+// In this scenario:
+//   - rung 0 (CAT-1):        0 results → 0 gate rows
+//   - rung 1 (Artist Title): 0 results → 0 gate rows
+//   - rung 2 (Title):        1 result  → 1 gate row
+// → 3 ladder rows, 1 gate row, 1 picked row.
 func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 	d := setupDB(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -525,7 +532,6 @@ func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 		t.Fatalf("worker: %v", err)
 	}
 
-	// Expect: 3 ladder rows + 3 gate rows + 1 picked row = 7.
 	var ladderN, gateN, pickedN int
 	_ = d.QueryRow(`SELECT COUNT(*) FROM discovery_log WHERE stage = 'ladder'`).Scan(&ladderN)
 	_ = d.QueryRow(`SELECT COUNT(*) FROM discovery_log WHERE stage = 'gate'`).Scan(&gateN)
@@ -534,8 +540,8 @@ func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 	if ladderN != 3 {
 		t.Errorf("ladder rows: got %d, want 3", ladderN)
 	}
-	if gateN != 3 {
-		t.Errorf("gate rows: got %d, want 3", gateN)
+	if gateN != 1 {
+		t.Errorf("gate rows: got %d, want 1 (per-candidate; only rung 2 had results)", gateN)
 	}
 	if pickedN != 1 {
 		t.Errorf("picked rows: got %d, want 1", pickedN)
@@ -546,5 +552,84 @@ func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 	_ = d.QueryRow(`SELECT query FROM discovery_log WHERE stage = 'ladder' AND rung = 0`).Scan(&q)
 	if q != "CAT-1" {
 		t.Errorf("rung 0 query in log = %q, want CAT-1", q)
+	}
+
+	// Sanity-check the per-candidate gate row carries the file detail.
+	var gotFilename string
+	var gotBitrate int
+	_ = d.QueryRow(`SELECT filename, bitrate FROM discovery_log WHERE stage = 'gate'`).Scan(&gotFilename, &gotBitrate)
+	if gotFilename != "a.flac" {
+		t.Errorf("gate row filename = %q, want a.flac", gotFilename)
+	}
+	if gotBitrate != 320 {
+		t.Errorf("gate row bitrate = %d, want 320", gotBitrate)
+	}
+}
+
+// TestDiscoveryLog_RejectedCandidatesLogged: every failed candidate must
+// land in discovery_log with a reason. Four bad results at a single rung
+// should produce four gate rows, each with Outcome=rejected_strict and a
+// non-empty Reason from classify().
+func TestDiscoveryLog_RejectedCandidatesLogged(t *testing.T) {
+	d := setupDB(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	songID := uuid.New()
+	if _, err := d.Exec(`INSERT INTO queue_songs (id) VALUES (?)`, songID.String()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// All four results fail a different gate threshold.
+	fc := &fakeClient{
+		responsesByQuery: map[string][]soulseek.SearchResult{
+			"Artist Title": {
+				{Peer: "lowbr", Filename: "a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
+				{Peer: "small", Filename: "b.mp3", Size: 100, Bitrate: 320, QueueLen: 0},
+				{Peer: "huge", Filename: "c.flac", Size: 500_000_000, Bitrate: 1000, QueueLen: 0},
+				{Peer: "busy", Filename: "d.mp3", Size: 5_000_000, Bitrate: 320, QueueLen: 999},
+			},
+			"Title": nil,
+		},
+		// Relaxed pass will accept the lowbr (96 kbps, passes relaxed 96 floor)
+		// and small (100B, passes relaxed 1MB? actually relaxed is 1MB — 100B
+		// still fails). The point of this test is the reject logging path.
+	}
+
+	cfg := download.DefaultConfig()
+	w := newDiscoveryWriter(d)
+	svc := download.NewServiceWithConfig(d, fc, "/music", b, nil, w, cfg)
+
+	// Ignore the download result — we only care about the gate rows.
+	_ = svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+		SongID: songID, Title: "Title", Artist: "Artist",
+	})
+
+	// Strict pass writes 4 gate rows (one per candidate), all with outcome
+	// rejected_strict and a non-empty reason. Relaxed pass writes another
+	// 4 (some may pass or fail under relaxed thresholds); we only check
+	// that the strict batch landed with reasons.
+	rows, err := d.Query(`
+		SELECT outcome, reason FROM discovery_log
+		WHERE stage = 'gate' AND outcome = 'rejected_strict'
+		ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	var n int
+	for rows.Next() {
+		var outcome, reason string
+		if err := rows.Scan(&outcome, &reason); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if reason == "" {
+			t.Errorf("rejected row has empty Reason — spec requires per-candidate detail")
+		}
+		n++
+	}
+	if n != 4 {
+		t.Errorf("rejected_strict rows = %d, want 4 (one per candidate)", n)
 	}
 }

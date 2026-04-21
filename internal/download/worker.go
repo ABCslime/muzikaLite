@@ -516,8 +516,8 @@ func bestProbeQuery(ev bus.RequestDownload) string {
 	return strings.TrimSpace(ev.CatalogNumber)
 }
 
-// filterByTitle drops Soulseek results whose filename doesn't contain
-// every token of `title` (via filematch.Contains — word-set match
+// filterByTitle drops Soulseek results whose filename doesn't match
+// any variant of `title` (via filematch.ContainsAny — word-set match
 // on the normalized forms, so parens / punctuation / case / stopword
 // differences don't cause rejection).
 //
@@ -530,17 +530,22 @@ func bestProbeQuery(ev bus.RequestDownload) string {
 // search returning every track on Merzbox Vol. 1 labeled with their
 // own titles, not the requested one).
 //
-// When `title` tokenizes to nothing (empty string, all stopwords),
-// the filter is a no-op — we'd rather have unfiltered results than
-// reject everything on a degenerate input.
+// Variants come from filematch.TitleVariants: slash-separated Discogs
+// titles (A-side / B-side, split releases, compilation joins) produce
+// one variant per slash-part, and a filename matching just one side
+// is accepted — that's how peers actually share them.
+//
+// When `title` produces no variants (empty, all stopwords), the filter
+// is a no-op — prefer unfiltered results over rejecting everything
+// on a degenerate input.
 func filterByTitle(results []soulseek.SearchResult, title string) []soulseek.SearchResult {
-	tokens := filematch.Tokens(title)
-	if len(tokens) == 0 {
+	variants := filematch.TitleVariants(title)
+	if len(variants) == 0 {
 		return results
 	}
 	out := make([]soulseek.SearchResult, 0, len(results))
 	for _, r := range results {
-		if filematch.Contains(r.Filename, tokens) {
+		if filematch.ContainsAny(r.Filename, variants) {
 			out = append(out, r)
 		}
 	}

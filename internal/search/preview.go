@@ -355,10 +355,25 @@ type AvailabilityResult struct {
 // artist page resolves in ~4 s worst case.
 const availabilityProbeWindow = 2 * time.Second
 
-// availabilityConcurrency caps goroutine fan-out. gosk's in-flight
-// search registry is cheap but we don't want to blast the Soulseek
-// server with 50 simultaneous searches from a single label page.
-const availabilityConcurrency = 10
+// availabilityConcurrency caps goroutine fan-out. 6 is the empirical
+// sweet spot: stacking 10+ parallel searches against gosk's session
+// wedged its response drain on subsequent requests, while 3-way
+// wasn't enough to finish a 30-release label page inside the
+// per-request deadline. 6 keeps gosk responsive AND clears a
+// typical label page in ~10 s.
+const availabilityConcurrency = 6
+
+// availabilityTimeout bounds how long the per-item label probe can
+// take end-to-end. At 6-way concurrency × 2 s window, a 30-release
+// label page resolves in ~10 s; the 20 s deadline absorbs slow
+// batches and response drain with room to spare.
+const availabilityTimeout = 20 * time.Second
+
+// artistAvailabilityTimeout caps the total wall time for an
+// artist-broad request. If gosk wedges or is slow, an all-unavailable
+// result goes back to the UI — more useful than a pending spinner
+// forever.
+const artistAvailabilityTimeout = 12 * time.Second
 
 // CheckAvailability probes Soulseek for every item in `items` in
 // parallel (capped at availabilityConcurrency) and returns results
@@ -369,6 +384,14 @@ const availabilityConcurrency = 10
 // (network glitch, gosk busy) looks the same to the UI as "no peers
 // have this". The user can still click Queue to get a full-ladder
 // retry with better signal.
+//
+// v0.4.2 PR E: the per-item probe now applies the filematch filter
+// to its Soulseek results — a query that drew back unrelated files
+// (Soulseek fuzzy matching) no longer green-lights the UI as
+// "available" just because any file came back. A hit has to carry
+// every title token in its filename to count. Same semantics as the
+// download worker's probe path — same precision story for LabelView
+// (the one surface still on per-item).
 func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQuery) ([]AvailabilityResult, error) {
 	if p.soulseek == nil {
 		return nil, ErrSoulseekDisabled
@@ -376,6 +399,14 @@ func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQ
 	if len(items) == 0 {
 		return []AvailabilityResult{}, nil
 	}
+
+	// Overall timeout so a wedged gosk doesn't leave the HTTP
+	// request hanging forever. Partial results (everything probed
+	// before deadline) come back; anything still in flight falls
+	// back to Available=false in the UI, which the user can still
+	// queue manually.
+	ctx, cancel := context.WithTimeout(ctx, availabilityTimeout)
+	defer cancel()
 
 	results := make([]AvailabilityResult, len(items))
 	sem := make(chan struct{}, availabilityConcurrency)
@@ -388,22 +419,47 @@ func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQ
 			results[i] = AvailabilityResult{Available: false}
 			continue
 		}
+		// Respect the deadline at the scheduler: if ctx is done,
+		// don't enqueue more goroutines.
+		select {
+		case <-ctx.Done():
+			continue
+		default:
+		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(idx int, q string) {
+		go func(idx int, q, title string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			res, err := p.soulseek.Search(ctx, q, availabilityProbeWindow)
-			if err != nil {
-				p.log.Debug("availability probe failed",
-					"query", q, "err", err)
-				return // leaves Available=false zero value
+			// Belt-and-suspenders select so a stuck gosk.Search
+			// doesn't block this goroutine past the deadline.
+			// The leaked goroutine will eventually drain when
+			// gosk recovers; the HTTP handler returns on time.
+			type out struct {
+				res []soulseek.SearchResult
+				err error
 			}
-			results[idx] = AvailabilityResult{
-				Available: len(res) > 0,
-				PeerCount: len(res),
+			done := make(chan out, 1)
+			go func() {
+				res, err := p.soulseek.Search(ctx, q, availabilityProbeWindow)
+				done <- out{res, err}
+			}()
+			select {
+			case o := <-done:
+				if o.err != nil {
+					p.log.Debug("availability probe failed",
+						"query", q, "err", o.err)
+					return
+				}
+				filtered := filterFilenamesByTitle(o.res, title)
+				results[idx] = AvailabilityResult{
+					Available: len(filtered) > 0,
+					PeerCount: len(filtered),
+				}
+			case <-ctx.Done():
+				return
 			}
-		}(i, query)
+		}(i, query, it.Title)
 	}
 	wg.Wait()
 	return results, nil
@@ -411,12 +467,19 @@ func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQ
 
 // ---- v0.4.2 PR E: artist-broad availability -----------------------------
 
-// artistBroadWindow is longer than availabilityProbeWindow because ONE
-// search now carries an entire page's worth of signal; we'd rather
-// pay the wall time once than N times. 5 s matches the download
-// worker's probe window — if the artist has any Soulseek presence,
-// results arrive well within that.
-const artistBroadWindow = 5 * time.Second
+// artistBroadWindow gives the artist-wide search enough time to pull
+// back a representative sample of what peers have on that artist.
+// Longer than the per-item probe (2 s) because this ONE search is
+// supposed to cover an entire artist page — we'd rather pay the wall
+// time once than fan out 20 shallow probes. 10 s is empirically the
+// sweet spot: past that gosk response volume stops growing
+// materially, under it long-tail artists come back thin.
+//
+// No per-title fallback. An earlier hybrid version fired per-title
+// probes for every broad-miss; that flooded gosk's connection pool
+// and wedged subsequent requests. One long broad search is more
+// reliable than a broad + many narrow ones.
+const artistBroadWindow = 10 * time.Second
 
 // ArtistAvailabilityQuery is the PR E request shape. The frontend
 // passes the artist name once plus the list of titles to test; the
@@ -426,25 +489,32 @@ type ArtistAvailabilityQuery struct {
 	Titles []string `json:"titles"`
 }
 
-// CheckByArtistAvailability runs ONE Soulseek search for `artist` and
-// reports which of `titles` appear among the returned filenames.
+// CheckByArtistAvailability resolves availability for a page's worth
+// of titles under a single artist with ONE Soulseek search:
+// search "<artist>", scan the returned filenames, mark every title
+// whose variants appear in at least one filename as Available.
 //
-// Why this over CheckAvailability? Two reasons:
+// One search (not N) for three reasons:
 //
-//  1. Efficiency — a 20-release artist page hits Soulseek once
-//     instead of 20 times. One longer window produces more hits
-//     than twenty short parallel ones against a jittery network.
+//   - Efficiency: a 20-release artist page pays one round-trip.
 //
-//  2. Reliability — per-release probes use the literal title, which
-//     loses on filename variance ("Song (Remastered).flac" vs
-//     "Song"). Here we tokenize via filematch and match as a
-//     word-set, so parens, punctuation, and stopword differences
-//     don't cause false negatives.
+//   - Reliability: Soulseek's session deals well with occasional
+//     long-window searches; it doesn't deal well with bursts of
+//     many concurrent searches from the same client, which is what
+//     a per-title fan-out looks like.
+//
+//   - Recall: a 10 s broad window pulls back more distinct peers
+//     than 20 × 2 s narrow ones because peers respond to the
+//     artist-tier search asynchronously — the window width dominates.
+//
+// Titles that produce no variants (all stopwords, empty) are left
+// Available=false — no signal to match on.
 //
 // Returns one AvailabilityResult per title, in input order. PeerCount
-// is the count of filtered filename matches for THIS title — not the
-// raw search result count. Empty artist or no titles short-circuits
-// to all-zero results without hitting Soulseek.
+// is the filtered match count (pre-gate). Soft errors (Soulseek
+// unreachable, timeout) are logged and return all-unavailable — no
+// hard error bubbles; the UI degrades to neutral rows which the
+// user can still queue.
 func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string, titles []string) ([]AvailabilityResult, error) {
 	if p.soulseek == nil {
 		return nil, ErrSoulseekDisabled
@@ -455,26 +525,58 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		return results, nil
 	}
 
-	soulseekResults, err := p.soulseek.Search(ctx, artist, artistBroadWindow)
-	if err != nil {
-		p.log.Debug("artist-broad availability search failed",
-			"artist", artist, "err", err)
-		return results, nil // all unavailable; not a hard error
+	// Overall timeout so a wedged gosk doesn't leave the HTTP
+	// request hanging forever — a partial answer is more useful
+	// than no answer. Just over artistBroadWindow to absorb a small
+	// post-window drain; well short of browser / reverse-proxy
+	// default timeouts.
+	ctx, cancel := context.WithTimeout(ctx, artistAvailabilityTimeout)
+	defer cancel()
+
+	// Belt-and-suspenders: some Soulseek backends (notably gosk via
+	// the soul library) occasionally block past their window — the
+	// session gets into a state where a subsequent search doesn't
+	// drain on the advertised deadline. We still want the HTTP
+	// handler to return on time, so run Search in a goroutine and
+	// select on ctx.Done(). The leaked goroutine will eventually
+	// complete when gosk recovers; in exchange, the UI never sees
+	// a spinner that runs forever.
+	type searchOutcome struct {
+		results []soulseek.SearchResult
+		err     error
 	}
-	if len(soulseekResults) == 0 {
+	done := make(chan searchOutcome, 1)
+	go func() {
+		res, err := p.soulseek.Search(ctx, artist, artistBroadWindow)
+		done <- searchOutcome{res, err}
+	}()
+
+	var broad []soulseek.SearchResult
+	select {
+	case o := <-done:
+		if o.err != nil {
+			p.log.Debug("artist-broad availability search failed",
+				"artist", artist, "err", o.err)
+			return results, nil
+		}
+		broad = o.results
+	case <-ctx.Done():
+		p.log.Debug("artist-broad availability search timed out",
+			"artist", artist, "timeout", artistAvailabilityTimeout)
+		return results, nil
+	}
+	if len(broad) == 0 {
 		return results, nil
 	}
 
-	// Per-title token match against each filename. The filename set is
-	// small (tens to low hundreds) so O(titles × results) is fine.
 	for i, title := range titles {
-		tokens := filematch.Tokens(title)
-		if len(tokens) == 0 {
+		variants := filematch.TitleVariants(title)
+		if len(variants) == 0 {
 			continue
 		}
 		count := 0
-		for _, r := range soulseekResults {
-			if filematch.Contains(r.Filename, tokens) {
+		for _, r := range broad {
+			if filematch.ContainsAny(r.Filename, variants) {
 				count++
 			}
 		}
@@ -483,6 +585,29 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		}
 	}
 	return results, nil
+}
+
+// filterFilenamesByTitle is the search-package twin of
+// download.filterByTitle: drops Soulseek results whose filename
+// doesn't match any variant of `title` (filematch.ContainsAny).
+// A no-op when title produces no variants.
+//
+// Variants handle slash-separated Discogs titles ("A / B" splits,
+// compilation joins) — a filename that matches just one side
+// counts, because that's how peers actually share these releases
+// (usually as the single track, not the full pack label).
+func filterFilenamesByTitle(results []soulseek.SearchResult, title string) []soulseek.SearchResult {
+	variants := filematch.TitleVariants(title)
+	if len(variants) == 0 {
+		return results
+	}
+	out := make([]soulseek.SearchResult, 0, len(results))
+	for _, r := range results {
+		if filematch.ContainsAny(r.Filename, variants) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // bulkProbeQuery mirrors download's bestProbeQuery priority (artist+

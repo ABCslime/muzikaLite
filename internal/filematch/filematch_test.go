@@ -18,7 +18,10 @@ func TestNormalize(t *testing.T) {
 		{"Daft Punk - Discovery [WPCR-80083] (JP)", "daft punk discovery"},
 		{"@@host\\Music\\Artist\\01 - Track.flac", "host music artist 01 track flac"},
 		{"  multiple   spaces  ", "multiple spaces"},
-		{"Björk — Ágætis byrjun", "björk ágætis byrjun"}, // unicode letters preserved
+		// v0.4.2 PR E (post-QA): accent-fold so Discogs's Björk matches
+		// the ASCII "bjork" that Soulseek users actually type.
+		{"Björk — Ágætis byrjun", "bjork agaetis byrjun"},
+		{"Le Privé (Avignon/Fr) - 18/11/1995", "le prive 18 11 1995"},
 		{"A & B, C/D", "a b c d"},
 		{"()", ""},
 		{"Song (v2) [2020]", "song"},
@@ -97,6 +100,94 @@ func TestContains(t *testing.T) {
 		got := filematch.Contains(c.filename, c.tokens)
 		if got != c.want {
 			t.Errorf("Contains(%q, %v) = %v, want %v", c.filename, c.tokens, got, c.want)
+		}
+	}
+}
+
+func TestTitleVariants(t *testing.T) {
+	cases := []struct {
+		in   string
+		want [][]string
+	}{
+		{"One More Time", [][]string{{"one", "more", "time"}}},
+		// Slash-separated (with surrounding whitespace) = one variant per side.
+		{"Around The World / Primavera",
+			[][]string{{"around", "world"}, {"primavera"}}},
+		{"Homework / Discovery / Alive 1997",
+			[][]string{{"homework"}, {"discovery"}, {"alive", "1997"}}},
+		// A side with only stopwords gets dropped.
+		{"The / Real Title",
+			[][]string{{"real", "title"}}},
+		// Subtitle dash ("Head - Subtitle") — peers share the head.
+		{"One More Virgin - Tracks For Celebration Of New Century",
+			[][]string{{"one", "more", "virgin"},
+				{"tracks", "celebration", "new", "century"}}},
+		// Colon series marker — peers drop the subtitle.
+		{"Discover The Video : Volume 1",
+			[][]string{{"discover", "video"}, {"volume", "1"}}},
+		// In-word slashes (dates, paths, fractions) don't split.
+		// The " - " separator DOES split the head ("Le Privé ...")
+		// from the date suffix — peers that name this as just
+		// "Le Prive" (without the date) still match via the head variant.
+		{"Le Privé (Avignon/Fr) - 18/11/1995",
+			[][]string{{"le", "prive"}, {"18", "11", "1995"}}},
+		// ("a" is a stopword and drops out.)
+		{"A/B Testing",
+			[][]string{{"b", "testing"}}},
+		// Empty / degenerate returns nil.
+		{"", nil},
+		{"the of a", nil},
+		{" / ", nil},
+	}
+	for _, c := range cases {
+		got := filematch.TitleVariants(c.in)
+		if c.want == nil {
+			if len(got) != 0 {
+				t.Errorf("TitleVariants(%q) = %v, want empty", c.in, got)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("TitleVariants(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestContainsAny(t *testing.T) {
+	cases := []struct {
+		filename string
+		variants [][]string
+		want     bool
+	}{
+		// Empty variants = trivially matches.
+		{"whatever.mp3", nil, true},
+		{"whatever.mp3", [][]string{}, true},
+
+		// Single variant.
+		{"Daft Punk - Around The World.mp3",
+			[][]string{{"around", "world"}}, true},
+
+		// Multiple variants — split release "Around The World / Primavera".
+		// A filename of just the A-side matches because one variant fits.
+		{"Daft Punk - Around The World.mp3",
+			[][]string{{"around", "world"}, {"primavera"}}, true},
+		// B-side-only filename also matches.
+		{"Marina Rei - Primavera.mp3",
+			[][]string{{"around", "world"}, {"primavera"}}, true},
+		// Partial match on a variant (missing "world") + no hit on the
+		// other → false.
+		{"Around the Corner.mp3",
+			[][]string{{"around", "world"}, {"primavera"}}, false},
+
+		// Degenerate variant (empty token list) is skipped.
+		{"foo.mp3",
+			[][]string{{}, {"foo"}}, true},
+	}
+	for _, c := range cases {
+		got := filematch.ContainsAny(c.filename, c.variants)
+		if got != c.want {
+			t.Errorf("ContainsAny(%q, %v) = %v, want %v",
+				c.filename, c.variants, got, c.want)
 		}
 	}
 }

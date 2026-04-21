@@ -289,8 +289,16 @@ func parsePickFirst(payload []byte) (SearchResult, error) {
 
 // parsePickAll decodes a /database/search response and returns up to
 // `limit` well-formed items, preserving Discogs' relevance order.
-// Malformed titles (no " - " separator) are skipped rather than
-// occupying dropdown slots. v0.4.1 PR C.
+//
+// Dedup (v0.4.2 PR A): Discogs indexes the same release across every
+// pressing — vinyl, CD, digital, regional catno variants — so a plain
+// list for "Never Let Me Go" is dominated by five near-identical
+// Placebo rows. We collapse on case-insensitive (artist, title) and
+// keep the FIRST occurrence (highest relevance). The user sees the
+// release once; the catno they get is whichever pressing Discogs
+// ranks highest, and the download ladder will try it on its own merit.
+//
+// Malformed titles (no " - " separator) are skipped.
 func parsePickAll(payload []byte, limit int) ([]SearchResult, error) {
 	var resp searchResponse
 	if err := json.Unmarshal(payload, &resp); err != nil {
@@ -300,11 +308,17 @@ func parsePickAll(payload []byte, limit int) ([]SearchResult, error) {
 		limit = 10
 	}
 	out := make([]SearchResult, 0, limit)
+	seen := make(map[string]struct{}, limit)
 	for _, r := range resp.Results {
 		res, ok := buildResult(r)
 		if !ok {
 			continue
 		}
+		key := strings.ToLower(res.Artist) + "\x00" + strings.ToLower(res.Title)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
 		out = append(out, res)
 		if len(out) >= limit {
 			break

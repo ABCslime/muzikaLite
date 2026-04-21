@@ -74,17 +74,16 @@
       >
         {{ pendingNotice }}
       </div>
+      <!-- v0.4.2 PR A: "not found" is a transient toast now. Backend
+           auto-deletes the stub on LoadedStatusNotFound; the toast fires
+           when the frontend detects "stub was here, now it's gone" and
+           auto-clears after 3 s. No Dismiss button — the queue entry
+           is already gone. -->
       <div
-        v-else-if="notFoundNotice"
-        class="absolute left-0 right-0 top-full mt-1 bg-amber-50 pixel-border border-amber-500 px-3 py-2 text-xs text-amber-900 pixel-texture flex items-center justify-between z-40"
+        v-else-if="notFoundToast"
+        class="absolute left-0 right-0 top-full mt-1 bg-amber-50 pixel-border border-amber-500 px-3 py-2 text-xs text-amber-900 pixel-texture z-40"
       >
-        <span>{{ notFoundNotice }}</span>
-        <button
-          @click="dismissSearchResult"
-          class="ml-3 px-2 py-0.5 bg-amber-200 text-amber-900 pixel-border border-amber-700 text-xs font-semibold hover:bg-amber-300"
-        >
-          Dismiss
-        </button>
+        {{ notFoundToast }}
       </div>
       <div
         v-else-if="relaxedNotice"
@@ -97,7 +96,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useQueueStore } from '@/stores/queue'
 
 // v0.4.1 PR C — TopBar owns the search widget. Two-stage UX:
@@ -209,37 +208,44 @@ async function pick(candidate) {
   }
 }
 
-function dismissSearchResult() {
-  const id = queueStore.lastSearchSongId
-  if (!id) return
-  queueStore.removeSongFromQueue(id)
-  queueStore.lastSearchSongId = null
-  queueStore.lastSearchQuery = null
-}
-
-// Notices mirror what QueueView used to own — now they live with the
-// widget that produced them.
+// v0.4.2 PR A: "searching Discogs…" while we haven't observed the stub
+// yet. Once the stub appears (probing), the dropdown collapsed and the
+// SongItem itself shows the probing state — no separate notice.
 const pendingNotice = computed(() => {
   const id = queueStore.lastSearchSongId
   if (!id) return null
-  const match = queueStore.songs.find(s => s.id === id)
-  if (!match) return `Searching Discogs for "${queueStore.lastSearchQuery}"…`
-  if (match.status === 'probing') {
-    return `Found "${match.title || queueStore.lastSearchQuery}" — checking Soulseek availability…`
-  }
-  return null
+  if (queueStore.lastSearchSawStub) return null
+  return `Searching Discogs for "${queueStore.lastSearchQuery}"…`
 })
 
-const notFoundNotice = computed(() => {
-  const id = queueStore.lastSearchSongId
-  if (!id) return null
-  const match = queueStore.songs.find(s => s.id === id)
-  if (!match || match.status !== 'not_found') return null
-  const label = match.artist
-    ? `"${match.title}" by ${match.artist}`
-    : `"${queueStore.lastSearchQuery}"`
-  return `${label} — not available on Soulseek sadly.`
-})
+// Transient toast (v0.4.2 PR A). Fires once when the stub disappeared
+// from the queue AFTER having been seen — i.e. the backend auto-
+// deleted it on NotFound. Clears itself after 3 s.
+const notFoundToast = ref('')
+let notFoundTimer = null
+
+watch(
+  () => [queueStore.lastSearchSongId, queueStore.lastSearchSawStub, queueStore.songs.length],
+  () => {
+    const id = queueStore.lastSearchSongId
+    if (!id || !queueStore.lastSearchSawStub) return
+    const stillThere = queueStore.songs.some(s => s.id === id)
+    if (stillThere) return
+    // Seen, now gone — backend deleted it.
+    const label = queueStore.lastSearchQuery
+      ? `"${queueStore.lastSearchQuery}"`
+      : 'That'
+    notFoundToast.value = `${label} — not available on Soulseek sadly.`
+    queueStore.lastSearchSongId = null
+    queueStore.lastSearchQuery = null
+    queueStore.lastSearchSawStub = false
+    if (notFoundTimer) clearTimeout(notFoundTimer)
+    notFoundTimer = setTimeout(() => {
+      notFoundToast.value = ''
+      notFoundTimer = null
+    }, 3000)
+  },
+)
 
 const relaxedNotice = computed(() => {
   const id = queueStore.lastSearchSongId
@@ -255,5 +261,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onClickAway)
   if (debounceTimer) clearTimeout(debounceTimer)
+  if (notFoundTimer) clearTimeout(notFoundTimer)
 })
 </script>

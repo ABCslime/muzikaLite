@@ -219,20 +219,21 @@ func (s *Service) onLoadedSong(ctx context.Context, ev bus.LoadedSong) error {
 		}
 		return nil
 	case bus.LoadedStatusNotFound:
-		// v0.4.1 PR B. Don't delete the stub — the user needs to see the
-		// entry with status='not_found' so they know their search failed
-		// rather than silently vanishing. The entry dismissal is a
-		// separate DELETE /api/queue/queue/{id} the user triggers.
-		userID, ok, err := s.repo.GetSongRequester(ctx, ev.SongID)
-		if err != nil {
-			return fmt.Errorf("get requester for not_found: %w", err)
+		// v0.4.2 PR A: auto-delete instead of marking status='not_found'.
+		// Previously the entry sat in the queue with a persistent banner
+		// + inline "Not found on Soulseek" until the user dismissed it —
+		// led to the "in queue AND not available" paradox the user hit
+		// when an already-queued song got re-searched and the probe
+		// happened to fail. With auto-delete the stub disappears; the
+		// frontend detects "entry we were watching just vanished" and
+		// shows a 3s transient "not found sadly" toast instead.
+		//
+		// The discovery_log probe row stays (stage='probe', outcome=
+		// no_results) so forensics survive the delete.
+		if err := s.repo.DeleteSong(ctx, ev.SongID); err != nil {
+			return fmt.Errorf("delete stub on not_found: %w", err)
 		}
-		if !ok {
-			// No requester means nobody's waiting on this — just drop it.
-			return s.repo.DeleteSong(ctx, ev.SongID)
-		}
-		defer s.lockFor(userID)()
-		return s.repo.MarkNotFound(ctx, userID, ev.SongID)
+		return nil
 	default:
 		return fmt.Errorf("unknown LoadedSong status: %q", ev.Status)
 	}
@@ -386,7 +387,25 @@ func (s *Service) Search(ctx context.Context, userID uuid.UUID, req SearchReques
 // Works regardless of discogsEnabled — the Discogs HTTP call that produced
 // the candidates already happened during preview; now we're just asking
 // Soulseek to fetch the file.
+//
+// Dedup (v0.4.2 PR A): if the user already has a ready song with the
+// same (title, artist), we skip the acquire and return the existing
+// SongID. Avoids the "in queue AND not available" paradox when the user
+// re-searches for something already playable and the re-probe happens to
+// fail. Case-insensitive match.
 func (s *Service) searchAcquire(ctx context.Context, userID uuid.UUID, req SearchRequest, normalizedQuery string) (SearchResponse, error) {
+	if existing, err := s.repo.FindReadyUserSong(ctx, userID, req.Title, req.Artist); err != nil {
+		// Lookup failure shouldn't block the acquire — log and fall through
+		// to the normal path. Worst case we get a duplicate probe that
+		// promotes back to ready.
+		s.log.Warn("search-acquire: dedup lookup failed", "user_id", userID, "err", err)
+	} else if existing != uuid.Nil {
+		s.log.Info("search-acquire: skipping duplicate (already ready)",
+			"user_id", userID, "song_id", existing,
+			"title", req.Title, "artist", req.Artist)
+		return SearchResponse{SongID: existing, Query: normalizedQuery}, nil
+	}
+
 	stubID := uuid.New()
 	if err := s.repo.InsertSongStub(ctx, stubID, "", userID); err != nil {
 		return SearchResponse{}, fmt.Errorf("insert stub: %w", err)

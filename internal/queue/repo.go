@@ -110,19 +110,41 @@ func (r *Repo) PromoteToReady(ctx context.Context, userID, songID uuid.UUID, rel
 	return nil
 }
 
-// MarkNotFound flips the entry status to 'not_found'. Unlike the Error path
-// (which deletes the stub), a NotFound-marked entry stays visible so the
-// user gets the "not on Soulseek" feedback; they dismiss it via the
-// existing DELETE /api/queue/queue/{id} route.
-func (r *Repo) MarkNotFound(ctx context.Context, userID, songID uuid.UUID) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE queue_entries SET status = 'not_found'
-		 WHERE user_id = ? AND song_id = ?`,
-		userID.String(), songID.String())
-	if err != nil {
-		return fmt.Errorf("mark not_found: %w", err)
+// FindReadyUserSong returns the first queue_songs.id belonging to userID
+// whose (title, artist) matches the given pair case-insensitively AND is
+// surfaced via a status='ready' queue_entries row. Used by search-acquire
+// to avoid duplicate stubs when the user re-searches for something they
+// already have queued and playable. v0.4.2 PR A.
+//
+// Returns (uuid.Nil, nil) when no match exists — that's the "go ahead and
+// acquire fresh" signal. An actual SQL error propagates.
+//
+// We intentionally only match status='ready'. A probing/stale stub with
+// the same metadata shouldn't block a fresh attempt — the user clicking
+// a candidate is a clear "I want this one".
+func (r *Repo) FindReadyUserSong(ctx context.Context, userID uuid.UUID, title, artist string) (uuid.UUID, error) {
+	if title == "" || artist == "" {
+		return uuid.Nil, nil
 	}
-	return nil
+	var idStr string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT qs.id
+		FROM queue_songs qs
+		JOIN queue_entries qe ON qe.song_id = qs.id
+		WHERE qe.user_id = ?
+		  AND qe.status = 'ready'
+		  AND LOWER(qs.title)  = LOWER(?)
+		  AND LOWER(qs.artist) = LOWER(?)
+		LIMIT 1`,
+		userID.String(), title, artist).Scan(&idStr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("find ready song: %w", err)
+	}
+	id, _ := uuid.Parse(idStr)
+	return id, nil
 }
 
 // CountEntries returns how many songs are queued for userID.

@@ -626,10 +626,12 @@ func TestOnRequestDownload_PassiveIntentDoesNotInsertEntry(t *testing.T) {
 	}
 }
 
-// TestOnLoadedSong_NotFoundMarksEntryNotFound: v0.4.1 PR B. A LoadedSong
-// with status=not_found must mark an existing probing entry as
-// 'not_found' (not delete it), so the UI can show "not on Soulseek".
-func TestOnLoadedSong_NotFoundMarksEntryNotFound(t *testing.T) {
+// TestOnLoadedSong_NotFoundDeletesStub: v0.4.2 PR A flipped the v0.4.1
+// PR B behavior. NotFound now deletes the stub (and cascades to the
+// queue_entries row) rather than marking status='not_found'. This
+// prevents the "in queue AND not available" paradox the user hit when
+// a re-search's probe failed despite an already-ready copy existing.
+func TestOnLoadedSong_NotFoundDeletesStub(t *testing.T) {
 	svc, d, _ := newService(t)
 	uid := seedUser(t, d)
 	ctx := context.Background()
@@ -655,18 +657,111 @@ func TestOnLoadedSong_NotFoundMarksEntryNotFound(t *testing.T) {
 		t.Fatalf("onLoadedSong: %v", err)
 	}
 
-	var status string
-	_ = d.QueryRow(`SELECT status FROM queue_entries WHERE user_id = ? AND song_id = ?`,
-		uid.String(), sid.String()).Scan(&status)
-	if status != "not_found" {
-		t.Errorf("got status %q, want 'not_found'", status)
-	}
-
-	// Stub is retained so the user can see the entry.
 	var songN int
 	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs WHERE id = ?`, sid.String()).Scan(&songN)
-	if songN != 1 {
-		t.Errorf("stub should be retained on NotFound, count=%d", songN)
+	if songN != 0 {
+		t.Errorf("stub should be deleted on NotFound, count=%d", songN)
+	}
+	var entryN int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_entries WHERE song_id = ?`, sid.String()).Scan(&entryN)
+	if entryN != 0 {
+		t.Errorf("queue_entries row should cascade-delete, count=%d", entryN)
+	}
+}
+
+// TestSearch_DedupSkipsAlreadyReady: v0.4.2 PR A. Picking a search
+// candidate for a song the user already has ready returns the existing
+// SongID and does NOT insert a duplicate stub or emit a RequestDownload.
+// Guards the re-search→probe-fails paradox.
+func TestSearch_DedupSkipsAlreadyReady(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	// Seed: existing ready song + queue_entries row for this user.
+	existing := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, title, artist, requesting_user_id) VALUES (?, ?, ?, ?)`,
+		existing.String(), "Sha Mo 3000", "Merzbow", uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
+		 VALUES (?, ?, ?, 0, 'ready')`,
+		uuid.NewString(), uid.String(), existing.String()); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+
+	// Subscribe so we can assert NO RequestDownload fires.
+	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/dedup-guard")
+
+	// Same title+artist, different casing intentionally — dedup is
+	// case-insensitive.
+	resp, err := svc.Search(ctx, uid, queue.SearchRequest{
+		Title:  "SHA MO 3000",
+		Artist: "merzbow",
+		Query:  "sha mo 3000",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp.SongID != existing {
+		t.Errorf("returned SongID %v, want existing %v", resp.SongID, existing)
+	}
+
+	// Zero RequestDownloads should have been published.
+	got := drain(ch, 1, 150*time.Millisecond)
+	if len(got) != 0 {
+		t.Errorf("dedup failed — RequestDownload fired: %+v", got)
+	}
+
+	// queue_songs count unchanged (still 1 — the existing one).
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
+	if n != 1 {
+		t.Errorf("duplicate stub inserted, count=%d", n)
+	}
+}
+
+// TestSearch_DedupIgnoresProbingSongs: dedup only guards against
+// colliding with a READY entry. A probing or failed search shouldn't
+// block a fresh attempt.
+func TestSearch_DedupIgnoresProbingSongs(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	// Seed: same-metadata song but still probing (not ready).
+	stale := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, title, artist, requesting_user_id) VALUES (?, ?, ?, ?)`,
+		stale.String(), "Proper Lady", "Erez", uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+	if _, err := d.Exec(
+		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
+		 VALUES (?, ?, ?, 0, 'probing')`,
+		uuid.NewString(), uid.String(), stale.String()); err != nil {
+		t.Fatalf("seed entry: %v", err)
+	}
+
+	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/no-dedup-on-probing")
+
+	resp, err := svc.Search(ctx, uid, queue.SearchRequest{
+		Title:  "Proper Lady",
+		Artist: "Erez",
+		Query:  "proper lady",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp.SongID == stale {
+		t.Errorf("got stale SongID %v — should be a fresh stub", resp.SongID)
+	}
+
+	got := drain(ch, 1, 500*time.Millisecond)
+	if len(got) != 1 {
+		t.Fatalf("expected a fresh RequestDownload, got %d", len(got))
 	}
 }
 

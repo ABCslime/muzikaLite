@@ -11,6 +11,11 @@ export const useQueueStore = defineStore('queue', {
     // display "searching for X…" feedback while the stub resolves.
     lastSearchQuery: null,
     lastSearchSongId: null,
+    // v0.4.2 PR A: flip to true the first time the stub appears in
+    // `songs` (probing or ready). Lets TopBar distinguish:
+    //   never seen  -> still searching Discogs (keep "searching…" notice)
+    //   seen, gone  -> backend auto-deleted on not_found (toast "sadly not found")
+    lastSearchSawStub: false,
   }),
 
   getters: {
@@ -44,6 +49,15 @@ export const useQueueStore = defineStore('queue', {
         
         // Preserve the exact order from the API response
         this.songs = response?.songs || []
+
+        // v0.4.2 PR A: mark the last-searched stub as "seen" once it
+        // shows up in the queue, even once (probing or ready). TopBar
+        // uses this to tell "still Discogs-searching" (never seen)
+        // apart from "backend auto-deleted on not_found" (seen, gone).
+        if (this.lastSearchSongId) {
+          const hit = this.songs.find(s => s.id === this.lastSearchSongId)
+          if (hit) this.lastSearchSawStub = true
+        }
         
         console.log('✅ Store updated:')
         console.log('   Songs count:', this.songs.length)
@@ -173,6 +187,9 @@ export const useQueueStore = defineStore('queue', {
         const resp = await queueAPI.searchAndQueue(candidate)
         this.lastSearchQuery = resp.query || candidate.query || candidate.title
         this.lastSearchSongId = resp.songId
+        // Reset the seen flag for the new search. fetchQueue flips it
+        // true when it observes the stub.
+        this.lastSearchSawStub = false
         return { success: true, data: resp }
       } catch (error) {
         this.error = error.response?.data?.message || error.message || 'Search failed'

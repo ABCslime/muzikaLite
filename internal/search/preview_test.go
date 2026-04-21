@@ -37,13 +37,15 @@ func TestPreview_EmptyQueryReturnsNilNoError(t *testing.T) {
 }
 
 // TestPreview_ReturnsUpToLimitCandidates: a well-populated response is
-// truncated to the Previewer's default limit (10).
+// truncated to the Previewer's default limit (10). Each row uses a
+// distinct (artist, title) because the dedup introduced in v0.4.2 PR A
+// collapses same-pair rows — we need 25 distinct pairs to actually
+// exercise the limit.
 func TestPreview_ReturnsUpToLimitCandidates(t *testing.T) {
-	// Build 25 well-formed releases.
 	items := make([]map[string]any, 25)
 	for i := range items {
 		items[i] = map[string]any{
-			"title": "Artist - Release",
+			"title": "Artist" + string(rune('A'+i)) + " - Release" + string(rune('A'+i)),
 			"catno": "CAT-" + string(rune('A'+i%26)),
 			"year":  "2020",
 		}
@@ -74,7 +76,7 @@ func TestPreview_ReturnsUpToLimitCandidates(t *testing.T) {
 	if res[0].Year != 2020 {
 		t.Errorf("year not parsed: %d", res[0].Year)
 	}
-	if res[0].Artist != "Artist" || res[0].Title != "Release" {
+	if res[0].Artist != "ArtistA" || res[0].Title != "ReleaseA" {
 		t.Errorf("split failed: %+v", res[0])
 	}
 }

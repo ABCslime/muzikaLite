@@ -270,6 +270,43 @@ func TestWorker_IgnoresOtherStrategies(t *testing.T) {
 	}
 }
 
+// TestSearchQuery_PreviewDedupesByArtistTitle: v0.4.2 PR A. Discogs
+// surfaces the same release under multiple pressings (vinyl, CD,
+// regional variants — different catnos, same (artist, title)). The
+// dropdown should show each release once. Tested through the Preview
+// path since that's where the dropdown is populated.
+func TestSearchQuery_PreviewDedupesByArtistTitle(t *testing.T) {
+	srv := httptest.NewServer(fakeResults(t, []map[string]any{
+		// Three pressings of the same Placebo release, different catnos.
+		{"title": "Placebo - Never Let Me Go", "catno": "SOAKLP263", "year": "2022"},
+		{"title": "Placebo - Never Let Me Go", "catno": "SOAKLPR263", "year": "2022"},
+		{"title": "Placebo - Never Let Me Go", "catno": "SOAK263", "year": "2022"},
+		// Different release.
+		{"title": "Florence + The Machine - Never Let Me Go", "catno": "VF044", "year": "2012"},
+		// Case variant — must also collapse into the Placebo row.
+		{"title": "placebo - never let me go", "catno": "SOAKLPV263", "year": "2022"},
+	}, nil))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	res, err := c.Preview(context.Background(), "never let me go", 10)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("expected 2 after dedup, got %d: %+v", len(res), res)
+	}
+	// First occurrence of each (artist, title) wins — so the Placebo
+	// candidate should carry the FIRST catno (SOAKLP263), not any of the
+	// later ones we discarded.
+	if res[0].Artist != "Placebo" || res[0].CatalogNumber != "SOAKLP263" {
+		t.Errorf("first entry wrong: %+v", res[0])
+	}
+	if res[1].Artist != "Florence + The Machine" {
+		t.Errorf("second entry wrong: %+v", res[1])
+	}
+}
+
 // TestSearchQuery_HonorsQueryParam: SearchQuery hits /database/search with
 // q=<query> and type=release, and the result's Title/Artist come from the
 // first well-formed item (no shuffle — Discogs' ranking wins).

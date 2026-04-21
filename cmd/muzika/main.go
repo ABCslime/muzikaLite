@@ -157,7 +157,7 @@ func run() error {
 		dgSvc.StartWorkers(ctx, cfg.DiscogsWorkers)
 		log.Info("discogs seeder enabled", "workers", cfg.DiscogsWorkers, "weight", cfg.DiscogsWeight)
 	}
-	previewer := search.NewPreviewer(dgClient)
+	previewer := search.NewPreviewer(dgClient).WithSoulseek(sk)
 
 	// ---- HTTP ----
 	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer)
@@ -237,6 +237,8 @@ func buildServer(
 	mux.Handle("GET /api/discogs/artist/{id}", withAuth(http.HandlerFunc(searchH.Artist)))
 	mux.Handle("GET /api/discogs/label/{id}", withAuth(http.HandlerFunc(searchH.Label)))
 	mux.Handle("GET /api/discogs/release/{id}", withAuth(http.HandlerFunc(searchH.Release)))
+	// v0.4.2 PR D — bulk Soulseek availability probe for artist/label/album pages.
+	mux.Handle("POST /api/queue/search/availability", withAuth(http.HandlerFunc(searchH.Availability)))
 	mux.Handle("DELETE /api/queue/queue/{id}", withAuth(http.HandlerFunc(qH.RemoveSong)))
 	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))

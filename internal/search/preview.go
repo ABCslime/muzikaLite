@@ -21,8 +21,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/macabc/muzika/internal/discogs"
+	"github.com/macabc/muzika/internal/soulseek"
 )
 
 // defaultPerCategoryLimit bounds each section's row count. 5 per section
@@ -63,19 +65,33 @@ type Preview struct {
 }
 
 // Previewer wraps the Discogs client for the preview endpoint.
+//
+// v0.4.2 PR D: now also holds a soulseek.Client for the bulk
+// availability-probe path. Kept optional — nil is tolerated and the
+// availability endpoint returns ErrSoulseekDisabled.
 type Previewer struct {
-	client *discogs.Client
-	log    *slog.Logger
+	client   *discogs.Client
+	soulseek soulseek.Client
+	log      *slog.Logger
 }
 
 // NewPreviewer constructs a Previewer. A nil *discogs.Client is valid —
 // Preview returns (Preview{}, ErrDiscogsDisabled) so the handler can map
-// it to 503.
+// it to 503. Soulseek client defaults to nil; wire it via WithSoulseek
+// for the v0.4.2 PR D availability-probe endpoint.
 func NewPreviewer(c *discogs.Client) *Previewer {
 	return &Previewer{
 		client: c,
 		log:    slog.Default().With("mod", "search"),
 	}
+}
+
+// WithSoulseek wires a soulseek.Client onto the Previewer. Returns the
+// receiver so main.go can chain it at construction time. Optional —
+// availability requests return ErrSoulseekDisabled when unset.
+func (p *Previewer) WithSoulseek(sk soulseek.Client) *Previewer {
+	p.soulseek = sk
+	return p
 }
 
 // ErrDiscogsDisabled signals that the preview endpoint can't serve
@@ -85,6 +101,15 @@ var ErrDiscogsDisabled = errDiscogsDisabled{}
 type errDiscogsDisabled struct{}
 
 func (errDiscogsDisabled) Error() string { return "search: Discogs not configured" }
+
+// ErrSoulseekDisabled mirrors ErrDiscogsDisabled for the availability
+// probe — returned when main.go didn't wire a soulseek.Client onto
+// the Previewer (tests, offline dev runs).
+var ErrSoulseekDisabled = errSoulseekDisabled{}
+
+type errSoulseekDisabled struct{}
+
+func (errSoulseekDisabled) Error() string { return "search: Soulseek not configured" }
 
 // Preview fans out three Discogs calls (releases, artists, labels) in
 // parallel and returns the union under a Preview struct. Genre matches
@@ -297,6 +322,105 @@ func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
 	// either shows the ID or falls back to a search/suggestion. A
 	// future PR could add a /labels/{id} lookup to enrich this.
 	return out, nil
+}
+
+// ---- v0.4.2 PR D: bulk availability probe -------------------------------
+
+// AvailabilityQuery is one row to probe — same tuple shape we use for
+// searchAcquire so the frontend can reuse what it already has.
+// Title + Artist required; CatalogNumber optional.
+type AvailabilityQuery struct {
+	Title         string `json:"title"`
+	Artist        string `json:"artist"`
+	CatalogNumber string `json:"catalogNumber,omitempty"`
+}
+
+// AvailabilityResult mirrors AvailabilityQuery order from the request.
+// Available is true iff Soulseek returned at least one peer within
+// availabilityProbeWindow. The probe is "any peer?" — the gate/ladder
+// still run on actual Queue click, so Available=true doesn't guarantee
+// a quality-floor-passing download.
+//
+// PeerCount is the raw response count (pre-gate) for debugging and
+// potential future UI ("12 peers found").
+type AvailabilityResult struct {
+	Available bool `json:"available"`
+	PeerCount int  `json:"peerCount,omitempty"`
+}
+
+// availabilityProbeWindow is shorter than the download worker's
+// 5 s probe — bulk pages want snappy feedback more than exhaustive
+// coverage. Combined with the 10-way concurrency below, a 20-item
+// artist page resolves in ~4 s worst case.
+const availabilityProbeWindow = 2 * time.Second
+
+// availabilityConcurrency caps goroutine fan-out. gosk's in-flight
+// search registry is cheap but we don't want to blast the Soulseek
+// server with 50 simultaneous searches from a single label page.
+const availabilityConcurrency = 10
+
+// CheckAvailability probes Soulseek for every item in `items` in
+// parallel (capped at availabilityConcurrency) and returns results
+// in input order. Empty input returns an empty slice without any
+// network calls.
+//
+// Per-item errors collapse to Available=false — a probe that failed
+// (network glitch, gosk busy) looks the same to the UI as "no peers
+// have this". The user can still click Queue to get a full-ladder
+// retry with better signal.
+func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQuery) ([]AvailabilityResult, error) {
+	if p.soulseek == nil {
+		return nil, ErrSoulseekDisabled
+	}
+	if len(items) == 0 {
+		return []AvailabilityResult{}, nil
+	}
+
+	results := make([]AvailabilityResult, len(items))
+	sem := make(chan struct{}, availabilityConcurrency)
+	var wg sync.WaitGroup
+
+	for i, it := range items {
+		query := bulkProbeQuery(it)
+		if query == "" {
+			// Nothing to probe on; mark unavailable without a Soulseek call.
+			results[i] = AvailabilityResult{Available: false}
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, q string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			res, err := p.soulseek.Search(ctx, q, availabilityProbeWindow)
+			if err != nil {
+				p.log.Debug("availability probe failed",
+					"query", q, "err", err)
+				return // leaves Available=false zero value
+			}
+			results[idx] = AvailabilityResult{
+				Available: len(res) > 0,
+				PeerCount: len(res),
+			}
+		}(i, query)
+	}
+	wg.Wait()
+	return results, nil
+}
+
+// bulkProbeQuery mirrors download's bestProbeQuery priority (artist+
+// title first, then title, then catno) — the same reasoning about
+// what Soulseek users actually tag applies.
+func bulkProbeQuery(it AvailabilityQuery) string {
+	artist := strings.TrimSpace(it.Artist)
+	title := strings.TrimSpace(it.Title)
+	if artist != "" && title != "" {
+		return artist + " " + title
+	}
+	if title != "" {
+		return title
+	}
+	return strings.TrimSpace(it.CatalogNumber)
 }
 
 // Release fetches a full release detail by ID: metadata + tracklist.

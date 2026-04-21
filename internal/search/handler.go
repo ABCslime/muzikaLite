@@ -1,6 +1,7 @@
 package search
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -136,4 +137,44 @@ func (h *Handler) writeDetailErr(w http.ResponseWriter, err error) {
 	default:
 		httpx.WriteError(w, http.StatusBadGateway, "search backend error")
 	}
+}
+
+// Availability handles POST /api/queue/search/availability (v0.4.2 PR D).
+// Body: {"items":[{"title","artist","catalogNumber?"}...]}.
+// Response: {"results":[{"available":bool,"peerCount":int}...]} in input order.
+//
+// Cap request size to 100 items so a malformed label page with 10k
+// releases can't fan out into 10k goroutines. The backend's per-item
+// probe is 2 s wall; 100 items at 10-way concurrency is ~20 s, the
+// effective timeout we want to allow. Larger pages should paginate
+// client-side.
+const maxAvailabilityItems = 100
+
+func (h *Handler) Availability(w http.ResponseWriter, r *http.Request) {
+	if _, ok := httpx.GetUserID(r.Context()); !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	var req struct {
+		Items []AvailabilityQuery `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(req.Items) > maxAvailabilityItems {
+		httpx.WriteError(w, http.StatusBadRequest, "too many items")
+		return
+	}
+	results, err := h.prev.CheckAvailability(r.Context(), req.Items)
+	if err != nil {
+		if errors.Is(err, ErrSoulseekDisabled) {
+			httpx.WriteError(w, http.StatusServiceUnavailable,
+				"Soulseek backend is not configured")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "availability check failed")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results})
 }

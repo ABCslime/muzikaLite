@@ -399,11 +399,20 @@ const availabilityConcurrency = 6
 // batches and response drain with room to spare.
 const availabilityTimeout = 20 * time.Second
 
-// artistAvailabilityTimeout caps the total wall time for an
-// artist-broad request. If gosk wedges or is slow, an all-unavailable
-// result goes back to the UI — more useful than a pending spinner
-// forever.
-const artistAvailabilityTimeout = 12 * time.Second
+// artistFallbackConcurrency caps the per-title probe fan-out when
+// the broad search came back thin. Deliberately low: the earlier
+// 10-way version was saturating gosk's session and wedging
+// subsequent requests. 2 is enough to parallelise a handful of
+// holdouts without adding real pressure.
+const artistFallbackConcurrency = 2
+
+// artistThinBroadThreshold is the "broad was healthy" heuristic.
+// If an artist search returned more than this many filenames, we
+// trust the coverage — titles that didn't surface in that sample
+// almost certainly aren't on Soulseek either, and firing N more
+// probes would just waste gosk time. Below the threshold the
+// per-title fallback runs on unresolved titles.
+const artistThinBroadThreshold = 50
 
 // CheckAvailability probes Soulseek for every item in `items` in
 // parallel (capped at availabilityConcurrency) and returns results
@@ -562,27 +571,21 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		p.log.Debug("by-artist availability cache hit",
 			"artist", artist, "broad_count", len(broad))
 		p.applyBroad(broad, titles, results)
+		if len(broad) < artistThinBroadThreshold {
+			p.runPerTitleFallback(ctx, artist, titles, results)
+		}
 		return results, nil
 	}
 	p.log.Debug("by-artist availability cache miss",
 		"artist", artist)
 
-	// Overall timeout so a wedged gosk doesn't leave the HTTP
-	// request hanging forever — a partial answer is more useful
-	// than no answer. Just over artistBroadWindow to absorb a small
-	// post-window drain; well short of browser / reverse-proxy
-	// default timeouts.
-	ctx, cancel := context.WithTimeout(ctx, artistAvailabilityTimeout)
-	defer cancel()
-
 	// Belt-and-suspenders: some Soulseek backends (notably gosk via
 	// the soul library) occasionally block past their window — the
 	// session gets into a state where a subsequent search doesn't
-	// drain on the advertised deadline. We still want the HTTP
-	// handler to return on time, so run Search in a goroutine and
-	// select on ctx.Done(). The leaked goroutine will eventually
-	// complete when gosk recovers; in exchange, the UI never sees
-	// a spinner that runs forever.
+	// drain on the advertised deadline. The handler-level deadline
+	// (r.Context + WithTimeout in the handler) still cancels the
+	// in-flight goroutine; in the meantime we select on ctx.Done
+	// so the handler returns on time instead of waiting on gosk.
 	type searchOutcome struct {
 		results []soulseek.SearchResult
 		err     error
@@ -603,8 +606,8 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 		}
 		broad = o.results
 	case <-ctx.Done():
-		p.log.Debug("artist-broad availability search timed out",
-			"artist", artist, "timeout", artistAvailabilityTimeout)
+		p.log.Debug("artist-broad availability search hit deadline",
+			"artist", artist)
 		return results, nil
 	}
 	if len(broad) == 0 {
@@ -618,7 +621,97 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 	p.log.Debug("by-artist availability cache put",
 		"artist", artist, "broad_count", len(broad))
 	p.applyBroad(broad, titles, results)
+
+	// Thin-broad fallback: if Soulseek returned a small sample for
+	// the artist name, per-title probes on the still-unresolved
+	// titles can rescue a few (peer file-sharing naming varies).
+	// Above the threshold we trust broad coverage — firing more
+	// probes would just waste gosk time and risk wedging the
+	// session for the next request.
+	if len(broad) < artistThinBroadThreshold {
+		p.runPerTitleFallback(ctx, artist, titles, results)
+	}
 	return results, nil
+}
+
+// runPerTitleFallback fires a small number of parallel
+// "<artist> <title>" probes against Soulseek for titles that the
+// broad phase didn't resolve. Each probe's results are filtered
+// through the same filematch variants, so a false-positive wrong-
+// song hit doesn't slip through.
+//
+// Concurrency is artistFallbackConcurrency (2) — empirically the
+// ceiling that keeps gosk's session responsive for the NEXT
+// availability request. The belt-and-suspenders goroutine-select
+// mirrors the broad-search pattern so ctx cancellation cuts off
+// in-flight gosk.Search calls cleanly from the handler's side.
+//
+// Mutates `results` in place. Does NOT return an error: a failed
+// probe just means we leave that title Available=false.
+func (p *Previewer) runPerTitleFallback(ctx context.Context, artist string, titles []string, results []AvailabilityResult) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, artistFallbackConcurrency)
+	for i, title := range titles {
+		if results[i].Available {
+			continue
+		}
+		if strings.TrimSpace(title) == "" {
+			continue
+		}
+		variants := filematch.TitleVariants(title)
+		if len(variants) == 0 {
+			continue
+		}
+		// Acquire a fallback slot. The select form matters: if sem
+		// is saturated and ctx has already fired, we bail instead
+		// of blocking the for-loop past the handler deadline.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		wg.Add(1)
+		go func(idx int, t string, vars [][]string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			queryTitle := t
+			if len(vars) > 1 {
+				if a, _, ok := strings.Cut(t, " / "); ok {
+					queryTitle = strings.TrimSpace(a)
+				}
+			}
+			query := strings.TrimSpace(artist + " " + queryTitle)
+			type out struct {
+				res []soulseek.SearchResult
+				err error
+			}
+			done := make(chan out, 1)
+			go func() {
+				res, err := p.soulseek.Search(ctx, query, availabilityProbeWindow)
+				done <- out{res, err}
+			}()
+			select {
+			case o := <-done:
+				if o.err != nil {
+					p.log.Debug("per-title fallback probe failed",
+						"query", query, "err", o.err)
+					return
+				}
+				count := 0
+				for _, r := range o.res {
+					if filematch.ContainsAny(r.Filename, vars) {
+						count++
+					}
+				}
+				if count > 0 {
+					results[idx] = AvailabilityResult{Available: true, PeerCount: count}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}(i, title, variants)
+	}
+	wg.Wait()
 }
 
 // applyBroad fills `results` in place: for each title, count how

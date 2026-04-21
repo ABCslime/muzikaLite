@@ -1,14 +1,24 @@
 package search
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/macabc/muzika/internal/discogs"
 	"github.com/macabc/muzika/internal/httpx"
 )
+
+// availabilityByArtistDeadline caps how long one by-artist request
+// can occupy a goroutine. The deadline lives on the handler (not
+// deeper in CheckByArtistAvailability) so it applies to every code
+// path — broad search, per-title fallback, and the in-flight gosk
+// goroutines we cancel via ctx. 15 s fits a 10 s broad window plus
+// a few seconds of trickle fallback without stretching the UX.
+const availabilityByArtistDeadline = 15 * time.Second
 
 // Handler mounts GET /api/queue/search/preview.
 type Handler struct{ prev *Previewer }
@@ -200,7 +210,9 @@ func (h *Handler) AvailabilityByArtist(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "too many titles")
 		return
 	}
-	results, err := h.prev.CheckByArtistAvailability(r.Context(), req.Artist, req.Titles)
+	ctx, cancel := context.WithTimeout(r.Context(), availabilityByArtistDeadline)
+	defer cancel()
+	results, err := h.prev.CheckByArtistAvailability(ctx, req.Artist, req.Titles)
 	if err != nil {
 		if errors.Is(err, ErrSoulseekDisabled) {
 			httpx.WriteError(w, http.StatusServiceUnavailable,

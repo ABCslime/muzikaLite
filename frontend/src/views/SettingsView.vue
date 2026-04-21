@@ -48,25 +48,33 @@
         <section>
           <h2 class="text-xl font-bold text-gray-900 mb-2">Discogs genres</h2>
           <p class="text-sm text-gray-600 mb-3">
-            Discogs uses a fixed set of genre names. Pick any number.
+            Discogs has ~15 top-level genres plus a larger set of finer
+            styles (House, Techno, Trance, …). Muzika routes each pick
+            to the right Discogs query param for you. Pick any number
+            across any group.
           </p>
-          <div class="grid grid-cols-2 gap-2">
-            <label
-              v-for="g in DISCOGS_GENRES"
-              :key="g"
-              class="flex items-center space-x-2 cursor-pointer"
-            >
-              <input
-                type="checkbox"
-                :value="g"
-                v-model="selectedDiscogs"
-                class="pixel-border border-gray-700"
-              />
-              <span class="text-gray-900">{{ g }}</span>
-            </label>
+
+          <div v-for="group in DISCOGS_GROUPS" :key="group.heading" class="mb-5">
+            <h3 class="text-sm font-bold text-gray-800 mb-2">{{ group.heading }}</h3>
+            <div class="grid grid-cols-2 gap-2">
+              <label
+                v-for="g in group.items"
+                :key="g"
+                class="flex items-center space-x-2 cursor-pointer"
+              >
+                <input
+                  type="checkbox"
+                  :value="g"
+                  v-model="selectedDiscogs"
+                  class="pixel-border border-gray-700"
+                />
+                <span class="text-gray-900">{{ g }}</span>
+              </label>
+            </div>
           </div>
+
           <p class="text-xs text-gray-500 mt-1">
-            {{ selectedDiscogs.length }} / {{ MAX_ITEMS }} genres
+            {{ selectedDiscogs.length }} / {{ MAX_ITEMS }} genres + styles
           </p>
         </section>
 
@@ -105,25 +113,91 @@ import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 
-// Discogs' closed genre vocabulary as of 2026. Keep in sync with the
-// Discogs API — adding custom genres would fail their search endpoint.
-// Source: https://www.discogs.com/developers/#page:database,header:database-search
-const DISCOGS_GENRES = [
-  'Blues',
-  'Brass & Military',
-  'Children\'s',
-  'Classical',
-  'Electronic',
-  'Folk, World, & Country',
-  'Funk / Soul',
-  'Hip Hop',
-  'Jazz',
-  'Latin',
-  'Non-Music',
-  'Pop',
-  'Reggae',
-  'Rock',
-  'Stage & Screen',
+// v0.4.2 PR B.1: the list covers Discogs' top-level genres PLUS the
+// styles people actually type (House, Techno, Trance, Ambient, …).
+// The server knows which query param to use for each — see
+// internal/discogs/genres.go KindOf — so pinning a style just works.
+//
+// Grouped visually so the checkbox grid doesn't read as a wall. Keep
+// in sync with internal/discogs/genres.go; if the Go list grows,
+// extend the matching section here.
+const DISCOGS_GROUPS = [
+  {
+    heading: 'Top-level genres',
+    items: [
+      'Blues',
+      'Brass & Military',
+      'Children\'s',
+      'Classical',
+      'Electronic',
+      'Folk, World, & Country',
+      'Funk / Soul',
+      'Hip Hop',
+      'Jazz',
+      'Latin',
+      'Non-Music',
+      'Pop',
+      'Reggae',
+      'Rock',
+      'Stage & Screen',
+    ],
+  },
+  {
+    heading: 'Electronic styles',
+    items: [
+      'House',
+      'Deep House',
+      'Tech House',
+      'Acid House',
+      'Progressive House',
+      'Minimal',
+      'Techno',
+      'Trance',
+      'Psy-Trance',
+      'Progressive Trance',
+      'Ambient',
+      'Drum n Bass',
+      'Dubstep',
+      'Dub',
+      'Breakbeat',
+      'Electro',
+      'IDM',
+      'Downtempo',
+      'Disco',
+      'Synth-pop',
+      'UK Garage',
+      'Hardstyle',
+      'Vaporwave',
+      'Lo-Fi',
+      'Experimental',
+    ],
+  },
+  {
+    heading: 'Rock styles',
+    items: [
+      'Alternative Rock',
+      'Indie Rock',
+      'Punk',
+      'Post-Punk',
+      'Heavy Metal',
+      'Prog Rock',
+      'Psychedelic Rock',
+      'Shoegaze',
+      'Grunge',
+    ],
+  },
+  {
+    heading: 'Hip Hop styles',
+    items: ['Boom Bap', 'Trap', 'Conscious', 'Instrumental'],
+  },
+  {
+    heading: 'Jazz styles',
+    items: ['Bebop', 'Cool Jazz', 'Fusion', 'Hard Bop', 'Soul-Jazz'],
+  },
+  {
+    heading: 'Funk / Soul styles',
+    items: ['Funk', 'Soul'],
+  },
 ]
 
 // Must stay in sync with internal/preferences/service.go maxItemsPerSource.

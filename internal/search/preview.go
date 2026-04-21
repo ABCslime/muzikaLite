@@ -30,28 +30,10 @@ import (
 // sections full-height renders 20 rows.
 const defaultPerCategoryLimit = 5
 
-// discogsGenres is the closed vocabulary Discogs uses on its /database/
-// search endpoint. Kept in lowercase-aware form here so substring
-// matching works naturally. Must stay in sync with the same list in
-// frontend/src/views/SettingsView.vue (if it ever drifts, search's
-// genre suggestions would no longer be pinnable).
-var discogsGenres = []string{
-	"Blues",
-	"Brass & Military",
-	"Children's",
-	"Classical",
-	"Electronic",
-	"Folk, World, & Country",
-	"Funk / Soul",
-	"Hip Hop",
-	"Jazz",
-	"Latin",
-	"Non-Music",
-	"Pop",
-	"Reggae",
-	"Rock",
-	"Stage & Screen",
-}
+// v0.4.2 PR B.1: the canonical genre + style vocabulary lives in
+// internal/discogs.GenreVocabulary(). Matching it is how we surface
+// suggestions like "House" / "Techno" / "Trance" without needing the
+// Discogs API to answer the question.
 
 // Candidate is a release row — kept for backward compatibility with the
 // (now-legacy) shape the client used before PR B.
@@ -189,21 +171,25 @@ func (p *Previewer) Preview(ctx context.Context, query string) (Preview, error) 
 	return out, nil
 }
 
-// matchGenres returns the subset of Discogs' closed genre vocabulary
-// whose name contains q (case-insensitive substring). Used by the
-// dropdown's Genres section.
+// matchGenres returns names from the curated Discogs vocabulary whose
+// name contains q (case-insensitive substring). Genres AND styles —
+// "House", "Techno", "Trance" live in the same list alongside
+// "Electronic" and "Rock". The Discogs client later routes each
+// entry to the right query param based on KindOf(name).
 //
-// Closed-vocabulary substring is deliberately simple — this isn't fuzzy
-// matching. Typing "elec" → ["Electronic"]; "jazz" → ["Jazz"]; "punk"
-// → [] (Discogs doesn't have "Punk" as a top-level genre; it's under
-// "Rock" as a style). The user has full control to pin anything in
-// Settings if they disagree.
+// Cap prevents a short prefix like "a" from returning 20+ rows that
+// blow out the dropdown.
 func matchGenres(q string) []string {
 	qLower := strings.ToLower(q)
-	out := make([]string, 0, 2)
-	for _, g := range discogsGenres {
-		if strings.Contains(strings.ToLower(g), qLower) {
-			out = append(out, g)
+	entries := discogs.GenreVocabulary()
+	out := make([]string, 0, 8)
+	const maxGenreSuggestions = 8
+	for _, e := range entries {
+		if strings.Contains(strings.ToLower(e.Name), qLower) {
+			out = append(out, e.Name)
+			if len(out) >= maxGenreSuggestions {
+				break
+			}
 		}
 	}
 	return out

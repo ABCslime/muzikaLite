@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -50,6 +51,100 @@ func newTestClient(srv *httptest.Server) *discogs.Client {
 		discogs.WithRand(fixedRand()),
 		discogs.WithLimiter(100, 100),
 	)
+}
+
+// TestKindOf_GenresAndStyles: v0.4.2 PR B.1. The KindOf lookup is
+// load-bearing — a KindGenre reply routes to Discogs' `genre=` param,
+// a KindStyle reply to `style=`. Wrong kind = zero results from
+// Discogs.
+func TestKindOf_GenresAndStyles(t *testing.T) {
+	cases := []struct {
+		in   string
+		want discogs.GenreKind
+	}{
+		// Top-level genres
+		{"Electronic", discogs.KindGenre},
+		{"Rock", discogs.KindGenre},
+		{"Jazz", discogs.KindGenre},
+		// Case-insensitive
+		{"electronic", discogs.KindGenre},
+		{"HIP HOP", discogs.KindGenre},
+		// Styles
+		{"House", discogs.KindStyle},
+		{"Techno", discogs.KindStyle},
+		{"Trance", discogs.KindStyle},
+		{"Deep House", discogs.KindStyle},
+		{"Psy-Trance", discogs.KindStyle},
+		// Unknown → defaults to genre (back-compat with uncurated user
+		// pins from before PR B.1)
+		{"SomeMadeUpGenre", discogs.KindGenre},
+		// Whitespace tolerated
+		{"  Techno  ", discogs.KindStyle},
+	}
+	for _, c := range cases {
+		got := discogs.KindOf(c.in)
+		if got != c.want {
+			t.Errorf("KindOf(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestSearch_StyleRoutesToStyleParam: v0.4.2 PR B.1. When a user pins
+// "Techno", passive refill must hit Discogs with `style=Techno`, not
+// `genre=Techno` (which would return zero results). Inspect the exact
+// URL the client constructed.
+func TestSearch_StyleRoutesToStyleParam(t *testing.T) {
+	var got url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{
+			{"title": "Jeff Mills - Something", "catno": "TR1"},
+		}})
+	}))
+	defer srv.Close()
+
+	c := discogs.NewClient(srv.URL, "tok", nil,
+		discogs.WithRand(fixedRand()),
+		discogs.WithLimiter(100, 100),
+	)
+	if _, err := c.Search(context.Background(), "Techno"); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got.Get("style") != "Techno" {
+		t.Errorf("expected style=Techno, got style=%q", got.Get("style"))
+	}
+	if got.Get("genre") != "" {
+		t.Errorf("expected no genre=, got genre=%q", got.Get("genre"))
+	}
+}
+
+// TestSearch_GenreStaysOnGenreParam: mirror of the previous test —
+// top-level genre routes to `genre=`.
+func TestSearch_GenreStaysOnGenreParam(t *testing.T) {
+	var got url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{
+			{"title": "Artist - Album", "catno": "X"},
+		}})
+	}))
+	defer srv.Close()
+
+	c := discogs.NewClient(srv.URL, "tok", nil,
+		discogs.WithRand(fixedRand()),
+		discogs.WithLimiter(100, 100),
+	)
+	if _, err := c.Search(context.Background(), "Electronic"); err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got.Get("genre") != "Electronic" {
+		t.Errorf("expected genre=Electronic, got genre=%q", got.Get("genre"))
+	}
+	if got.Get("style") != "" {
+		t.Errorf("expected no style=, got style=%q", got.Get("style"))
+	}
 }
 
 func TestSearch_HonorsGenre(t *testing.T) {

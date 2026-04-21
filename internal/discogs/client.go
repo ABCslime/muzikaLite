@@ -125,10 +125,17 @@ type SearchResult struct {
 }
 
 // Search picks one random release from the top page of /database/search
-// filtered by genre. Respects the rate limiter and the 30-day cache.
+// filtered by genre (or style — see below). Respects the rate limiter
+// and the 30-day cache.
 //
 // Used by the passive-refill path (StrategyRandom). For user-initiated
 // text search (StrategySearch, v0.4 PR 3), see SearchQuery.
+//
+// v0.4.2 PR B.1: the param routes on KindOf(name). Top-level Discogs
+// Genres (Electronic, Rock, …) go to `genre=`; Styles (House, Techno,
+// Trance, …) go to `style=`. Using the wrong param returns zero
+// results from Discogs, so this routing is load-bearing for any user
+// who pins a style.
 //
 // If every result has a malformed title (no " - " separator between
 // artist and release) we return ErrNoResults rather than ship garbage.
@@ -140,10 +147,11 @@ func (c *Client) Search(ctx context.Context, genre string) (SearchResult, error)
 		genre = c.defaultGenres[c.rng.Intn(len(c.defaultGenres))]
 	}
 
-	key := "search:genre=" + strings.ToLower(genre)
+	paramKey := string(KindOf(genre)) // "genre" | "style"
+	key := "search:" + paramKey + "=" + strings.ToLower(genre)
 	params := url.Values{}
 	params.Set("type", "release")
-	params.Set("genre", genre)
+	params.Set(paramKey, genre)
 	payload, err := c.fetchSearch(ctx, key, params)
 	if err != nil {
 		return SearchResult{}, err

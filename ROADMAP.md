@@ -63,10 +63,10 @@ Vue frontend ported. armv7 build for 32-bit Pi userland. Stream fixes.
 Retired slskd sidecar. gosk is now the in-process Soulseek backend,
 consumed as a Go module (github.com/ABCslime/gosk).
 
-### v0.4 — Next: search, Discogs, quality gate
+### v0.4 — Shipped (search, Discogs, quality gate)
 
-This is the first version that meaningfully changes the product, not
-just the plumbing.
+Three PRs (1 → 2 → 3) landed on `main`; PR 2.1 and PR 2.2 followed as
+stylistic + observability fixes. Every in-scope item below is live.
 
 **In scope:**
 

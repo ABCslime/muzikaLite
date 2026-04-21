@@ -23,9 +23,10 @@ type Repo struct{ db *sql.DB }
 func NewRepo(sqlDB *sql.DB) *Repo { return &Repo{db: sqlDB} }
 
 // ListEntries returns all queue entries for userID ordered by position.
+// The Relaxed flag (v0.4 PR 3) is filled from queue_entries.relaxed.
 func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, user_id, song_id, position, created_at
+		`SELECT id, user_id, song_id, position, created_at, relaxed
 		 FROM queue_entries WHERE user_id = ? ORDER BY position`,
 		userID.String())
 	if err != nil {
@@ -38,8 +39,9 @@ func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry,
 			idStr, uidStr, sidStr string
 			pos                   int
 			createdAt             int64
+			relaxed               int
 		)
-		if err := rows.Scan(&idStr, &uidStr, &sidStr, &pos, &createdAt); err != nil {
+		if err := rows.Scan(&idStr, &uidStr, &sidStr, &pos, &createdAt, &relaxed); err != nil {
 			return nil, err
 		}
 		id, _ := uuid.Parse(idStr)
@@ -48,6 +50,7 @@ func (r *Repo) ListEntries(ctx context.Context, userID uuid.UUID) ([]QueueEntry,
 		out = append(out, QueueEntry{
 			ID: id, UserID: uid, SongID: sid, Position: pos,
 			CreatedAt: time.Unix(createdAt, 0).UTC(),
+			Relaxed:   relaxed != 0,
 		})
 	}
 	return out, rows.Err()
@@ -81,7 +84,21 @@ func (r *Repo) InsertEntry(ctx context.Context, e QueueEntry) error {
 }
 
 // AppendEntry computes MAX(position)+1 then inserts. Caller holds per-user mutex.
+// Relaxed=false; use AppendEntryRelaxed when the download worker's relaxed
+// pass produced this entry.
 func (r *Repo) AppendEntry(ctx context.Context, userID, songID uuid.UUID) error {
+	return r.appendEntry(ctx, userID, songID, false)
+}
+
+// AppendEntryRelaxed is AppendEntry + sets relaxed=1. v0.4 PR 3 calls this
+// only when the originating DiscoveryIntent was user-initiated (Strategy=
+// StrategySearch). Passive refill always uses AppendEntry so the flag stays
+// 0 per ROADMAP §v0.4 item 6 ("Passive refill relaxes silently.").
+func (r *Repo) AppendEntryRelaxed(ctx context.Context, userID, songID uuid.UUID) error {
+	return r.appendEntry(ctx, userID, songID, true)
+}
+
+func (r *Repo) appendEntry(ctx context.Context, userID, songID uuid.UUID, relaxed bool) error {
 	var maxPos sql.NullInt64
 	if err := r.db.QueryRowContext(ctx,
 		`SELECT MAX(position) FROM queue_entries WHERE user_id = ?`,
@@ -92,12 +109,21 @@ func (r *Repo) AppendEntry(ctx context.Context, userID, songID uuid.UUID) error 
 	if maxPos.Valid {
 		next = int(maxPos.Int64) + 1
 	}
-	return r.InsertEntry(ctx, QueueEntry{
-		ID:       uuid.New(),
-		UserID:   userID,
-		SongID:   songID,
-		Position: next,
-	})
+	relaxedVal := 0
+	if relaxed {
+		relaxedVal = 1
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO queue_entries (id, user_id, song_id, position, relaxed)
+		 VALUES (?, ?, ?, ?, ?)`,
+		uuid.New().String(), userID.String(), songID.String(), next, relaxedVal)
+	if err != nil {
+		if db.IsUniqueErr(err) {
+			return ErrDuplicate
+		}
+		return fmt.Errorf("insert entry: %w", err)
+	}
+	return nil
 }
 
 // RemoveEntry deletes a queue entry. Caller holds the per-user mutex.

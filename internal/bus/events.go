@@ -47,10 +47,18 @@ type UnlikedSong struct {
 }
 
 // LoadedSong is published by the Soulseek layer when a download completes or fails.
+//
+// Relaxed=true means the file was acquired only after the download gate
+// fell back to relaxed thresholds (halved floors / doubled ceilings). v0.4
+// PR 3 surfaces this to the queue handler so user-initiated search can show
+// "no high-quality matches; showing best available" in the UI. For passive
+// refill, onLoadedSong discards the flag (ROADMAP §v0.4 item 6 — passive
+// relaxes silently).
 type LoadedSong struct {
 	SongID   uuid.UUID    `json:"song_id"`
 	FilePath string       `json:"file_path,omitempty"`
 	Status   LoadedStatus `json:"status"`
+	Relaxed  bool         `json:"relaxed,omitempty"`
 }
 
 type LoadedStatus string
@@ -152,9 +160,16 @@ type DiscoveryIntent struct {
 // empty by seeders that don't (Bandcamp). The download ladder (ROADMAP §v0.4
 // item 4) uses it as rung 0 of the search fallthrough — catno → artist+title
 // → title. Rung 0 is skipped when the field is empty.
+//
+// Strategy (v0.4 PR 3) carries the originating DiscoveryIntent.Strategy so
+// the download worker can decide whether to surface relax-mode. Empty
+// Strategy means "unknown / legacy" and is treated as passive (silent)
+// relax — kept permissive so a stale RequestDownload from before PR 3
+// still works.
 type RequestDownload struct {
 	SongID        uuid.UUID `json:"song_id"`
 	Title         string    `json:"title"`
 	Artist        string    `json:"artist"`
 	CatalogNumber string    `json:"catalog_number,omitempty"`
+	Strategy      Strategy  `json:"strategy,omitempty"`
 }

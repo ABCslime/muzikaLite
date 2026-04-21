@@ -243,6 +243,16 @@ The two-subscriber case on `RequestDownloadEvent` (was `RequestSlskdSongEvent` b
 
 4. **`discovery_log`** (migration 0003). Every seeder pick, every ladder rung, every gate outcome, every picked peer writes a row via `internal/discovery.Writer`. Never deleted — historical data feeds v0.5 similarity and the "is rung 0 earning its keep?" question the ROADMAP asks us to revisit in three months.
 
+**v0.4 PR 3 — user search + origin-aware relax.** Four additions on top of PR 2:
+
+1. **`POST /api/queue/search`** in `internal/queue/handler.go`. Body: `{"query": "…"}`. The service normalizes (lowercase + strip punctuation + collapse whitespace; fallback "words > 4 chars" if that's empty), inserts a stub tagged with `requesting_user_id`, and emits `DiscoveryIntent{Strategy: StrategySearch, Query: q, PreferredSources: ["discogs"]}`. Returns `{songId, query}`. The stub's entry appears asynchronously via the normal seeder → download pipeline.
+
+2. **Discogs widens its Strategy filter** to handle `StrategySearch` alongside `StrategyRandom`. New `Client.SearchQuery(ctx, q)` hits `/database/search?q=…&type=release` and returns the first well-formed result (preserving Discogs' ranking — no shuffle). Cache keys differ from genre queries (`"search:q=…"`) so genre and text results don't collide. Bandcamp stays random-only — its discover endpoint is tag-based.
+
+3. **Origin-aware relax** (ROADMAP §v0.4 item 6). `bus.RequestDownload` gains a `Strategy` field populated by every seeder. `bus.LoadedSong` gains a `Relaxed` bool. The download worker's `runLadder` now returns a `usedRelax` flag; `onRequestDownload` sets `LoadedSong.Relaxed = usedRelax && ev.Strategy == StrategySearch`. Passive refill stays silent; user-initiated search surfaces.
+
+4. **Queue entries carry `relaxed`** (migration 0004 — `queue_entries.relaxed INTEGER NOT NULL DEFAULT 0`). `queue.onLoadedSong` uses `AppendEntryRelaxed` when `LoadedSong.Relaxed=true`, `AppendEntry` otherwise. The `SongDTO` returned by `GET /api/queue/queue` exposes the flag; the Vue frontend renders "no high-quality matches; showing best available" next to any relaxed entry that resulted from the user's most recent search.
+
 ### Transactional outbox
 
 State-change events must **never** be silently dropped. The outbox pattern guarantees at-least-once delivery across process crashes:

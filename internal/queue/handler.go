@@ -62,6 +62,41 @@ func (h *Handler) Check(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "refill triggered"})
 }
 
+// Search handles POST /api/queue/search (protected). v0.4 PR 3.
+//
+// Body: {"query": "the user's typed string"}. The server normalizes
+// (lowercase + strip punctuation + collapse whitespace) and, if that's
+// empty, retries with words > 4 chars. The normalized query is handed
+// to the Discogs seeder via a DiscoveryIntent{Strategy: StrategySearch};
+// Bandcamp's discover endpoint is tag-based so it ignores search intents.
+//
+// 201 with {"songId": "...", "query": "normalized form"} — the stub is
+// inserted synchronously; the queue entry appears asynchronously once the
+// seeder + download ladder complete. 400 when the query is empty after
+// normalization; 401 if not authenticated; 500 otherwise.
+func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	var req SearchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	resp, err := h.svc.Search(r.Context(), userID, req)
+	if err != nil {
+		if errors.Is(err, ErrEmptyQuery) {
+			httpx.WriteError(w, http.StatusBadRequest, "query is empty after normalization")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "search failed")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, resp)
+}
+
 // Skipped handles POST /api/queue/queue/skipped (protected).
 func (h *Handler) Skipped(w http.ResponseWriter, r *http.Request) {
 	userID, req, ok := decodeUserAndSongReq(w, r)

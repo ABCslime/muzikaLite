@@ -450,6 +450,91 @@ func TestLadder_TitleOnlyIsFinalRung(t *testing.T) {
 	}
 }
 
+// TestRelax_SurfacedOnlyForSearchStrategy: when strict rejects all results
+// and relax mode saves the download, the resulting LoadedSong carries
+// Relaxed=true ONLY if the upstream Strategy was StrategySearch (user-
+// initiated). Passive refill (StrategyRandom, empty, etc.) gets Relaxed=false
+// even though relax-mode fired. ROADMAP §v0.4 item 6.
+func TestRelax_SurfacedOnlyForSearchStrategy(t *testing.T) {
+	cases := []struct {
+		name        string
+		strategy    bus.Strategy
+		wantRelaxed bool
+	}{
+		{"passive_random", bus.StrategyRandom, false},
+		{"user_search", bus.StrategySearch, true},
+		{"legacy_empty_strategy", "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := setupDB(t)
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			b := bus.New(64, log)
+
+			// 96 kbps: fails strict (192 min), passes relaxed (96 min).
+			// Forces the worker into the relax branch.
+			fc := &fakeClient{
+				searchResp: []soulseek.SearchResult{
+					{Peer: "lowbr", Filename: "a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
+				},
+				states: completedStates("a.mp3"),
+			}
+
+			svc := download.NewService(d, fc, "/music", b, nil)
+
+			err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+				SongID: uuid.New(), Title: "X", Artist: "Y",
+				Strategy: tc.strategy,
+			})
+			if err != nil {
+				t.Fatalf("worker: %v", err)
+			}
+
+			var payload []byte
+			_ = d.QueryRow(`SELECT payload FROM outbox WHERE event_type = ?`, bus.TypeLoadedSong).Scan(&payload)
+			var ev bus.LoadedSong
+			_ = json.Unmarshal(payload, &ev)
+			if ev.Status != bus.LoadedStatusCompleted {
+				t.Fatalf("unexpected status %q (relax should have saved it)", ev.Status)
+			}
+			if ev.Relaxed != tc.wantRelaxed {
+				t.Errorf("Relaxed = %v, want %v", ev.Relaxed, tc.wantRelaxed)
+			}
+		})
+	}
+}
+
+// TestRelax_NotSetWhenStrictWins: when strict passes everything, the
+// relaxed-flag must stay false regardless of upstream strategy.
+func TestRelax_NotSetWhenStrictWins(t *testing.T) {
+	d := setupDB(t)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+
+	fc := &fakeClient{
+		searchResp: []soulseek.SearchResult{goodResult("peer1", "a.mp3", 0)},
+		states:     completedStates("a.mp3"),
+	}
+	svc := download.NewService(d, fc, "/music", b, nil)
+
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
+		SongID: uuid.New(), Title: "X", Artist: "Y",
+		Strategy: bus.StrategySearch, // even on search path, no relax fires
+	})
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+
+	var payload []byte
+	_ = d.QueryRow(`SELECT payload FROM outbox WHERE event_type = ?`, bus.TypeLoadedSong).Scan(&payload)
+	var ev bus.LoadedSong
+	_ = json.Unmarshal(payload, &ev)
+	if ev.Relaxed {
+		t.Errorf("Relaxed = true when strict succeeded — should be false")
+	}
+}
+
 // TestDiscoveryLog_NilWriterIsSafe: passing nil *discovery.Writer must be a
 // no-op — the worker must not panic and no rows must land in discovery_log.
 // Production tests pass a real writer; this is a smoke check for the

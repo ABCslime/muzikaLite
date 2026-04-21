@@ -27,6 +27,11 @@ type QueueEntry struct {
 	SongID    uuid.UUID
 	Position  int
 	CreatedAt time.Time
+	// Relaxed is true when this entry was acquired via the download worker's
+	// relaxed-gate fallback AND the originating intent was user-initiated
+	// (StrategySearch). Passive refill relaxations never land in this flag —
+	// ROADMAP §v0.4 item 6 keeps that path silent.
+	Relaxed bool
 }
 
 type UserSong struct {
@@ -40,6 +45,8 @@ type UserSong struct {
 }
 
 // SongDTO mirrors the old Spring response so the frontend works unchanged.
+// Relaxed (v0.4 PR 3) lets the UI show "no high-quality matches; showing
+// best available" when a user-initiated search landed via the relaxed gate.
 type SongDTO struct {
 	ID       uuid.UUID `json:"id"`
 	Title    string    `json:"title,omitempty"`
@@ -47,6 +54,7 @@ type SongDTO struct {
 	Album    string    `json:"album,omitempty"`
 	Genre    string    `json:"genre,omitempty"`
 	Duration int       `json:"duration,omitempty"`
+	Relaxed  bool      `json:"relaxed,omitempty"`
 }
 
 type QueueResponse struct {
@@ -65,4 +73,22 @@ type SongIDRequest struct {
 
 type SongLikedResponse struct {
 	Liked bool `json:"liked"`
+}
+
+// SearchRequest is the body for POST /api/queue/search (v0.4 PR 3). The
+// server applies its own query normalization (internal/queue/normalize.go)
+// before handing the query to the Discogs seeder, so callers can send the
+// raw user input verbatim.
+type SearchRequest struct {
+	Query string `json:"query"`
+}
+
+// SearchResponse is returned synchronously after the stub is inserted.
+// The queue will be populated asynchronously once the seeder + download
+// ladder complete; clients poll /api/queue/queue to observe the result.
+// SongID is the stub's UUID — clients can use it to identify the
+// search-triggered entry when it appears in GetQueue output.
+type SearchResponse struct {
+	SongID uuid.UUID `json:"songId"`
+	Query  string    `json:"query"` // the normalized form actually used
 }

@@ -95,9 +95,10 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		return err
 	}
 	out := bus.RequestDownload{
-		SongID: ev.SongID,
-		Title:  result.Title,
-		Artist: result.Artist,
+		SongID:   ev.SongID,
+		Title:    result.Title,
+		Artist:   result.Artist,
+		Strategy: ev.Strategy,
 	}
 	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{
 		SendTimeout: 100 * time.Millisecond,

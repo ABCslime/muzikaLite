@@ -121,6 +121,9 @@ type SearchResult struct {
 // Search picks one random release from the top page of /database/search
 // filtered by genre. Respects the rate limiter and the 30-day cache.
 //
+// Used by the passive-refill path (StrategyRandom). For user-initiated
+// text search (StrategySearch, v0.4 PR 3), see SearchQuery.
+//
 // If every result has a malformed title (no " - " separator between
 // artist and release) we return ErrNoResults rather than ship garbage.
 func (c *Client) Search(ctx context.Context, genre string) (SearchResult, error) {
@@ -131,42 +134,47 @@ func (c *Client) Search(ctx context.Context, genre string) (SearchResult, error)
 		genre = c.defaultGenres[c.rng.Intn(len(c.defaultGenres))]
 	}
 
-	payload, err := c.fetchSearch(ctx, genre)
+	key := "search:genre=" + strings.ToLower(genre)
+	params := url.Values{}
+	params.Set("type", "release")
+	params.Set("genre", genre)
+	payload, err := c.fetchSearch(ctx, key, params)
 	if err != nil {
 		return SearchResult{}, err
 	}
-
-	var resp searchResponse
-	if err := json.Unmarshal(payload, &resp); err != nil {
-		return SearchResult{}, fmt.Errorf("discogs: unmarshal: %w", err)
-	}
-	if len(resp.Results) == 0 {
-		return SearchResult{}, ErrNoResults
-	}
-
-	// Shuffle and try until one parses — Discogs titles are "Artist - Release"
-	// by convention, but malformed ones (bootlegs, compilations, mixes with
-	// multiple dashes) do appear. Skip rather than ship bad data.
-	order := c.rng.Perm(len(resp.Results))
-	for _, idx := range order {
-		r := resp.Results[idx]
-		artist, title, ok := splitArtistTitle(r.Title)
-		if !ok {
-			continue
-		}
-		return SearchResult{
-			Title:         title,
-			Artist:        artist,
-			CatalogNumber: firstCatno(r.CatalogNumber),
-		}, nil
-	}
-	return SearchResult{}, ErrNoResults
+	return parsePickRandom(payload, c.rng)
 }
 
-// fetchSearch returns the raw JSON body for (genre). Consults the cache
-// first; on miss hits the API, stores the result, and returns it.
-func (c *Client) fetchSearch(ctx context.Context, genre string) ([]byte, error) {
-	key := "search:genre=" + strings.ToLower(genre)
+// SearchQuery picks one result from a free-text query. Used by the
+// user-initiated search path (StrategySearch). ROADMAP §v0.4 item 5:
+// "Relies on Discogs' native fuzziness — no custom fuzzy matcher."
+// Callers (queue.SearchHandler) normalize the query before calling.
+//
+// Unlike Search, we DON'T shuffle — Discogs already orders results by
+// relevance, so the head of the list is the best match for the user's
+// typed query. Shuffling would erase Discogs' ranking signal.
+//
+// Cache key incorporates the normalized query; identical queries share
+// a cache row for up to 30 days.
+func (c *Client) SearchQuery(ctx context.Context, query string) (SearchResult, error) {
+	if query == "" {
+		return SearchResult{}, ErrNoResults
+	}
+	key := "search:q=" + query
+	params := url.Values{}
+	params.Set("type", "release")
+	params.Set("q", query)
+	payload, err := c.fetchSearch(ctx, key, params)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	return parsePickFirst(payload)
+}
+
+// fetchSearch returns the raw JSON body for a /database/search request
+// described by params. Consults the cache (keyed by key) first; on miss
+// it hits the API, stores the result, and returns it.
+func (c *Client) fetchSearch(ctx context.Context, key string, params url.Values) ([]byte, error) {
 	if c.cache != nil {
 		if payload, err := c.cache.Get(ctx, key); err == nil {
 			return payload, nil
@@ -180,11 +188,10 @@ func (c *Client) fetchSearch(ctx context.Context, genre string) ([]byte, error) 
 	}
 
 	u, _ := url.Parse(c.baseURL + "/database/search")
-	q := u.Query()
-	q.Set("type", "release")
-	q.Set("genre", genre)
-	q.Set("per_page", "100")
-	u.RawQuery = q.Encode()
+	if !params.Has("per_page") {
+		params.Set("per_page", "100")
+	}
+	u.RawQuery = params.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -221,6 +228,57 @@ func (c *Client) fetchSearch(ctx context.Context, genre string) ([]byte, error) 
 		}
 	}
 	return body, nil
+}
+
+// parsePickRandom decodes a /database/search response and returns one
+// random well-formed item. Used by the genre-based Search path.
+func parsePickRandom(payload []byte, rng *rand.Rand) (SearchResult, error) {
+	var resp searchResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return SearchResult{}, fmt.Errorf("discogs: unmarshal: %w", err)
+	}
+	if len(resp.Results) == 0 {
+		return SearchResult{}, ErrNoResults
+	}
+	order := rng.Perm(len(resp.Results))
+	for _, idx := range order {
+		r := resp.Results[idx]
+		artist, title, ok := splitArtistTitle(r.Title)
+		if !ok {
+			continue
+		}
+		return SearchResult{
+			Title:         title,
+			Artist:        artist,
+			CatalogNumber: firstCatno(r.CatalogNumber),
+		}, nil
+	}
+	return SearchResult{}, ErrNoResults
+}
+
+// parsePickFirst decodes a /database/search response and returns the
+// first well-formed item (preserving Discogs' relevance ranking). Used
+// by the user-initiated SearchQuery path.
+func parsePickFirst(payload []byte) (SearchResult, error) {
+	var resp searchResponse
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return SearchResult{}, fmt.Errorf("discogs: unmarshal: %w", err)
+	}
+	if len(resp.Results) == 0 {
+		return SearchResult{}, ErrNoResults
+	}
+	for _, r := range resp.Results {
+		artist, title, ok := splitArtistTitle(r.Title)
+		if !ok {
+			continue
+		}
+		return SearchResult{
+			Title:         title,
+			Artist:        artist,
+			CatalogNumber: firstCatno(r.CatalogNumber),
+		}, nil
+	}
+	return SearchResult{}, ErrNoResults
 }
 
 // SweepCache is an optional maintenance hook: drops cache rows older than

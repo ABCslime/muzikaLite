@@ -247,11 +247,25 @@ All runtime knobs are in `internal/config/Config`, prefix `MUZIKA_`.
   earns its keep.
 - **Gate is strict by default**. If every rung under strict rejects
   everything, one relax pass (halved floors, doubled ceilings) runs
-  before the worker gives up. Relax is silent in PR 2 — PR 3 splits the
-  relaxation signal by intent origin so user-initiated search can
-  surface it.
-- **Every pass/fail writes discovery_log**. Never sample. The table is
-  never deleted. v0.5's similarity engine will read it.
+  before the worker gives up. Relax is silent for passive refill and
+  surfaced for user-initiated search (v0.4 PR 3).
+- **Every pass/fail writes discovery_log**, per-candidate (not
+  aggregate). Never sample. The table is never deleted. v0.5's
+  similarity engine will read it.
+
+### Origin-aware relax (v0.4 PR 3)
+
+When the gate's relaxed pass rescues a song, the download worker only
+sets `LoadedSong.Relaxed=true` when the originating
+`DiscoveryIntent.Strategy` was `StrategySearch`. This is plumbed via a
+new `Strategy` field on `bus.RequestDownload`, which every seeder
+populates from the incoming intent. `queue.onLoadedSong` then translates
+that flag into `queue_entries.relaxed=1`; the DTO exposes it to the UI
+so users see "no high-quality matches; showing best available."
+
+Passive refill never sets the flag — ROADMAP §v0.4 item 6. That's a
+deliberate silence, not a bug: the refiller keeps trying and a better
+source will land tomorrow.
 
 See `ARCHITECTURE.md` §7 for the gosk integration.
 

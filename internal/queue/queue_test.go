@@ -260,6 +260,146 @@ func TestOnLoadedSong_ErrorDeletesStub(t *testing.T) {
 	}
 }
 
+// TestSearch_NormalizesAndPublishesDiscoveryIntent: end-to-end for the
+// user-initiated search path (v0.4 PR 3). Feeds a messy query, asserts the
+// service normalizes it, inserts a stub, and emits DiscoveryIntent with
+// StrategySearch + PreferredSources=["discogs"].
+func TestSearch_NormalizesAndPublishesDiscoveryIntent(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	ch := bus.Subscribe[bus.DiscoveryIntent](busFromService(svc), "test/search")
+
+	resp, err := svc.Search(ctx, uid, queue.SearchRequest{Query: "  Boards OF Canada — (1998)  "})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if resp.Query != "boards of canada 1998" {
+		t.Errorf("normalized query = %q, want %q", resp.Query, "boards of canada 1998")
+	}
+
+	got := drain(ch, 1, 500*time.Millisecond)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 publish, got %d", len(got))
+	}
+	ev := got[0]
+	if ev.Strategy != bus.StrategySearch {
+		t.Errorf("strategy %q, want %q", ev.Strategy, bus.StrategySearch)
+	}
+	if ev.Query != "boards of canada 1998" {
+		t.Errorf("query %q in event, want normalized form", ev.Query)
+	}
+	if len(ev.PreferredSources) != 1 || ev.PreferredSources[0] != "discogs" {
+		t.Errorf("PreferredSources %v, want [discogs]", ev.PreferredSources)
+	}
+	if ev.SongID != resp.SongID {
+		t.Errorf("event SongID %v, want %v", ev.SongID, resp.SongID)
+	}
+	if ev.UserID != uid {
+		t.Errorf("event UserID %v, want %v", ev.UserID, uid)
+	}
+
+	// Stub row exists with requesting_user_id = uid.
+	var reqStr string
+	_ = d.QueryRow(`SELECT requesting_user_id FROM queue_songs WHERE id = ?`,
+		resp.SongID.String()).Scan(&reqStr)
+	if reqStr != uid.String() {
+		t.Errorf("stub requester = %q, want %q", reqStr, uid.String())
+	}
+}
+
+// TestSearch_EmptyAfterNormalization: punctuation-only queries return
+// ErrEmptyQuery and no stub is inserted.
+func TestSearch_EmptyAfterNormalization(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	_, err := svc.Search(ctx, uid, queue.SearchRequest{Query: "!!! ??? ..."})
+	if err != queue.ErrEmptyQuery {
+		t.Errorf("got %v, want ErrEmptyQuery", err)
+	}
+
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
+	if n != 0 {
+		t.Errorf("stub should not have been inserted, count=%d", n)
+	}
+}
+
+// TestOnLoadedSong_RelaxedSurfacedForSearchPath: a LoadedSong with
+// Relaxed=true lands queue_entries.relaxed=1 and the DTO exposes it.
+func TestOnLoadedSong_RelaxedSurfacedForSearchPath(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, genre, requesting_user_id) VALUES (?, ?, ?)`,
+		sid.String(), defaultGenre, uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+
+	if err := svc.OnLoadedSong(ctx, bus.LoadedSong{
+		SongID:   sid,
+		FilePath: "relaxed.mp3",
+		Status:   bus.LoadedStatusCompleted,
+		Relaxed:  true,
+	}); err != nil {
+		t.Fatalf("onLoadedSong: %v", err)
+	}
+
+	var relaxed int
+	_ = d.QueryRow(`SELECT relaxed FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&relaxed)
+	if relaxed != 1 {
+		t.Errorf("queue_entries.relaxed = %d, want 1", relaxed)
+	}
+
+	resp, err := svc.GetQueue(ctx, uid)
+	if err != nil {
+		t.Fatalf("GetQueue: %v", err)
+	}
+	if len(resp.Songs) != 1 || !resp.Songs[0].Relaxed {
+		t.Errorf("DTO relaxed flag not surfaced: %+v", resp.Songs)
+	}
+}
+
+// TestOnLoadedSong_NotRelaxedForPassivePath: Relaxed=false keeps
+// queue_entries.relaxed at 0. This is the passive-refill default —
+// the download worker only sets Relaxed=true when the origin was
+// user-initiated search (ROADMAP §v0.4 item 6).
+func TestOnLoadedSong_NotRelaxedForPassivePath(t *testing.T) {
+	svc, d, _ := newService(t)
+	uid := seedUser(t, d)
+	ctx := context.Background()
+
+	sid := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, genre, requesting_user_id) VALUES (?, ?, ?)`,
+		sid.String(), defaultGenre, uid.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+
+	if err := svc.OnLoadedSong(ctx, bus.LoadedSong{
+		SongID:   sid,
+		FilePath: "passive.mp3",
+		Status:   bus.LoadedStatusCompleted,
+		Relaxed:  false,
+	}); err != nil {
+		t.Fatalf("onLoadedSong: %v", err)
+	}
+
+	var relaxed int
+	_ = d.QueryRow(`SELECT relaxed FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), sid.String()).Scan(&relaxed)
+	if relaxed != 0 {
+		t.Errorf("queue_entries.relaxed = %d, want 0", relaxed)
+	}
+}
+
 func TestOnRequestDownload_UpdatesMetadata(t *testing.T) {
 	svc, d, _ := newService(t)
 	ctx := context.Background()

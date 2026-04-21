@@ -7,6 +7,10 @@ export const useQueueStore = defineStore('queue', {
     songs: [],
     loading: false,
     error: null,
+    // v0.4 PR 3: remember the last user-initiated search so the UI can
+    // display "searching for X…" feedback while the stub resolves.
+    lastSearchQuery: null,
+    lastSearchSongId: null,
   }),
 
   getters: {
@@ -140,6 +144,27 @@ export const useQueueStore = defineStore('queue', {
         return { success: false, error: this.error }
       } finally {
         this.loading = false
+      }
+    },
+
+    // v0.4 PR 3: user-initiated search. The backend accepts the raw query,
+    // normalizes it, creates a stub, and asynchronously resolves the stub
+    // via Discogs + download ladder. Returns { songId, query } on success.
+    //
+    // searchedQuery is retained in store state so the UI can show "you
+    // searched for X" feedback while the stub resolves.
+    async searchAndQueue(query) {
+      this.error = null
+      try {
+        const resp = await queueAPI.searchAndQueue(query)
+        this.lastSearchQuery = resp.query
+        this.lastSearchSongId = resp.songId
+        // The entry will appear asynchronously; the caller can poll
+        // fetchQueue() or just wait for the next periodic refresh.
+        return { success: true, data: resp }
+      } catch (error) {
+        this.error = error.response?.data?.message || error.message || 'Search failed'
+        return { success: false, error: this.error }
       }
     },
 

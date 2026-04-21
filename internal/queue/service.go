@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -17,6 +18,10 @@ import (
 
 // ErrNoFile is returned by ResolveSongPath when the song hasn't been downloaded.
 var ErrNoFile = errors.New("queue: song has no file yet")
+
+// ErrEmptyQuery is returned by Search when the user-supplied query
+// collapses to empty after normalization + long-words fallback.
+var ErrEmptyQuery = errors.New("queue: empty query")
 
 // Service owns per-user queues, the song catalog, and listen stats.
 //
@@ -170,7 +175,7 @@ func (s *Service) onLoadedSong(ctx context.Context, ev bus.LoadedSong) error {
 		if err := s.repo.UpdateSongFile(ctx, ev.SongID, ev.FilePath); err != nil {
 			return err
 		}
-		return s.appendForRequester(ctx, ev.SongID)
+		return s.appendForRequester(ctx, ev.SongID, ev.Relaxed)
 	case bus.LoadedStatusError:
 		// Delete the stub; cascade removes any queue_entries rows.
 		if err := s.repo.DeleteSong(ctx, ev.SongID); err != nil {
@@ -186,7 +191,12 @@ func (s *Service) onLoadedSong(ctx context.Context, ev bus.LoadedSong) error {
 // completed song to that user's queue and only that user's. If the stub has
 // no requester (legacy rows, or rows inserted outside the refiller path), we
 // log and skip — those belong to no queue by definition.
-func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID) error {
+//
+// relaxed (v0.4 PR 3) is the LoadedSong.Relaxed flag: true iff the download
+// worker had to fall back to the relaxed gate AND the origin was a
+// user-initiated search. For passive refill, the download worker passes
+// false regardless of whether its relax-mode fired — ROADMAP §v0.4 item 6.
+func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID, relaxed bool) error {
 	userID, ok, err := s.repo.GetSongRequester(ctx, songID)
 	if err != nil {
 		return fmt.Errorf("get requester: %w", err)
@@ -199,8 +209,14 @@ func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID) erro
 		return nil
 	}
 	defer s.lockFor(userID)()
-	if err := s.repo.AppendEntry(ctx, userID, songID); err != nil && !errors.Is(err, ErrDuplicate) {
-		return err
+	var appendErr error
+	if relaxed {
+		appendErr = s.repo.AppendEntryRelaxed(ctx, userID, songID)
+	} else {
+		appendErr = s.repo.AppendEntry(ctx, userID, songID)
+	}
+	if appendErr != nil && !errors.Is(appendErr, ErrDuplicate) {
+		return appendErr
 	}
 	return nil
 }
@@ -229,12 +245,56 @@ func (s *Service) GetQueue(ctx context.Context, userID uuid.UUID) (QueueResponse
 		out.Songs = append(out.Songs, SongDTO{
 			ID: sg.ID, Title: sg.Title, Artist: sg.Artist,
 			Album: sg.Album, Genre: sg.Genre, Duration: sg.Duration,
+			Relaxed: e.Relaxed,
 		})
 	}
 	// Fire-and-forget refill — don't block the response. svcCtx outlives the
 	// HTTP request but is cancelled on shutdown.
 	go s.refiller.Trigger(s.svcCtx, userID)
 	return out, nil
+}
+
+// Search handles POST /api/queue/search (v0.4 PR 3). Normalizes the user's
+// query, inserts a stub song row, and publishes a DiscoveryIntent with
+// Strategy=StrategySearch and PreferredSources=["discogs"] so Bandcamp
+// ignores it and Discogs handles it. Returns the stub's UUID so clients
+// can correlate the eventual queue entry.
+//
+// If the normalized query is empty, retry with words > 4 chars (ROADMAP
+// §v0.4 item 5). If still empty, return 400 — nothing to search on.
+func (s *Service) Search(ctx context.Context, userID uuid.UUID, req SearchRequest) (SearchResponse, error) {
+	q := normalizeQuery(req.Query)
+	if q == "" {
+		q = retryLongWords(normalizeQuery(req.Query))
+	}
+	if q == "" {
+		return SearchResponse{}, ErrEmptyQuery
+	}
+
+	stubID := uuid.New()
+	if err := s.repo.InsertSongStub(ctx, stubID, "", userID); err != nil {
+		return SearchResponse{}, fmt.Errorf("insert stub: %w", err)
+	}
+
+	ev := bus.DiscoveryIntent{
+		SongID:           stubID,
+		UserID:           userID,
+		Strategy:         bus.StrategySearch,
+		Query:            q,
+		PreferredSources: []string{"discogs"},
+	}
+	err := bus.Publish(ctx, s.bus, ev, bus.PublishOpts{
+		SendTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		// Keep the stub — the refiller won't help for a search intent, but
+		// the caller sees the stub ID so they can retry. Log and return the
+		// SearchResponse anyway; a Publish error on a non-full channel is
+		// rare and the Discogs worker will likely still drain when it
+		// arrives.
+		s.log.Warn("search: publish failed", "user_id", userID, "err", err)
+	}
+	return SearchResponse{SongID: stubID, Query: q}, nil
 }
 
 // AddSong inserts a song at a specific position (appended to the end).

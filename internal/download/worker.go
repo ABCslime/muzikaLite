@@ -134,7 +134,7 @@ func (s *Service) OnRequestDownload(ctx context.Context, ev bus.RequestDownload)
 }
 
 func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
-	peer, file, ok := s.runLadder(ctx, ev)
+	peer, file, usedRelax, ok := s.runLadder(ctx, ev)
 	if !ok {
 		s.recordFailed(ctx, ev, "no viable peer after ladder + gate")
 		return s.emitError(ctx, ev.SongID)
@@ -166,20 +166,30 @@ func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload)
 		return s.emitError(ctx, ev.SongID)
 	}
 
-	return s.emitCompleted(ctx, ev.SongID, filePath)
+	// ROADMAP §v0.4 item 6 — split relaxation by origin. Surface only for
+	// user-initiated search (StrategySearch). Passive refill relaxes
+	// silently regardless of usedRelax.
+	relaxed := usedRelax && ev.Strategy == bus.StrategySearch
+	return s.emitCompleted(ctx, ev.SongID, filePath, relaxed)
 }
 
 // runLadder walks the catno → artist+title → title rungs, applying the
-// quality gate at each. Returns the chosen peer+file, or (_, _, false) if
-// every rung under both strict and relaxed gates failed.
+// quality gate at each. Returns the chosen peer+file, whether the relaxed
+// gate produced the pick, and ok=false if every rung under both strict and
+// relaxed gates failed.
+//
+// usedRelax: true iff the pick came from the relaxed-mode pass (strict
+// found nothing across every rung). onRequestDownload uses this to decide
+// whether to set LoadedSong.Relaxed — which it only does for user-
+// initiated search (ROADMAP §v0.4 item 6).
 //
 // Laddering is the default; if cfg.LadderEnabled=false the function runs
 // a single search with the plain "artist title" query and the strict gate
 // — equivalent to pre-v0.4 behavior modulo the new thresholds.
-func (s *Service) runLadder(ctx context.Context, ev bus.RequestDownload) (string, soulseek.SearchResult, bool) {
+func (s *Service) runLadder(ctx context.Context, ev bus.RequestDownload) (string, soulseek.SearchResult, bool, bool) {
 	if !s.cfg.LadderEnabled {
 		peer, file, ok := s.runSingleRung(ctx, ev, "artist_title", ev.Artist+" "+ev.Title, searchWindow, s.cfg.Gate, GateModeStrict)
-		return peer, file, ok
+		return peer, file, false, ok
 	}
 
 	rungs := buildLadder(ev)
@@ -197,7 +207,7 @@ func (s *Service) runLadder(ctx context.Context, ev bus.RequestDownload) (string
 		}
 		peer, file, count, ok := s.runRung(ctx, ev, i, rung.name, rung.query, window, s.cfg.Gate, GateModeStrict)
 		if ok && count >= s.cfg.LadderEnough {
-			return peer, file, true
+			return peer, file, false, true
 		}
 		// Carry the best-effort candidate across rungs so we still have
 		// something if strict keeps rejecting but finds a few passes.
@@ -208,12 +218,13 @@ func (s *Service) runLadder(ctx context.Context, ev bus.RequestDownload) (string
 
 	// If strict produced anything at all (below LadderEnough), use it.
 	if haveAny {
-		return bestPeer, bestFile, true
+		return bestPeer, bestFile, false, true
 	}
 
-	// Relax pass over the same rungs with halved thresholds. ROADMAP §v0.4
-	// item 6 — PR 2 implements a single silent relax; PR 3 adds origin-
-	// aware surfacing (passive vs user-initiated search).
+	// Relax pass over the same rungs with halved thresholds. Passive refill
+	// doesn't surface the relaxation (silent); user-initiated search does
+	// (onRequestDownload turns usedRelax=true into LoadedSong.Relaxed=true
+	// iff ev.Strategy == StrategySearch). See ROADMAP §v0.4 item 6.
 	relaxed := s.cfg.Gate.Relax()
 	for i, rung := range rungs {
 		window := searchWindow
@@ -222,10 +233,10 @@ func (s *Service) runLadder(ctx context.Context, ev bus.RequestDownload) (string
 		}
 		peer, file, _, ok := s.runRung(ctx, ev, i, rung.name, rung.query, window, relaxed, GateModeRelaxed)
 		if ok {
-			return peer, file, true
+			return peer, file, true, true
 		}
 	}
-	return "", soulseek.SearchResult{}, false
+	return "", soulseek.SearchResult{}, false, false
 }
 
 // rungSpec is one ladder step's name (for logging) and query.
@@ -422,11 +433,12 @@ func (s *Service) waitForDownload(ctx context.Context, h soulseek.DownloadHandle
 
 // ---- outbox emissions ----
 
-func (s *Service) emitCompleted(ctx context.Context, songID uuid.UUID, filePath string) error {
+func (s *Service) emitCompleted(ctx context.Context, songID uuid.UUID, filePath string, relaxed bool) error {
 	return s.emit(ctx, bus.LoadedSong{
 		SongID:   songID,
 		FilePath: filePath,
 		Status:   bus.LoadedStatusCompleted,
+		Relaxed:  relaxed,
 	})
 }
 

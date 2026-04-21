@@ -270,6 +270,109 @@ func TestWorker_IgnoresOtherStrategies(t *testing.T) {
 	}
 }
 
+// TestSearchQuery_HonorsQueryParam: SearchQuery hits /database/search with
+// q=<query> and type=release, and the result's Title/Artist come from the
+// first well-formed item (no shuffle — Discogs' ranking wins).
+func TestSearchQuery_HonorsQueryParam(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(fakeResults(t, []map[string]any{
+		{"title": "Best Match - Winner", "catno": "A-1"},
+		{"title": "Lower Rank - Loser", "catno": "A-2"},
+	}, &queries))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	res, err := c.SearchQuery(context.Background(), "boards of canada")
+	if err != nil {
+		t.Fatalf("SearchQuery: %v", err)
+	}
+	if res.Artist != "Best Match" || res.Title != "Winner" {
+		t.Errorf("first-result ranking not honored: %+v", res)
+	}
+	if len(queries) != 1 || !strings.Contains(queries[0], "q=boards+of+canada") {
+		t.Errorf("q= not in query: %v", queries)
+	}
+	if !strings.Contains(queries[0], "type=release") {
+		t.Errorf("type=release missing: %v", queries)
+	}
+}
+
+// TestSearchQuery_EmptyIsErrNoResults
+func TestSearchQuery_EmptyIsErrNoResults(t *testing.T) {
+	srv := httptest.NewServer(fakeResults(t, []map[string]any{}, nil))
+	defer srv.Close()
+	c := newTestClient(srv)
+	if _, err := c.SearchQuery(context.Background(), ""); err != discogs.ErrNoResults {
+		t.Errorf("got %v, want ErrNoResults", err)
+	}
+}
+
+// TestSearchQuery_CachesByQuery: two calls for the same query hit the
+// network once; two different queries hit twice.
+func TestSearchQuery_CachesByQuery(t *testing.T) {
+	var hits atomic.Int64
+	items := []map[string]any{{"title": "Artist - Title", "catno": "X-1"}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": items})
+	}))
+	defer srv.Close()
+
+	db := newTempDB(t)
+	c := discogs.NewClient(srv.URL, "tok", []string{"Electronic"},
+		discogs.WithRand(fixedRand()),
+		discogs.WithLimiter(100, 100),
+		discogs.WithCache(db),
+	)
+
+	_, _ = c.SearchQuery(context.Background(), "alpha")
+	_, _ = c.SearchQuery(context.Background(), "alpha") // cache hit
+	_, _ = c.SearchQuery(context.Background(), "beta")  // cache miss
+
+	if got := hits.Load(); got != 2 {
+		t.Errorf("network hits = %d, want 2 (alpha cached, beta fresh)", got)
+	}
+}
+
+// TestWorker_SearchStrategyRoutesThroughSearchQuery: a DiscoveryIntent with
+// Strategy=StrategySearch publishes a RequestDownload with Strategy also
+// set to StrategySearch so the download worker can do origin-aware relax.
+func TestWorker_SearchStrategyRoutesThroughSearchQuery(t *testing.T) {
+	srv := httptest.NewServer(fakeResults(t, []map[string]any{
+		{"title": "Björk - Debut", "catno": "ONE-001"},
+	}, nil))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	b := bus.New(64, log)
+	svc := discogs.NewService(c, nil, b, nil, nil)
+
+	outCh := bus.Subscribe[bus.RequestDownload](b, "test/search-path")
+
+	stubID := uuid.New()
+	if err := svc.OnDiscoveryIntent(context.Background(), bus.DiscoveryIntent{
+		SongID:   stubID,
+		Strategy: bus.StrategySearch,
+		Query:    "björk debut",
+	}); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	select {
+	case ev := <-outCh:
+		if ev.Strategy != bus.StrategySearch {
+			t.Errorf("event Strategy = %q, want %q", ev.Strategy, bus.StrategySearch)
+		}
+		if ev.Artist != "Björk" || ev.Title != "Debut" {
+			t.Errorf("metadata: %+v", ev)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for RequestDownload")
+	}
+}
+
 // TestWorker_RespectsPreferredSources: an intent that names "bandcamp" in
 // PreferredSources is dropped by Discogs.
 func TestWorker_RespectsPreferredSources(t *testing.T) {

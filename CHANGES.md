@@ -283,3 +283,140 @@ Modified:
 
 This commit explicitly does not ship ROADMAP §v0.4 PR 3 (user search
 endpoint + typo handling + relax-mode split). PR 3 follows on review.
+
+---
+
+## v0.4 PR 2.2 — per-candidate gate logging
+
+ROADMAP §v0.4 item 3 requires "Every candidate that passes or fails the
+gate is logged with reason." PR 2 wrote one summary row per rung
+(`reason="passed=3/12"`). Fix: loop over filterGate's verdict slice and
+emit one StageGate row per SearchResult, carrying per-file detail
+(Filename, Peer, Bitrate, Size). New `gateOutcomeFor(pass, mode)`
+helper maps the 2×2 of (pass/fail, strict/relaxed) to the right
+outcome string.
+
+---
+
+## v0.4 PR 3 — user search + typo handling + origin-aware relax-mode
+
+Closes v0.4. The first real user-facing feature of the muzika
+discovery surface.
+
+### 1. `POST /api/queue/search`
+
+New handler. Body `{"query": "…"}`. Server normalizes:
+
+- lowercase
+- strip punctuation/symbols (Unicode letters and digits kept — Björk
+  stays Björk)
+- collapse whitespace
+
+If normalization empties the query, a fallback retries with words > 4
+chars (e.g. "the cat" → ""; "aphex twin care do 1995" → "aphex twin
+because"). Both passes empty → 400 `ErrEmptyQuery`. Helper lives in
+`internal/queue/normalize.go`; unit tests in `normalize_test.go`.
+
+On success: stub inserted synchronously (requesting_user_id set),
+`DiscoveryIntent{Strategy: StrategySearch, Query, PreferredSources:
+["discogs"]}` published. Response `{songId, query}`. 201 Created.
+
+### 2. Discogs widens its Strategy filter
+
+`internal/discogs/client.go` — new `SearchQuery(ctx, q)` hits
+`/database/search?type=release&q=…`. Cache key scheme splits genre
+(`"search:genre=electronic"`) from text (`"search:q=björk post"`) so
+the 30-day cache doesn't collide. Unlike the genre path, text search
+picks the first well-formed result (no shuffle) — Discogs' relevance
+ranking does the work, no custom fuzzy matcher (ROADMAP §v0.4 item 5).
+
+`internal/discogs/worker.go` — `onDiscoveryIntent` now handles
+`StrategyRandom` and `StrategySearch`; dispatches on `ev.Strategy`.
+Every downstream `RequestDownload` carries the originating strategy.
+
+Bandcamp stays random-only — its discover endpoint is tag-based, not
+query-based.
+
+### 3. Origin-aware relax-mode (ROADMAP §v0.4 item 6)
+
+Events widened:
+
+- `bus.RequestDownload` gains `Strategy` (originating intent).
+- `bus.LoadedSong` gains `Relaxed` bool.
+
+Download worker:
+
+- `runLadder` returns `(peer, file, usedRelax, ok)`; strict-pass wins
+  get `usedRelax=false`, relaxed-pass wins get `usedRelax=true`.
+- `onRequestDownload` sets `LoadedSong.Relaxed = usedRelax &&
+  ev.Strategy == StrategySearch`. Passive refill silently relaxes
+  regardless of `usedRelax` — the flag stays false.
+
+Queue service:
+
+- Migration 0004 adds `queue_entries.relaxed INTEGER NOT NULL DEFAULT 0`.
+- `Repo.AppendEntryRelaxed` sets it to 1.
+- `onLoadedSong` picks the right variant based on `LoadedSong.Relaxed`.
+- `SongDTO` exposes the flag on `GET /api/queue/queue`.
+
+### 4. Frontend wiring (v0.4 search-endpoint exception)
+
+`frontend/src/api/queue.js` — new `searchAndQueue(query)` wrapping
+`POST /api/queue/search`.
+
+`frontend/src/stores/queue.js` — `searchAndQueue` action,
+`lastSearchQuery` / `lastSearchSongId` state so the UI can show
+"searching for X…" until the stub resolves.
+
+`frontend/src/components/queue/QueueView.vue` — search input above the
+queue. Two toasts:
+
+- Pending: `Searching Discogs for "<q>"…` while the stub hasn't
+  resolved.
+- Relaxed: `"<q>" — no high-quality matches; showing best available.`
+  once the stub resolves with `relaxed=true`.
+
+Non-search queue entries never show the relaxed toast — it only fires
+for the song triggered by the user's most recent search.
+
+### Files
+
+New:
+- `internal/db/migrations/0004_queue_entries_relaxed.{up,down}.sql`
+- `internal/queue/normalize.go` + `normalize_test.go`
+
+Modified:
+- `internal/bus/events.go` — `RequestDownload.Strategy`,
+  `LoadedSong.Relaxed`
+- `internal/bandcamp/worker.go` — propagates Strategy
+- `internal/discogs/client.go` — `SearchQuery` + `parsePickFirst` +
+  split fetchSearch params
+- `internal/discogs/worker.go` — dispatches on Strategy
+- `internal/discogs/discogs_test.go` — 4 new tests for SearchQuery
+  path + cache + StrategySearch wiring
+- `internal/download/worker.go` — `runLadder` returns usedRelax;
+  `onRequestDownload` sets `LoadedSong.Relaxed` conditionally
+- `internal/download/worker_test.go` — 2 new tests for origin-aware
+  relax (4 subcases)
+- `internal/queue/handler.go` — `Search` handler
+- `internal/queue/service.go` — `Search` service method +
+  `ErrEmptyQuery`; `appendForRequester` takes relaxed flag
+- `internal/queue/models.go` — `QueueEntry.Relaxed`, `SongDTO.Relaxed`,
+  `SearchRequest`, `SearchResponse`
+- `internal/queue/repo.go` — `AppendEntryRelaxed`; `ListEntries` reads
+  the column
+- `internal/queue/queue_test.go` — 4 new tests (search normalize +
+  stub + relaxed surfaced / not surfaced)
+- `cmd/muzika/main.go` — registers `POST /api/queue/search`
+- `frontend/src/api/queue.js`, `stores/queue.js`, `components/queue/
+  QueueView.vue` — frontend wiring
+- `CLAUDE.md`, `ARCHITECTURE.md`, `ROADMAP.md` — docs
+
+### Verification
+
+- `go build ./...` clean
+- `go vet ./...` clean
+- `go test ./...` all packages pass
+- Manual: `POST /api/queue/search` returns 201 with `{songId, query}`;
+  empty query returns 400; stub appears in `queue_songs` with
+  `requesting_user_id`.

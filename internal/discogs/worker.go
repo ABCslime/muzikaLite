@@ -23,13 +23,21 @@ const sourceName = "discogs"
 // Service consumes DiscoveryIntent events, queries Discogs, and publishes
 // RequestDownload (with CatalogNumber populated).
 //
-// Strategy filter: StrategyRandom only in PR 2. Per ROADMAP, StrategyGenre
-// is deferred to v0.4.1 (user preferences UI) and StrategySearch to PR 3.
+// Strategy filter:
+//   - StrategyRandom — passive refill. Genre picked from the intent's
+//     Genre (or the client's defaults). A random well-formed release wins.
+//   - StrategySearch — user-initiated typed query (v0.4 PR 3). The
+//     intent's Query drives a free-text /database/search call; the
+//     first well-formed result wins (preserving Discogs' relevance
+//     ranking — ROADMAP §v0.4 item 5 leans on Discogs' native fuzziness).
+//   - StrategyGenre  — deferred to v0.4.1 (user preferences UI).
+//   - StrategySimilarSong / StrategySimilarPlaylist — deferred to v0.5.
 //
 // Source filter: if the incoming intent carries a non-empty PreferredSources
 // list that doesn't include "discogs", the event is silently ignored —
 // another seeder will handle it. The refiller's weighted pick uses this to
 // route random intents 30% to Discogs and 70% to Bandcamp (defaults).
+// Search intents (v0.4 PR 3) always carry PreferredSources=["discogs"].
 //
 // Failure path: ErrNoResults, ErrRateLimited, or any other search error
 // emits a LoadedSong{Error} via the outbox so queue.onLoadedSong reaps the
@@ -70,8 +78,8 @@ func (s *Service) OnDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 }
 
 func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent) error {
-	// Strategy filter. Discogs currently handles random only.
-	if ev.Strategy != bus.StrategyRandom {
+	// Strategy filter. Discogs currently handles random + search.
+	if ev.Strategy != bus.StrategyRandom && ev.Strategy != bus.StrategySearch {
 		return nil
 	}
 	// Source filter.
@@ -79,9 +87,22 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		return nil
 	}
 
-	result, err := s.client.Search(ctx, ev.Genre)
+	var (
+		result SearchResult
+		err    error
+		query  string // goes into discovery_log for forensics
+	)
+	switch ev.Strategy {
+	case bus.StrategyRandom:
+		query = ev.Genre
+		result, err = s.client.Search(ctx, ev.Genre)
+	case bus.StrategySearch:
+		query = ev.Query
+		result, err = s.client.SearchQuery(ctx, ev.Query)
+	}
+
 	if err != nil {
-		s.recordSeedFailure(ctx, ev, err)
+		s.recordSeedFailure(ctx, ev, query, err)
 		if err := s.emitLoadedError(ctx, ev.SongID); err != nil {
 			s.log.Error("discogs: emit LoadedSong error failed",
 				"song_id", ev.SongID, "err", err)
@@ -98,7 +119,7 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		Source:   discovery.SourceDiscogs,
 		Strategy: string(ev.Strategy),
 		Stage:    discovery.StageSeed,
-		Query:    ev.Genre,
+		Query:    query,
 		Outcome:  discovery.OutcomeOK,
 		Rung:     -1,
 		Reason: func() string {
@@ -114,6 +135,7 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		Title:         result.Title,
 		Artist:        result.Artist,
 		CatalogNumber: result.CatalogNumber,
+		Strategy:      ev.Strategy,
 	}
 	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{
 		SendTimeout: 100 * time.Millisecond,
@@ -125,8 +147,8 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 
 // recordSeedFailure logs a seed-stage failure to discovery_log. Maps error
 // kinds to outcome values so aggregations can distinguish rate-limit blips
-// from genuine "Discogs has nothing for this genre" misses.
-func (s *Service) recordSeedFailure(ctx context.Context, ev bus.DiscoveryIntent, err error) {
+// from genuine "Discogs has nothing for this query" misses.
+func (s *Service) recordSeedFailure(ctx context.Context, ev bus.DiscoveryIntent, query string, err error) {
 	outcome := discovery.OutcomeError
 	switch {
 	case errors.Is(err, ErrNoResults):
@@ -140,7 +162,7 @@ func (s *Service) recordSeedFailure(ctx context.Context, ev bus.DiscoveryIntent,
 		Source:   discovery.SourceDiscogs,
 		Strategy: string(ev.Strategy),
 		Stage:    discovery.StageSeed,
-		Query:    ev.Genre,
+		Query:    query,
 		Outcome:  outcome,
 		Rung:     -1,
 		Reason:   err.Error(),

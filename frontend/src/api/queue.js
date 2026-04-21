@@ -140,5 +140,35 @@ export const queueAPI = {
       throw error
     }
   },
+
+  // v0.4 PR 3: user-initiated search. POSTs the raw query; the backend
+  // normalizes (lowercase + strip punctuation + collapse whitespace). A
+  // stub is created synchronously; the queue entry appears asynchronously
+  // as the Discogs seeder + download ladder complete.
+  //
+  // Returns { songId, query } — songId is the stub's UUID, query is the
+  // normalized form actually used. Throws on 400 (empty normalized
+  // query) or network errors.
+  async searchAndQueue(query) {
+    try {
+      const response = await client.post(`${API_URLS.QUEUE}/search`, { query })
+      return response.data
+    } catch (error) {
+      if (error.response) {
+        const status = error.response.status
+        if (status === 400) {
+          const msg = error.response.data?.message || 'query is empty after normalization'
+          console.error(`Bad search: ${msg}`)
+        } else if (status === 401) {
+          console.error('Unauthorized - please login again')
+        } else {
+          console.error(`Search server error: ${status}`)
+        }
+      } else {
+        console.error('Error searching:', error.message)
+      }
+      throw error
+    }
+  },
 }
 

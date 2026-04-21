@@ -193,6 +193,7 @@ func buildServer(
 	mux.Handle("POST /api/queue/queue/check", withAuth(http.HandlerFunc(qH.Check)))
 	mux.Handle("POST /api/queue/queue/skipped", withAuth(http.HandlerFunc(qH.Skipped)))
 	mux.Handle("POST /api/queue/queue/finished", withAuth(http.HandlerFunc(qH.Finished)))
+	mux.Handle("POST /api/queue/search", withAuth(http.HandlerFunc(qH.Search)))
 	mux.Handle("DELETE /api/queue/queue/{id}", withAuth(http.HandlerFunc(qH.RemoveSong)))
 	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))

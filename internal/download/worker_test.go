@@ -1,4 +1,4 @@
-package slskd_test
+package download_test
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 
 	"github.com/macabc/muzika/internal/bus"
 	"github.com/macabc/muzika/internal/db"
-	"github.com/macabc/muzika/internal/slskd"
+	"github.com/macabc/muzika/internal/download"
 	"github.com/macabc/muzika/internal/soulseek"
 )
 
@@ -99,9 +99,9 @@ func TestWorker_HappyPath(t *testing.T) {
 		},
 	}
 
-	svc := slskd.NewService(d, fc, "/music", b, nil)
+	svc := download.NewService(d, fc, "/music", b, nil)
 
-	err := svc.OnRequestSlskdSong(context.Background(), bus.RequestSlskdSong{
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
 		SongID: songID, Title: "Some Title", Artist: "Some Artist",
 	})
 	if err != nil {
@@ -135,9 +135,9 @@ func TestWorker_NoPeers_EmitsError(t *testing.T) {
 
 	fc := &fakeClient{searchResp: nil} // empty results
 
-	svc := slskd.NewService(d, fc, "/music", b, nil)
+	svc := download.NewService(d, fc, "/music", b, nil)
 
-	err := svc.OnRequestSlskdSong(context.Background(), bus.RequestSlskdSong{
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
 		SongID: uuid.New(), Title: "X", Artist: "Y",
 	})
 	if err != nil {
@@ -160,9 +160,9 @@ func TestWorker_SearchError_EmitsError(t *testing.T) {
 
 	fc := &fakeClient{searchErr: errors.New("soulseek unreachable")}
 
-	svc := slskd.NewService(d, fc, "/music", b, nil)
+	svc := download.NewService(d, fc, "/music", b, nil)
 
-	err := svc.OnRequestSlskdSong(context.Background(), bus.RequestSlskdSong{
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
 		SongID: uuid.New(),
 	})
 	if err != nil {
@@ -192,9 +192,9 @@ func TestWorker_DownloadFailed_EmitsError(t *testing.T) {
 		},
 	}
 
-	svc := slskd.NewService(d, fc, "/music", b, nil)
+	svc := download.NewService(d, fc, "/music", b, nil)
 
-	err := svc.OnRequestSlskdSong(context.Background(), bus.RequestSlskdSong{
+	err := svc.OnRequestDownload(context.Background(), bus.RequestDownload{
 		SongID: uuid.New(),
 	})
 	if err != nil {

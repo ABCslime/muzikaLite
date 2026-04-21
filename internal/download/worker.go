@@ -1,10 +1,11 @@
-// Package slskd is a thin wrapper around internal/soulseek.Client. It owns
-// the RequestSlskdSong worker pool: search via the Soulseek backend, pick a
+// Package download is a thin wrapper around internal/soulseek.Client. It owns
+// the RequestDownload worker pool: search via the Soulseek backend, pick a
 // peer, download the file, and emit LoadedSong (via outbox).
 //
-// The backend implementation (slskd daemon vs. gosk) is selected in main.go
-// and passed in here as a soulseek.Client interface.
-package slskd
+// The name reflects what the package does — turn "title + artist" into a
+// downloaded file — not which backend it speaks to. Swapping gosk for a
+// different Soulseek client later wouldn't change this package's API.
+package download
 
 import (
 	"context"
@@ -28,11 +29,11 @@ const (
 	searchWindow       = 10 * time.Second
 	pollInterval       = 2 * time.Second
 	downloadMaxTimeout = 5 * time.Minute
-	peerMinFiles       = 1    // avoid peers sharing 0 files
-	peerMaxQueue       = 50   // avoid peers with insane queues
+	peerMinFiles       = 1  // avoid peers sharing 0 files
+	peerMaxQueue       = 50 // avoid peers with insane queues
 )
 
-// Service owns the RequestSlskdSong worker pool.
+// Service owns the RequestDownload worker pool.
 type Service struct {
 	db               *sql.DB
 	soulseek         soulseek.Client
@@ -56,22 +57,22 @@ func NewService(
 		bus:              b,
 		dispatcher:       d,
 		musicStoragePath: musicStoragePath,
-		log:              slog.Default().With("mod", "slskd"),
+		log:              slog.Default().With("mod", "download"),
 	}
 }
 
-// StartWorkers subscribes to RequestSlskdSong with `workers` goroutines.
+// StartWorkers subscribes to RequestDownload with `workers` goroutines.
 func (s *Service) StartWorkers(ctx context.Context, workers int) {
-	ch := bus.Subscribe[bus.RequestSlskdSong](s.bus, "slskd/request-slskd-song")
-	bus.RunPool(ctx, s.bus, "slskd/request-slskd-song", workers, ch, s.onRequestSlskdSong)
+	ch := bus.Subscribe[bus.RequestDownload](s.bus, "download/request-download")
+	bus.RunPool(ctx, s.bus, "download/request-download", workers, ch, s.onRequestDownload)
 }
 
-// OnRequestSlskdSong is exported for tests.
-func (s *Service) OnRequestSlskdSong(ctx context.Context, ev bus.RequestSlskdSong) error {
-	return s.onRequestSlskdSong(ctx, ev)
+// OnRequestDownload is exported for tests.
+func (s *Service) OnRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
+	return s.onRequestDownload(ctx, ev)
 }
 
-func (s *Service) onRequestSlskdSong(ctx context.Context, ev bus.RequestSlskdSong) error {
+func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
 	// Build a sensible query and search.
 	query := ev.Artist + " " + ev.Title
 	results, err := s.soulseek.Search(ctx, query, searchWindow)
@@ -117,10 +118,10 @@ func (s *Service) waitForDownload(ctx context.Context, h soulseek.DownloadHandle
 		case soulseek.DownloadCompleted:
 			return state.FilePath, nil
 		case soulseek.DownloadFailed:
-			return "", errors.New("slskd: download failed")
+			return "", errors.New("download: transfer failed")
 		}
 		if time.Now().After(deadline) {
-			return "", errors.New("slskd: download timeout")
+			return "", errors.New("download: transfer timeout")
 		}
 		select {
 		case <-ctx.Done():
@@ -134,11 +135,9 @@ func (s *Service) waitForDownload(ctx context.Context, h soulseek.DownloadHandle
 // and file with the most shared files (a rough proxy for peer reliability).
 //
 // FilesShared == 0 is treated as "unknown" rather than "zero-share peer":
-// the slskd backend populates it from the API's FileCount (always >=1 when
-// the peer responds to a search, so nothing gets incorrectly admitted), but
-// the native/gosk backend leaves it at 0 because the Soulseek wire-level
+// the gosk backend leaves it at 0 because the Soulseek wire-level
 // FileSearchResponse doesn't carry a per-peer shared count. Rejecting 0s
-// here would silently drop every gosk result.
+// here would silently drop every result.
 func pickBest(results []soulseek.SearchResult) (string, soulseek.SearchResult) {
 	var candidates []soulseek.SearchResult
 	for _, r := range results {

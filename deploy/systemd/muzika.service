@@ -1,11 +1,10 @@
 [Unit]
 Description=Muzika music platform
 Documentation=https://github.com/ABCslime/muzikaLite
-After=network-online.target slskd.service
+After=network-online.target
 Wants=network-online.target
-# slskd is a soft dependency (Wants on .target, After on slskd.service).
-# muzika can start without it — the slskd HTTP client tolerates connection
-# failures and retries on the next request.
+# v0.3.0 dropped the slskd sidecar — muzika talks Soulseek directly via
+# github.com/ABCslime/gosk, so there's no After=slskd.service anymore.
 StartLimitBurst=5
 StartLimitIntervalSec=60
 

@@ -4,6 +4,16 @@ Revision of v1 after Phase 2 review. Hardware target moved from "a Pi" (vague) t
 
 See `CHANGES.md` for the mapping from each revision item to the section where it landed.
 
+> **v0.3.0 delta** — the slskd HTTP sidecar was retired. Soulseek now runs
+> in-process via [gosk](https://github.com/ABCslime/gosk), so the Pi
+> deployment is a single binary plus its env file. The gosk evolution
+> plan in §7 is done — it's the only backend now. The former
+> `internal/slskd` package is now `internal/download`; the
+> `RequestSlskdSong` event is now `RequestDownload`; the backend
+> selector and its env var (`MUZIKA_SOULSEEK_BACKEND`) are gone. Sections
+> below are annotated where they describe the pre-v0.3.0 design; the
+> narrative is preserved for historical context.
+
 ---
 
 ## 1. Hardware constraints
@@ -23,12 +33,11 @@ Every downstream design decision in this document answers to one of these constr
 
 | systemd unit                     | `MemoryMax` | `MemoryHigh` | Notes                                               |
 |----------------------------------|-------------|---------------|-----------------------------------------------------|
-| `muzika.service`                 | 150 MB      | 130 MB        | Static Go binary, GOMEMLIMIT=120MiB, GOGC=50.       |
-| `slskd.service`                  | 400 MB      | 350 MB        | The heavy hitter. Replaceable by `gosk` (§7).       |
+| `muzika.service`                 | 150 MB      | 130 MB        | Static Go binary, GOMEMLIMIT=120MiB, GOGC=50. Embeds gosk in-process since v0.3.0. |
 | `muzika-updater.service`         | —           | —             | `Type=oneshot`, runs ~5 s every 5 min. Negligible average. |
-| **Total steady-state**           | **~550 MB** | —             | Leaves ~470 MB for kernel, journald, SSH.           |
+| **Total steady-state**           | **~150 MB** | —             | Leaves ~870 MB for kernel, journald, SSH.           |
 
-Down from ~740 MB under Docker+Watchtower (~130 MB of that was the Docker daemon itself). The RAM delta is the reason we migrated off containers — see §8 for the systemd layout, §10 for the "don't bring Docker back" rationale.
+Down from ~550 MB pre-v0.3.0 (muzika 150 + slskd 400). Down from ~740 MB under Docker+Watchtower (~130 MB of which was the Docker daemon itself). Two RAM cliffs: migrating off Docker (Phase 3.5) bought ~190 MB; retiring the slskd sidecar (v0.3.0, §7) bought another ~400 MB. See §8 for the systemd layout, §10 for the "don't bring Docker back" rationale.
 
 No Postgres process; SQLite is in-process inside `muzika`, so its page cache counts toward muzika's 150 MB limit. Configured `PRAGMA cache_size = -8000` (≈8 MB).
 
@@ -87,11 +96,11 @@ muzika/
 │   │   ├── refiller.go                 # on-demand only, no ticker (§9)
 │   │   └── …
 │   ├── bandcamp/                       # BandcampApi port
-│   ├── slskd/                          # THIN: wraps internal/soulseek.Client
-│   ├── soulseek/                       # NEW (§7): SoulseekClient interface + slskd impl
+│   ├── download/                       # THIN: wraps internal/soulseek.Client
+│   │                                   # (was internal/slskd/ before v0.3.0)
+│   ├── soulseek/                       # NEW (§7): SoulseekClient interface + gosk impl
 │   │   ├── client.go                   # interface definition
-│   │   ├── slskd.go                    # slskd-daemon implementation
-│   │   └── native.go                   # stub; returns ErrNotImplemented in v1
+│   │   └── native.go                   # gosk-backed implementation (sole backend since v0.3.0)
 │   ├── bus/                            # in-process event bus (per-subscriber channels)
 │   │   ├── bus.go
 │   │   ├── events.go
@@ -137,29 +146,29 @@ muzika/
 
 **Out-of-repo (separate module):**
 ```
-gosk/                                   # github.com/<user>/gosk, separate go.mod
+gosk/                                   # github.com/ABCslime/gosk, separate go.mod
 ├── go.mod
-├── client.go                           # implements soulseek.SoulseekClient
+├── client.go                           # implements soulseek.Client
 ├── session.go                          # login + persistent Soulseek session (uses bh90210/soul)
 ├── search.go
 ├── download.go
-├── state.go                            # BoltDB or SQLite for in-flight downloads
-└── README.md                           # scope doc, "not yet production" banner
+├── state.go                            # SQLite for in-flight downloads
+└── README.md                           # scope doc
 ```
 
-`gosk` is not in `muzika/` at all. Muzika imports it by module path. See §7 for the full evolution plan.
+`gosk` is not in `muzika/` at all. Muzika imports it by module path. See §7 for the integration — since v0.3.0 gosk is the only backend.
 
 ### Dependency direction
 ```
 cmd/muzika ───► all internal/*
-internal/{auth,playlist,queue,bandcamp,slskd}
+internal/{auth,playlist,queue,bandcamp,download}
         │
         ├──► internal/bus
         ├──► internal/db
         ├──► internal/httpx
         └──► internal/config
-internal/slskd ──► internal/soulseek   (for SoulseekClient)
-internal/soulseek ──► (stdlib net/http for slskd impl)  OR  github.com/<user>/gosk (for native impl)
+internal/download ──► internal/soulseek   (for soulseek.Client)
+internal/soulseek ──► github.com/ABCslime/gosk
 ```
 No cross-domain imports.
 
@@ -185,7 +194,7 @@ No cross-domain imports.
 
 ### Subscribe / Publish model
 
-**v1 had a bug**: one channel per event type, multiple consumers reading from it — but channel receives are consumed by exactly one receiver, so the second subscriber never sees the message. The `request-slskd-song` topic (consumed by both `slskd` and `queue`) would break.
+**v1 had a bug**: one channel per event type, multiple consumers reading from it — but channel receives are consumed by exactly one receiver, so the second subscriber never sees the message. The `request-slskd-song` topic (consumed by both `slskd` and `queue`) would break. (Renamed to `RequestDownload` in v0.3.0 when `internal/slskd` became `internal/download`.)
 
 **v2 fixes it with per-subscriber channels.** `Subscribe[T]` returns a fresh channel; `Publish[T]` fans out to every subscriber's channel.
 
@@ -216,11 +225,11 @@ func Publish[T any](b *Bus, ctx context.Context, event T) error {
 | `user-deleted` (new)   | `UserDeletedEvent`     | `auth`        | `playlist` (1), `queue` (1) — for cache invalidation only (cascade already handled by FK, §5) |
 | `liked`                | `LikedSongEvent`       | `queue`       | `playlist` (1)                                      |
 | `unliked`              | `UnlikedSongEvent`     | `queue`       | `playlist` (1)                                      |
-| `loaded-song`          | `LoadedSongEvent`      | `slskd`       | `queue` (1)                                         |
+| `loaded-song`          | `LoadedSongEvent`      | `download`    | `queue` (1)                                         |
 | `request-random-song`  | `RequestRandomSongEvent` | `queue` (refiller) | `bandcamp` (cfg `BANDCAMP_WORKERS`, default 2) |
-| `request-slskd-song`   | `RequestSlskdSongEvent`  | `bandcamp` | `slskd` (cfg `SLSKD_WORKERS`, default 2), `queue` (1, for metadata update) |
+| `request-download`     | `RequestDownloadEvent`   | `bandcamp` | `download` (cfg `DOWNLOAD_WORKERS`, default 2), `queue` (1, for metadata update) |
 
-The two-subscriber case on `RequestSlskdSongEvent` now works correctly: each of `slskd` and `queue` gets its own channel with its own backlog.
+The two-subscriber case on `RequestDownloadEvent` (was `RequestSlskdSongEvent` before v0.3.0) works correctly: each of `download` and `queue` gets its own channel with its own backlog.
 
 ### Transactional outbox
 
@@ -239,7 +248,7 @@ State-change events must **never** be silently dropped. The outbox pattern guara
 
 **Events published directly** (regenerable, no outbox):
 - `RequestRandomSongEvent` — if lost, the next refiller call re-emits.
-- `RequestSlskdSongEvent` — if lost, the Bandcamp worker gets the same `RequestRandomSong` again next time the queue is short.
+- `RequestDownloadEvent` — if lost, the Bandcamp worker gets the same `RequestRandomSong` again next time the queue is short. (Was `RequestSlskdSongEvent` before v0.3.0.)
 
 ### Outbox table
 
@@ -544,25 +553,30 @@ Replaces the old hardcoded `audio/mpeg`. Works for mp3, flac, ogg, m4a uniformly
 
 ---
 
-## 7. Soulseek backend evolution
+## 7. Soulseek backend (gosk, in-process)
 
-### Interface (day 1)
+Since v0.3.0 there is one backend: gosk, a pure-Go Soulseek client at
+[github.com/ABCslime/gosk](https://github.com/ABCslime/gosk), imported
+as a library and run in-process. No sidecar, no HTTP hop, no second
+systemd unit. The `MUZIKA_SOULSEEK_BACKEND` switch is gone.
+
+### Interface
 
 ```go
 // internal/soulseek/client.go
 package soulseek
 
 type SearchResult struct {
-    Peer       string
-    Filename   string
-    Size       int64
-    Bitrate    int
-    QueueLen   int
+    Peer        string
+    Filename    string
+    Size        int64
+    Bitrate     int
+    QueueLen    int
     FilesShared int
 }
 
 type DownloadHandle struct {
-    ID       string       // backend-opaque
+    ID string       // gosk-opaque
 }
 
 type DownloadState struct {
@@ -579,81 +593,61 @@ type Client interface {
 }
 ```
 
-Selector:
+Construction (in `cmd/muzika/main.go`):
+
 ```go
-// cmd/muzika/main.go
-var sk soulseek.Client
-switch cfg.SoulseekBackend {       // "slskd" (default) or "native"
-case "slskd":
-    sk = soulseek.NewSlskdClient(cfg.SlskdURL, cfg.SlskdUser, cfg.SlskdPass)
-case "native":
-    sk = gosk.NewClient(...)       // github.com/<user>/gosk
-default:
-    log.Fatalf("unknown backend: %s", cfg.SoulseekBackend)
+sk, err := soulseek.NewNativeClient(nativeGoskConfig(cfg))
+if err != nil {
+    return fmt.Errorf("init gosk: %w", err)
 }
 ```
 
-Env: `MUZIKA_SOULSEEK_BACKEND` ∈ `{slskd, native}`, default `slskd`.
+`NewNativeClient` wraps `gosk.New(...)`, supplying credentials and the
+state path from `Config` (`MUZIKA_SOULSEEK_USERNAME`, `_PASSWORD`,
+`MUZIKA_SOULSEEK_SERVER_ADDRESS`, `_PORT`, `MUZIKA_SOULSEEK_LISTEN_PORT`,
+`MUZIKA_GOSK_STATE_PATH`).
 
-### slskd implementation — first-class, ships day one
+### gosk scope
 
-`internal/soulseek/slskd.go` is the full port of the old SlskdDownloader's HTTP client logic, adapted:
-- Credentials come from config (`MUZIKA_SLSKD_USERNAME`, `MUZIKA_SLSKD_PASSWORD`) — not hardcoded `slskd:slskd`.
-- Search IDs via `uuid.New()` — not the 8-UUID hardcoded pool.
-- Proper structured logging, no `System.out.println` equivalent.
-- Same semantics: login, create search, poll, pick peer (filters by file count and queue length — configurable), initiate download, poll state.
-
-**This is the default backend. The whole system must run end-to-end with slskd before gosk begins.** That's Phase 4–8 of the migration (port-one-module-at-a-time order: auth → playlist → queue → bandcamp → slskd → frontend).
-
-### gosk — separate Go module, lives outside this repo
-
-- Repo: `github.com/<user>/gosk` (or a sibling directory with its own `go.mod`; we'll decide at create-time).
-- Depends on `github.com/bh90210/soul` for the raw Soulseek wire protocol.
-- Implements `soulseek.Client` exactly as defined above.
-- **Not** under `muzika/internal/`. Muzika imports it like any other third-party dep.
-
-**gosk v1 scope — explicit:**
 - Login + persistent session (reconnect on drop, exponential backoff).
-- Search with N-second response window (subscribe to incoming peer responses for a window, then close).
-- Peer selection filter: by file count threshold and queue length.
+- Search with N-second response window.
+- Peer selection filter by file count and queue length.
 - Single-file download with resume on reconnect.
-- In-flight download state persistence: BoltDB or SQLite (decide at impl time).
+- In-flight download state persistence in SQLite at
+  `MUZIKA_GOSK_STATE_PATH` (default `/data/gosk-state.db`).
 
-**gosk v1 explicit non-goals:**
-- Uploads.
-- Chat / private messages.
-- Room search / room join.
-- Distributed network (DHT / parent-peer routing).
-- Wishlists.
-- A web UI.
-- Multi-peer swarm download of a single file.
+Explicit non-goals (same as always): uploads, chat, room search,
+distributed peer routing, wishlists, web UI, swarm download. If muzika
+needs any of these, add them to gosk — not to muzika.
 
-These can come in v2+. None block muzika.
+### History (pre-v0.3.0)
 
-### RAM target for gosk: 40–80 MB under load
+Originally v2 shipped with two implementations behind `soulseek.Client`:
+- **slskd** — HTTP client against the external slskd daemon, running as
+  its own `slskd.service`. This was the default through v0.2.x.
+- **native** — early gosk, flagged as experimental.
 
-If gosk runs over 80 MB steady-state, we've lost the reason to replace slskd. Validated via `docker stats` during sustained search+download load. If it exceeds, we go back to slskd permanently and gosk remains an experiment.
+The plan in the v2 design doc was to port every module against slskd
+first, then swap to gosk once it met a 40–80 MB RAM target. That's what
+happened: Phases 4–8 ported modules against slskd; Phase 8 stabilized
+gosk; v0.3.0 deleted the slskd implementation, the backend switch, and
+the `slskd.service` unit. The `internal/slskd` package was renamed to
+`internal/download` to match its new role — driving an in-process Go
+client, not an external daemon.
 
-### Development order — strict
-
-1. Scaffold (Phase 3).
-2. Port modules one at a time against the **slskd** backend (auth → playlist → queue → bandcamp → slskd → frontend wiring). This is Phases 4 through 9.
-3. Ship muzika running fully on slskd. Declare the migration done.
-4. **Only then** start `gosk` v1 in its own repo. Muzika is unaffected.
-5. When `gosk` passes its scope goals + RAM target, swap it behind the interface by flipping `MUZIKA_SOULSEEK_BACKEND=native` on the Pi.
-
-Muzika is **never blocked on gosk**. At any point, flipping the env back to `slskd` restores the working setup.
+The rename is intentional: "slskd" referred to a specific external
+binary that no longer exists in the deployment. Keeping the name would
+misdescribe the code.
 
 ---
 
 ## 8. Systemd layout
 
-Bare-metal systemd, not Docker. Four units installed to `/etc/systemd/system/` by `deploy/install.sh`:
+Bare-metal systemd, not Docker. Three units installed to `/etc/systemd/system/` by `deploy/install.sh` (pre-v0.3.0 there were four — `slskd.service` was the fourth):
 
 | Unit                          | Type      | User    | Memory cap | Started by            |
 |-------------------------------|-----------|---------|------------|-----------------------|
 | `muzika.service`              | simple    | muzika  | 150 MB     | the updater, after first binary install |
-| `slskd.service`               | simple    | muzika  | 400 MB     | operator (`systemctl enable --now slskd.service` once) |
 | `muzika-updater.service`      | oneshot   | root    | —          | the timer              |
 | `muzika-updater.timer`        | —         | —       | —          | operator (`systemctl enable --now muzika-updater.timer` once) |
 
@@ -662,24 +656,21 @@ Sources live under [`deploy/systemd/`](./deploy/systemd/). `install.sh` copies t
 ### Memory caps (cgroup v2)
 
 - `muzika.service`: `MemoryMax=150M`, `MemoryHigh=130M`, plus `Environment=GOMEMLIMIT=120MiB GOGC=50` so the Go runtime starts collecting before hitting the cgroup ceiling.
-- `slskd.service`: `MemoryMax=400M`, `MemoryHigh=350M`.
 
 `MemoryMax=` is a hard cap — the process is OOM-killed past it. `MemoryHigh=` is a soft throttle — the process is heavily reclaimed but not killed. Requires systemd ≥ 247; Raspberry Pi OS Bookworm ships 252, every current distro is fine.
 
-### Sandboxing (applied to both `muzika` and `slskd`)
+### Sandboxing (muzika.service)
 
-- `User=muzika`, `Group=muzika` (UID 1000, created by `install.sh`).
+- `User=muzika`, `Group=muzika` (UID 1001, created by `install.sh`).
 - `ProtectSystem=strict` — entire rootfs read-only except explicitly listed paths.
 - `ProtectHome=true`, `PrivateTmp=true`, `NoNewPrivileges=true`.
-- `ReadWritePaths=` restricts the writable set:
-  - muzika: `/srv/muzika/data`.
-  - slskd: `/var/lib/slskd /srv/muzika/data/music`.
-- `StandardOutput=journal`, `StandardError=journal` → `journalctl -u <unit>`.
+- `ReadWritePaths=/srv/muzika/data` — audio files, the SQLite DB, and the
+  gosk state DB all live under this one directory.
+- `StandardOutput=journal`, `StandardError=journal` → `journalctl -u muzika`.
 
 ### Restart policy
 
 - muzika: `Restart=on-failure`, `RestartSec=5`, `StartLimitBurst=5`, `StartLimitIntervalSec=60`. On a persistently-broken binary we stop retrying after 5 attempts in 60 s — no tight-loop restart storm eating CPU on a 1 GB Pi.
-- slskd: `Restart=on-failure`, `RestartSec=10`. slskd has varied failure modes (network hiccups, peer stalls); a longer backoff is kinder.
 - updater: no restart. Timer retries every 5 min on its own.
 
 ### Autoupdate flow
@@ -688,7 +679,7 @@ Sources live under [`deploy/systemd/`](./deploy/systemd/). `install.sh` copies t
 2. Timer starts `muzika-updater.service` (oneshot, `User=root`).
 3. [`/usr/local/bin/muzika-update`](./deploy/bin/muzika-update) does, in order:
    1. `git fetch && git reset --hard origin/main` in `/srv/muzika/repo`.
-   2. Run [`/usr/local/bin/muzika-decrypt`](./deploy/bin/muzika-decrypt): SOPS-decrypt `deploy/.env.sops`, split by prefix into `/etc/muzika/muzika.env` (`MUZIKA_*`) and `/etc/muzika/slskd.env` (`SLSKD_*`, `SOULSEEK_*`). Compare sha256 of each file before/after to set `env_changed`.
+   2. Run [`/usr/local/bin/muzika-decrypt`](./deploy/bin/muzika-decrypt): SOPS-decrypt `deploy/.env.sops` into `/etc/muzika/muzika.env`. Compare sha256 before/after to set `env_changed`. (Pre-v0.3.0 this split by prefix into two files — `muzika.env` and `slskd.env` — because the slskd sidecar needed its own env. With slskd gone there's a single consumer, so a single file.)
    3. `curl` GitHub Releases API for `<repo>/releases/latest`. On HTTP 403 (rate-limited) or 5xx, log and exit 0 — the timer retries next tick.
    4. If the returned `tag_name` doesn't start with `v`, exit 1 (guard against upstream mistakes).
    5. Read `/var/lib/muzika/version`. If binary tag matches and `env_changed=0`, exit 0.
@@ -703,9 +694,13 @@ Sources live under [`deploy/systemd/`](./deploy/systemd/). `install.sh` copies t
 - Both subtract from a fixed 1024 MB budget. systemd is already PID 1 and costs nothing extra.
 - See §1 for the numbers, §10 for the "don't bring it back" rule.
 
-### slskd config
+### gosk config
 
-Non-secret slskd settings live in `/etc/muzika/slskd.yml` (seeded by `install.sh` from [`deploy/slskd.yml.template`](./deploy/slskd.yml.template)). Secrets (admin username/password, Soulseek account credentials) live in `/etc/muzika/slskd.env` via `EnvironmentFile=`. Editing the template in the repo doesn't overwrite `/etc/muzika/slskd.yml` — operator edits there are preserved.
+There is no separate gosk config file. gosk is a Go library linked into
+muzika; every knob comes from `MUZIKA_*` env vars parsed into
+`internal/config.Config` (see §10) and passed to `soulseek.NewNativeClient`
+at startup. The pre-v0.3.0 `/etc/muzika/slskd.yml` file and its
+`deploy/slskd.yml.template` source are gone.
 
 ---
 
@@ -724,26 +719,31 @@ No ticker goroutine — if the user isn't interacting, the queue sits. Same as b
 
 ```go
 type Config struct {
-    HTTPPort           int           `envconfig:"HTTP_PORT" default:"8080"`
-    DBPath             string        `envconfig:"DB_PATH" default:"/data/muzika.db"`
-    JWTSecret          string        `envconfig:"JWT_SECRET" required:"true"`
-    JWTExpiration      time.Duration `envconfig:"JWT_EXPIRATION" default:"24h"`
-    MusicStoragePath   string        `envconfig:"MUSIC_STORAGE_PATH" default:"/data/music"`
-    CORSOrigins        []string      `envconfig:"CORS_ORIGINS"`              // comma-separated, empty = off
-    SoulseekBackend    string        `envconfig:"SOULSEEK_BACKEND" default:"slskd"` // "slskd" | "native"
-    SlskdURL           string        `envconfig:"SLSKD_URL" default:"http://slskd:5030"`
-    SlskdUsername      string        `envconfig:"SLSKD_USERNAME"`
-    SlskdPassword      string        `envconfig:"SLSKD_PASSWORD"`
-    MinQueueSize       int           `envconfig:"MIN_QUEUE_SIZE" default:"10"`
-    BandcampWorkers    int           `envconfig:"BANDCAMP_WORKERS" default:"2"`
-    SlskdWorkers       int           `envconfig:"SLSKD_WORKERS" default:"2"`
-    BandcampDefaultTags []string     `envconfig:"BANDCAMP_DEFAULT_TAGS" default:"electronic,house"`
-    BusBufferSize      int           `envconfig:"BUS_BUFFER_SIZE" default:"64"`
-    LogLevel           string        `envconfig:"LOG_LEVEL" default:"info"`
+    HTTPPort             int           `envconfig:"HTTP_PORT" default:"8080"`
+    DBPath               string        `envconfig:"DB_PATH" default:"/data/muzika.db"`
+    JWTSecret            string        `envconfig:"JWT_SECRET" required:"true"`
+    JWTExpiration        time.Duration `envconfig:"JWT_EXPIRATION" default:"24h"`
+    MusicStoragePath     string        `envconfig:"MUSIC_STORAGE_PATH" default:"/data/music"`
+    CORSOrigins          []string      `envconfig:"CORS_ORIGINS"`                          // comma-separated, empty = off
+
+    // Soulseek network account (gosk login)
+    SoulseekUsername       string      `envconfig:"SOULSEEK_USERNAME" required:"true"`
+    SoulseekPassword       string      `envconfig:"SOULSEEK_PASSWORD" required:"true"`
+    SoulseekServerAddress  string      `envconfig:"SOULSEEK_SERVER_ADDRESS" default:"server.slsknet.org"`
+    SoulseekServerPort     int         `envconfig:"SOULSEEK_SERVER_PORT" default:"2242"`
+    SoulseekListenPort     int         `envconfig:"SOULSEEK_LISTEN_PORT" default:"2234"`
+    GoskStatePath          string      `envconfig:"GOSK_STATE_PATH" default:"/data/gosk-state.db"`
+
+    MinQueueSize         int           `envconfig:"MIN_QUEUE_SIZE" default:"10"`
+    BandcampWorkers      int           `envconfig:"BANDCAMP_WORKERS" default:"2"`
+    DownloadWorkers      int           `envconfig:"DOWNLOAD_WORKERS" default:"2"`
+    BandcampDefaultTags  []string      `envconfig:"BANDCAMP_DEFAULT_TAGS" default:"electronic,house"`
+    BusBufferSize        int           `envconfig:"BUS_BUFFER_SIZE" default:"64"`
+    LogLevel             string        `envconfig:"LOG_LEVEL" default:"info"`
 }
 ```
 
-Prefix `MUZIKA_`. Validation: `SlskdUsername` / `SlskdPassword` required only when `SoulseekBackend=slskd`; the struct-validator function runs after parsing.
+Prefix `MUZIKA_`. `SoulseekUsername` / `SoulseekPassword` are `required:"true"` — muzika won't start without a Soulseek account. The v0.2.x struct had a `SoulseekBackend` switch and four `Slskd*` fields; all five were dropped in v0.3.0 along with the sidecar. `SlskdWorkers` became `DownloadWorkers`.
 
 ---
 
@@ -880,13 +880,11 @@ On every timer tick, `/usr/local/bin/muzika-update` calls `/usr/local/bin/muzika
 
 1. Reads `/srv/muzika/repo/deploy/.env.sops`.
 2. Runs `sops -d` with `SOPS_AGE_KEY_FILE=/etc/muzika/age.key`.
-3. Splits the decrypted output into two service env files by variable prefix:
-   - `MUZIKA_*` → `/etc/muzika/muzika.env` (mode 0640, owner `muzika:muzika`)
-   - `SLSKD_*` and `SOULSEEK_*` → `/etc/muzika/slskd.env` (same perms)
+3. Writes the decrypted output to `/etc/muzika/muzika.env` (mode 0640, owner `muzika:muzika`).
 
-Both files are consumed by systemd via `EnvironmentFile=` directives in the service units. There is no `docker compose --env-file` pipeline, no env-var templating in a compose file — systemd loads the files as plain `KEY=value` pairs.
+The file is consumed by systemd via `EnvironmentFile=` in `muzika.service`. There is no `docker compose --env-file` pipeline, no env-var templating — systemd loads the file as plain `KEY=value` pairs.
 
-Variables that both services need (e.g. slskd admin credentials used as `SLSKD_USERNAME` for slskd itself and as `MUZIKA_SLSKD_USERNAME` for muzika's HTTP client) appear twice in the plaintext `.env` under both names. `.env.example` documents this.
+Pre-v0.3.0 this step split the decrypted output into two files by variable prefix — `MUZIKA_*` into `muzika.env`, `SLSKD_*`/`SOULSEEK_*` into `slskd.env` — because the slskd sidecar needed its own env. With slskd retired, everything that remains is a `MUZIKA_*` var consumed by the one binary.
 
 ### Rotation
 
@@ -903,7 +901,7 @@ Variables that both services need (e.g. slskd admin credentials used as `SLSKD_U
 
 ### UID pinning on the Pi
 
-`install.sh` creates a `muzika` system user at UID 1000. Host directory `/srv/muzika/data/music` is owned `muzika:muzika` (0750). Both `muzika.service` and `slskd.service` run as `User=muzika`. Matching UIDs eliminate the shared-volume permission dance that plagued the Docker setup — no PUID/PGID env vars, no `chown -R` maintenance.
+`install.sh` creates a `muzika` system user at UID 1001. `/srv/muzika/data` (audio files + SQLite DB + gosk state) is owned `muzika:muzika` (0750) and `muzika.service` runs as `User=muzika`. Since v0.3.0 there's no second service sharing the music directory — gosk runs inside muzika — so the shared-UID dance that mattered for slskd is moot. The Docker-era PUID/PGID env vars were retired in Phase 3.5.
 
 ---
 
@@ -925,13 +923,9 @@ func main() {
     qSvc    := queue.NewService(db, cfg.MusicStoragePath, cfg.MinQueueSize, b)
     bcSvc   := bandcamp.NewService(cfg.BandcampDefaultTags, b)
 
-    var sk soulseek.Client
-    switch cfg.SoulseekBackend {
-    case "slskd":  sk = soulseek.NewSlskdClient(cfg.SlskdURL, cfg.SlskdUsername, cfg.SlskdPassword)
-    case "native": log.Error("native backend not yet available in v1"); os.Exit(1)
-    default:       log.Error("unknown backend"); os.Exit(1)
-    }
-    skSvc := slskd.NewService(sk, cfg.MusicStoragePath, b)
+    sk, err := soulseek.NewNativeClient(nativeGoskConfig(cfg))  // gosk, in-process
+    if err != nil { log.Error("init gosk: " + err.Error()); os.Exit(1) }
+    dlSvc := download.NewService(sk, cfg.MusicStoragePath, b)
 
     ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
     defer cancel()
@@ -940,7 +934,7 @@ func main() {
     plSvc.StartWorkers(ctx)
     qSvc.StartWorkers(ctx)
     bcSvc.StartWorkers(ctx, cfg.BandcampWorkers)
-    skSvc.StartWorkers(ctx, cfg.SlskdWorkers)
+    dlSvc.StartWorkers(ctx, cfg.DownloadWorkers)
 
     // Outbox dispatcher
     outbox := bus.StartOutboxDispatcher(ctx, db, b, log)
@@ -980,38 +974,34 @@ flowchart LR
             Playlist["internal/playlist"]
             Queue["internal/queue<br/>per-user mutex<br/>refiller (on-demand)"]
             Bandcamp["internal/bandcamp<br/>workers: N"]
-            Slskd["internal/slskd<br/>workers: N"]
+            Download["internal/download<br/>workers: N"]
             SoulseekIface(["internal/soulseek.Client"])
-            SlskdImpl["slskd impl"]
-            NativeImpl["native impl (gosk)<br/>— future"]
+            GoskImpl["gosk<br/>(github.com/ABCslime/gosk)<br/>in-process"]
 
             Bus[("internal/bus<br/>per-subscriber channels")]
             Outbox[("outbox table<br/>+ dispatcher")]
             SQLite[(SQLite<br/>/srv/muzika/data/muzika.db)]
+            GoskDB[(gosk state<br/>/srv/muzika/data/gosk-state.db)]
 
             HTTP --> Auth & Playlist & Queue
             Auth -- "INSERT outbox + DELETE" --> SQLite
             Queue -- "INSERT outbox + state" --> SQLite
-            Slskd -- "INSERT outbox (LoadedSong)" --> SQLite
+            Download -- "INSERT outbox (LoadedSong)" --> SQLite
 
             Outbox -- polls --> SQLite
             Outbox -- "Publish state-change" --> Bus
 
             Queue -- "Publish RequestRandomSong" --> Bus
-            Bandcamp -- "Publish RequestSlskdSong" --> Bus
+            Bandcamp -- "Publish RequestDownload" --> Bus
 
             Bus -- per-subscriber chan --> Playlist
             Bus -- per-subscriber chan --> Queue
             Bus -- per-subscriber chan --> Bandcamp
-            Bus -- per-subscriber chan --> Slskd
+            Bus -- per-subscriber chan --> Download
 
-            Slskd --> SoulseekIface
-            SoulseekIface -.day 1.-> SlskdImpl
-            SoulseekIface -.future.-> NativeImpl
-        end
-
-        subgraph SlskdSvc["slskd.service (User=muzika, MemoryMax=400M)"]
-            SLSKDBOX["slskd daemon"]
+            Download --> SoulseekIface
+            SoulseekIface --> GoskImpl
+            GoskImpl --- GoskDB
         end
 
         subgraph UpdaterSvc["muzika-updater.timer + .service<br/>(oneshot, User=root, fires every 5 min)"]
@@ -1020,6 +1010,7 @@ flowchart LR
 
         subgraph Disk["Pi filesystem (/srv/muzika — owned muzika:muzika)"]
             DBFile["data/muzika.db"]
+            GoskFile["data/gosk-state.db"]
             Audio["data/music/"]
             Repo["repo/ (git checkout)"]
         end
@@ -1027,17 +1018,13 @@ flowchart LR
         subgraph Etc["/etc/muzika (0750 root:muzika)"]
             AgeKey["age.key (0400 root)"]
             MuzEnv["muzika.env (0640)"]
-            SlkEnv["slskd.env (0640)"]
-            SlkYml["slskd.yml"]
         end
 
         SQLite --- DBFile
-        SLSKDBOX -.writes.-> Audio
+        GoskDB --- GoskFile
+        GoskImpl -.writes.-> Audio
         Queue -.reads (ServeContent).-> Audio
-        SlskdImpl -.HTTP :5030.-> SLSKDBOX
         MuzikaSvc -.EnvironmentFile.-> MuzEnv
-        SlskdSvc -.EnvironmentFile.-> SlkEnv
-        SlskdSvc -.config.-> SlkYml
     end
 
     SPA -->|HTTPS /api/*, Bearer w/ tv| HTTP
@@ -1045,12 +1032,12 @@ flowchart LR
     subgraph External["Internet"]
         BC[bandcamp.com]
         SN[Soulseek P2P]
-        GHREL[GitHub Releases<br/>muzika-linux-arm64]
+        GHREL[GitHub Releases<br/>muzika-linux-arm64<br/>muzika-linux-armv7]
         GHGIT[GitHub repo]
     end
 
     Bandcamp -.goquery scrape.-> BC
-    SLSKDBOX -.P2P.-> SN
+    GoskImpl -.P2P wire protocol.-> SN
     Updater -.curl + verify sha.-> GHREL
     Updater -.git pull.-> GHGIT
     Updater -.decrypts .env.sops with age.key.-> Etc
@@ -1066,7 +1053,7 @@ flowchart LR
 3. **End-to-end smoke** — `go test -tags=e2e` spins the full binary against a `:memory:` DB and a fake `soulseek.Client`; asserts login → add song → fetch queue.
 4. **Outbox correctness** — a dedicated test kills the dispatcher mid-run and restarts to confirm events are still delivered.
 
-No testing against real slskd in CI (slow, flaky). Manual smoke on the Pi post-deploy is enough for a personal deploy.
+No test hits the real Soulseek network. Tests use a fake `soulseek.Client` and run the full download worker against it. Manual smoke on the Pi post-deploy is enough for a personal deploy.
 
 ---
 
@@ -1075,8 +1062,8 @@ No testing against real slskd in CI (slow, flaky). Manual smoke on the Pi post-d
 All Phase 2-v1 items resolved. Remaining small uncertainties for Phase 3:
 
 1. **Frontend dev workflow** — locked: when `internal/web/dist` is empty (`embed.FS` yields zero files), muzika serves nothing at `/` and returns 404. In dev, run `vite dev` on :3000; the Vite proxy forwards `/api/*` to `localhost:8080` as it does today. In prod, the CI binary build (`build.yml`) runs `npm run build` and copies `frontend/dist/` into `internal/web/dist/` before `go build`, so `//go:embed` bakes the SPA into the released binary. README will document both.
-2. **Audio extensions** — if a filename has no extension (slskd occasionally returns one), `mime.TypeByExtension` yields `""` and we fall back to `application/octet-stream`. The browser's `<audio>` element may reject unknown types. If it becomes a real problem, we sniff the first 512 bytes (`http.DetectContentType`). Not doing it in v2 to keep things lean.
-3. **gosk module path** — to be chosen at implementation time: either `github.com/<user>/gosk` (recommended, independent lifecycle) or a sibling directory with its own `go.mod` inside a multi-module layout. Doesn't affect Muzika's code — it's just an import path.
+2. **Audio extensions** — if a filename has no extension (some peers serve one), `mime.TypeByExtension` yields `""` and we fall back to `application/octet-stream`. The browser's `<audio>` element may reject unknown types. If it becomes a real problem, we sniff the first 512 bytes (`http.DetectContentType`). Not doing it in v2 to keep things lean.
+3. **gosk module path** — resolved: [`github.com/ABCslime/gosk`](https://github.com/ABCslime/gosk). Independent repo, independent lifecycle, imported as a normal Go dep. v0.3.0 consumes gosk v0.1.0.
 
 ---
 

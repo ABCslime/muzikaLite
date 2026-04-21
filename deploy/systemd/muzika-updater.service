@@ -21,10 +21,10 @@ StandardError=journal
 #   /srv/muzika/repo   — git fetch + reset --hard
 #
 # NoNewPrivileges is intentionally NOT set. The script invokes systemctl to
-# restart muzika.service and slskd.service. While systemctl itself is not
-# setuid, NoNewPrivileges has caused subtle interaction issues with
-# systemd's D-Bus helpers on some distributions; the ProtectSystem=strict +
-# ReadWritePaths combination already bounds the blast radius.
+# restart muzika.service. While systemctl itself is not setuid,
+# NoNewPrivileges has caused subtle interaction issues with systemd's D-Bus
+# helpers on some distributions; the ProtectSystem=strict + ReadWritePaths
+# combination already bounds the blast radius.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

@@ -1,16 +1,14 @@
-// Package soulseek defines the abstraction over Soulseek backends.
+// Package soulseek defines the abstraction over the Soulseek network backend.
 //
-// Two implementations live here:
-//   - slskd.go   — HTTP client against the slskd daemon. Ships day one.
-//   - native.go  — gosk (github.com/<user>/gosk) — returns ErrNotImplemented
-//                  in v1. Will be enabled when gosk reaches its scope goals.
-//
-// The selector in cmd/muzika/main.go picks one based on MUZIKA_SOULSEEK_BACKEND.
+// Only one implementation ships: native.go, which wraps github.com/ABCslime/gosk
+// (a pure-Go Soulseek client). The old HTTP-to-slskd-daemon backend was
+// retired in v0.3.0 — muzika is now a single Go binary on the Pi with no
+// sidecar. Keeping the Client interface around lets us swap in a different
+// backend later without touching the worker code.
 package soulseek
 
 import (
 	"context"
-	"errors"
 	"time"
 )
 
@@ -41,19 +39,9 @@ type SearchResult struct {
 	FilesShared int
 }
 
-// DownloadHandle identifies an in-flight or completed download. It carries
-// both the raw (Peer, Filename) pair the slskd daemon uses to look up the
-// transfer and a backend-opaque ID used by the native gosk backend. Backends
-// read only the field(s) they need; the other side stays zero.
-//
-// Peer+Filename are kept as distinct fields (not a single encoded string) so
-// no escaping scheme has to be invented and no separator can collide with
-// user-provided content.
+// DownloadHandle identifies an in-flight or completed download via a
+// backend-opaque transfer ID.
 type DownloadHandle struct {
-	// slskd fields
-	Peer     string
-	Filename string
-	// native (gosk) field — opaque transfer ID
 	ID string
 }
 
@@ -73,6 +61,3 @@ const (
 	DownloadCompleted    DownloadStateKind = "completed"
 	DownloadFailed       DownloadStateKind = "failed"
 )
-
-// ErrNotImplemented is returned by the native backend while gosk is unfinished.
-var ErrNotImplemented = errors.New("soulseek: backend not implemented")

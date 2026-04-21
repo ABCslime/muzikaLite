@@ -19,7 +19,7 @@ coverage.txt
 .env.local
 .env.*.local
 
-# Local data (DB, music, slskd state). On the Pi these live under
+# Local data (DB, music, gosk state). On the Pi these live under
 # /srv/muzika/data, not in the repo; this keeps local-dev runs tidy.
 /data/
 /deploy/data/

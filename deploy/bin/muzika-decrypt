@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# muzika-decrypt: decrypt deploy/.env.sops from the repo checkout and split
-# it into two service env files.
+# muzika-decrypt: decrypt deploy/.env.sops from the repo checkout into the
+# single service env file consumed by muzika.service.
 #
 # Called by /usr/local/bin/muzika-update on every timer tick, or manually
 # by the operator after the first install. Idempotent.
+#
+# v0.3.0 collapsed the two-file split (muzika.env + slskd.env) into one —
+# muzika no longer has a sidecar, so everything it needs lives under the
+# MUZIKA_* prefix.
 #
 # Inputs:
 #   /srv/muzika/repo/deploy/.env.sops   (SOPS-encrypted .env)
@@ -11,7 +15,6 @@
 #
 # Outputs:
 #   /etc/muzika/muzika.env              (MUZIKA_* vars, 0640 muzika:muzika)
-#   /etc/muzika/slskd.env               (SLSKD_* and SOULSEEK_* vars, same)
 
 set -euo pipefail
 
@@ -46,24 +49,19 @@ command -v sops >/dev/null 2>&1 || die "sops not installed"
 
 tmp_plain=$(mktemp)
 tmp_muzika=$(mktemp)
-tmp_slskd=$(mktemp)
 # shellcheck disable=SC2064
 # Intentional early-expansion — we want the current filenames baked in.
-trap "rm -f '$tmp_plain' '$tmp_muzika' '$tmp_slskd'" EXIT
+trap "rm -f '$tmp_plain' '$tmp_muzika'" EXIT
 
 SOPS_AGE_KEY_FILE="$AGE_KEY" sops -d "$SOPS_FILE" > "$tmp_plain"
 
-# Split the decrypted env by variable prefix. The two service units
-# consume disjoint variable families; anything else is ignored.
-#
+# Keep only MUZIKA_* lines. Anything else in the decrypted file is ignored —
+# the muzika service only consumes this prefix.
 # grep returns 1 if no lines match — we accept that with || :.
 grep '^MUZIKA_' "$tmp_plain" > "$tmp_muzika" || :
-grep -E '^(SLSKD_|SOULSEEK_)' "$tmp_plain" > "$tmp_slskd" || :
 
 [ -s "$tmp_muzika" ] || die "no MUZIKA_* variables in decrypted env"
-[ -s "$tmp_slskd" ]  || log "WARNING: no SLSKD_/SOULSEEK_ variables in decrypted env"
 
 install -m 0640 -o muzika -g muzika "$tmp_muzika" "${ETC_DIR}/muzika.env"
-install -m 0640 -o muzika -g muzika "$tmp_slskd"  "${ETC_DIR}/slskd.env"
 
-log "decrypted env into ${ETC_DIR}/{muzika,slskd}.env"
+log "decrypted env into ${ETC_DIR}/muzika.env"

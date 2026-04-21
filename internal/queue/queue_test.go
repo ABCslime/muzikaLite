@@ -254,7 +254,7 @@ func TestOnLoadedSong_ErrorDeletesStub(t *testing.T) {
 	}
 }
 
-func TestOnRequestSlskdSong_UpdatesMetadata(t *testing.T) {
+func TestOnRequestDownload_UpdatesMetadata(t *testing.T) {
 	svc, d, _ := newService(t)
 	ctx := context.Background()
 
@@ -263,7 +263,7 @@ func TestOnRequestSlskdSong_UpdatesMetadata(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	err := svc.OnRequestSlskdSong(ctx, bus.RequestSlskdSong{
+	err := svc.OnRequestDownload(ctx, bus.RequestDownload{
 		SongID: sid, Title: "Test Title", Artist: "Test Artist",
 	})
 	if err != nil {

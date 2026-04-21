@@ -33,7 +33,6 @@ BIN_PATH="${INSTALL_DIR}/muzika"
 VERSION_FILE="${VERSION_FILE:-/var/lib/muzika/version}"
 REPO_DIR="${REPO_DIR:-/srv/muzika/repo}"
 ENV_FILE="${ENV_FILE:-/etc/muzika/muzika.env}"
-SLSKD_ENV_FILE="${SLSKD_ENV_FILE:-/etc/muzika/slskd.env}"
 LOG_TAG="muzika-updater"
 
 # curl timeouts applied to every remote call:
@@ -80,9 +79,9 @@ hash_file() {
     fi
 }
 
-# Per-service restart flags. Set to 1 when that service's inputs changed.
+# Restart flag. Set to 1 when muzika's inputs changed (binary or env).
+# v0.3.0 dropped the slskd sidecar — there's only one service now.
 should_restart_muzika=0
-should_restart_slskd=0
 
 # -----------------------------------------------------------------------------
 # 1. Git fetch + HEAD comparison + decrypt.
@@ -92,7 +91,6 @@ should_restart_slskd=0
 # -----------------------------------------------------------------------------
 if [ -d "${REPO_DIR}/.git" ]; then
     old_muzika_env_hash=$(hash_file "$ENV_FILE")
-    old_slskd_env_hash=$(hash_file "$SLSKD_ENV_FILE")
 
     if ! git -C "$REPO_DIR" fetch --quiet origin; then
         log "git fetch failed; will retry next tick"
@@ -133,14 +131,9 @@ if [ -d "${REPO_DIR}/.git" ]; then
 
     if /usr/local/bin/muzika-decrypt; then
         new_muzika_env_hash=$(hash_file "$ENV_FILE")
-        new_slskd_env_hash=$(hash_file "$SLSKD_ENV_FILE")
         if [ "$old_muzika_env_hash" != "$new_muzika_env_hash" ]; then
             should_restart_muzika=1
             log "muzika.env changed"
-        fi
-        if [ "$old_slskd_env_hash" != "$new_slskd_env_hash" ]; then
-            should_restart_slskd=1
-            log "slskd.env changed"
         fi
     else
         log "decrypt failed; keeping existing env and continuing"
@@ -240,16 +233,9 @@ if [ "$api_ok" -eq 1 ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Restart services whose binary or env changed.
-#
-#    muzika restarts on binary change OR muzika.env change.
-#    slskd  restarts on slskd.env change (credential rotation etc).
+# 4. Restart muzika if the binary or env changed.
 # -----------------------------------------------------------------------------
 if [ "$should_restart_muzika" -eq 1 ]; then
     systemctl restart muzika
     log "restarted muzika.service"
-fi
-if [ "$should_restart_slskd" -eq 1 ]; then
-    systemctl restart slskd
-    log "restarted slskd.service"
 fi

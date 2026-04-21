@@ -21,10 +21,10 @@ import (
 	"github.com/macabc/muzika/internal/bus"
 	"github.com/macabc/muzika/internal/config"
 	"github.com/macabc/muzika/internal/db"
+	"github.com/macabc/muzika/internal/download"
 	"github.com/macabc/muzika/internal/httpx"
 	"github.com/macabc/muzika/internal/playlist"
 	"github.com/macabc/muzika/internal/queue"
-	"github.com/macabc/muzika/internal/slskd"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
@@ -70,19 +70,10 @@ func run() error {
 
 	dispatcher := bus.StartOutboxDispatcher(ctx, database, b, log)
 
-	// ---- Soulseek backend selection ----
-	var sk soulseek.Client
-	switch cfg.SoulseekBackend {
-	case "slskd":
-		sk = soulseek.NewSlskdClient(cfg.SlskdURL, cfg.SlskdUsername, cfg.SlskdPassword)
-	case "native":
-		native, err := soulseek.NewNativeClient(nativeGoskConfig(cfg))
-		if err != nil {
-			return fmt.Errorf("init gosk: %w", err)
-		}
-		sk = native
-	default:
-		return fmt.Errorf("unknown SOULSEEK_BACKEND %q", cfg.SoulseekBackend)
+	// ---- Soulseek backend (native gosk — single binary, no sidecar) ----
+	sk, err := soulseek.NewNativeClient(nativeGoskConfig(cfg))
+	if err != nil {
+		return fmt.Errorf("init gosk: %w", err)
 	}
 
 	// ---- Services ----
@@ -94,13 +85,13 @@ func run() error {
 	}
 	qSvc := queue.NewService(ctx, database, cfg.MusicStoragePath, cfg.MinQueueSize, defaultGenre, b, dispatcher)
 	bcSvc := bandcamp.NewService(bandcamp.NewClient("https://bandcamp.com", cfg.BandcampDefaultTags), database, b, dispatcher)
-	skSvc := slskd.NewService(database, sk, cfg.MusicStoragePath, b, dispatcher)
+	dlSvc := download.NewService(database, sk, cfg.MusicStoragePath, b, dispatcher)
 
 	// ---- Start worker pools ----
 	plSvc.StartWorkers(ctx)
 	qSvc.StartWorkers(ctx)
 	bcSvc.StartWorkers(ctx, cfg.BandcampWorkers)
-	skSvc.StartWorkers(ctx, cfg.SlskdWorkers)
+	dlSvc.StartWorkers(ctx, cfg.DownloadWorkers)
 
 	// ---- HTTP ----
 	srv := buildServer(cfg, log, authSvc, plSvc, qSvc)

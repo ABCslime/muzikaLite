@@ -11,14 +11,16 @@ import (
 )
 
 // NativeClient adapts github.com/ABCslime/gosk to this package's Client
-// interface. Activate with MUZIKA_SOULSEEK_BACKEND=native in production.
+// interface. As of v0.3.0 this is the only backend we ship — the HTTP
+// client against the slskd daemon was retired so muzika can run as a
+// single binary on the Pi with no sidecar.
 //
 // Field-for-field translation only — gosk defines its public API with
 // matching semantics by design (see gosk/README.md wire-up section).
 //
-// Login is lazy: the first call that requires a session triggers it.
-// This matches SlskdClient's behavior so main.go doesn't need to know
-// which backend is in use.
+// Login is lazy: the first call that requires a session triggers it,
+// which keeps main.go wiring uniform even though there's only one
+// backend now.
 type NativeClient struct {
 	g *gosk.Client
 

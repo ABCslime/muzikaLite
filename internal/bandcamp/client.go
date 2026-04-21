@@ -1,6 +1,6 @@
 // Package bandcamp scrapes Bandcamp's discover endpoint to populate the song
 // catalog when the queue runs low. Consumes RequestRandomSong, produces
-// RequestSlskdSong. Genre is honored (replaces the old hardcoded "hisa").
+// RequestDownload. Genre is honored (replaces the old hardcoded "hisa").
 package bandcamp
 
 import (
@@ -105,7 +105,7 @@ func (c *Client) discover(ctx context.Context, tag string) (DiscoverResponse, er
 		TimeFacetID:        nil,           // no time filter
 		Cursor:             nil,           // first page
 		Size:               60,            // maxBatchSize in bundle
-		IncludeResultTypes: []string{"a"}, // albums only (s = songs, we want albums for slskd)
+		IncludeResultTypes: []string{"a"}, // albums only (s = songs, we want albums so Soulseek finds the release)
 	})
 	if err != nil {
 		return DiscoverResponse{}, fmt.Errorf("marshal: %w", err)

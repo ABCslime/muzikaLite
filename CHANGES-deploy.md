@@ -79,3 +79,59 @@ oneshot updater average). The spec's 580 MB likely accounted for some
 systemd overhead; ~550 is the measured lower bound, and both numbers
 are consistent with the ~740 MB old-with-Docker figure. If you want the
 docs to say 580 flat, one `sed -i 's/~550/~580/'` fixes both spots.
+
+---
+
+## v0.3.0 — slskd sidecar retired (2026-04-21)
+
+The Phase 3.5 systemd migration above preserved a two-service layout:
+`muzika.service` plus `slskd.service`. v0.3.0 retires the sidecar
+entirely. Soulseek moves in-process via
+[gosk](https://github.com/ABCslime/gosk) v0.1.0. Result: one binary,
+one systemd unit, one env file.
+
+### Files deleted
+
+| Item                                    | Action                                       |
+|-----------------------------------------|----------------------------------------------|
+| `deploy/systemd/slskd.service`          | `git rm` — no sidecar to supervise           |
+| `deploy/slskd.yml.template`             | `git rm` — every gosk knob is now a `MUZIKA_*` env var, seeded from `.env.example` |
+
+### Files modified
+
+| Item                                    | Change                                       |
+|-----------------------------------------|----------------------------------------------|
+| `deploy/install.sh`                     | Removed slskd binary download, yml template install, `slskd.service` copy, arch detection for slskd, `/var/lib/slskd` + `/opt/slskd` directory creation. Only `age` + `sops` install remains. |
+| `deploy/bin/muzika-decrypt`             | Removed two-file split: now writes a single `/etc/muzika/muzika.env`. No more prefix-filtering the decrypted output. |
+| `deploy/bin/muzika-update`              | Removed slskd env-hash tracking, `should_restart_slskd` flag, `systemctl restart slskd` call. Only restarts `muzika.service`. |
+| `deploy/systemd/muzika.service`         | Removed `After=slskd.service`. Comment notes the v0.3.0 change. |
+| `deploy/systemd/muzika-updater.service` | Updated sandboxing comment to reflect the single-env-file flow. |
+| `.env.example`                          | Dropped `MUZIKA_SOULSEEK_BACKEND`, all `MUZIKA_SLSKD_*`, all `SLSKD_*` and `SOULSEEK_*` sidecar credentials. Kept `MUZIKA_SOULSEEK_USERNAME` / `_PASSWORD` (gosk login) and added `MUZIKA_GOSK_STATE_PATH`. Renamed `MUZIKA_SLSKD_WORKERS` → `MUZIKA_DOWNLOAD_WORKERS`. |
+
+### Documentation
+
+| File                  | Change                                              |
+|-----------------------|-----------------------------------------------------|
+| `README.md`           | Full rewrite for v0.3.0: three units (not four); single env file; directory layout table shows `internal/download/` and drops `deploy/systemd/slskd.service`, `deploy/slskd.yml.template`; memory budget table updated to ~150 MB total; "Soulseek backend" section collapsed to gosk-only. |
+| `CLAUDE.md`           | §1 budget table updated (slskd row removed). §2 dependency tree (`internal/slskd` → `internal/download`). §5 event name updated. §7 secrets (no shared-UID dance). §8 collapsed to single-backend language. §11 three units, single env file, single UID (1001). |
+| `ARCHITECTURE.md`     | v0.3.0 delta banner at the top. §1 budget table. §3 repo layout + dependency arrows. §4 event renames. §7 fully rewritten (gosk is sole backend; historical slskd narrative preserved). §8 three units; sandboxing; restart policy. §10 Config struct. §12 decrypt flow (single file). §13 main.go startup sketch. §14 mermaid diagram rewritten (no slskd subgraph; gosk runs inside muzika). |
+| `CHANGES.md`          | Appended v0.3.0 section summarizing code/deploy/memory deltas and the fate of items 7–12 from the v2 plan. |
+
+### Memory delta
+
+| Component          | Pre-v0.3.0 | Post-v0.3.0 | Delta   |
+|--------------------|------------|-------------|---------|
+| `muzika.service`   | 150 MB     | 150 MB      | 0       |
+| `slskd.service`    | 400 MB     | —           | −400 MB |
+| **Total**          | **~550 MB** | **~150 MB** | **−400 MB** |
+
+Combined with Phase 3.5's Docker → systemd delta (~190 MB), the Pi 3
+total footprint is down ~590 MB from the pre-Phase-3.5 baseline of
+~740 MB.
+
+### Verification
+
+- `go build ./...` — clean.
+- `go vet ./...` — clean.
+- `go test ./...` — all packages pass (auth, bandcamp, download, playlist, queue).
+- `shellcheck -x deploy/bin/muzika-update deploy/bin/muzika-decrypt deploy/install.sh` — clean.

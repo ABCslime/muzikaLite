@@ -11,7 +11,7 @@ const (
 	TypeUnlikedSong       = "UnlikedSong"
 	TypeLoadedSong        = "LoadedSong"
 	TypeRequestRandomSong = "RequestRandomSong"
-	TypeRequestSlskdSong  = "RequestSlskdSong"
+	TypeRequestDownload   = "RequestDownload"
 )
 
 // State-change events — delivered via the outbox. Subscribers MUST be idempotent.
@@ -60,7 +60,11 @@ type RequestRandomSong struct {
 	Genre string `json:"genre"`
 }
 
-type RequestSlskdSong struct {
+// RequestDownload is emitted by bandcamp when it picks a (title, artist) pair,
+// and consumed by the download worker pool (and by queue, for a metadata
+// sync-up). The event name reflects the intent — "please obtain this track" —
+// rather than which backend ultimately fetches it.
+type RequestDownload struct {
 	SongID uuid.UUID `json:"song_id"`
 	Title  string    `json:"title"`
 	Artist string    `json:"artist"`

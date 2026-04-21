@@ -3,9 +3,13 @@
 # Run with sudo. Idempotent — safe to re-run.
 #
 # Provisions the muzika system user, directories, systemd units, the
-# muzika-update / muzika-decrypt scripts, slskd binary, sops/age tooling,
-# and an age keypair. Does NOT enable any services — prints a checklist
-# the operator runs manually.
+# muzika-update / muzika-decrypt scripts, sops/age tooling, and an age
+# keypair. Does NOT enable any services — prints a checklist the operator
+# runs manually.
+#
+# v0.3.0 dropped the slskd sidecar: muzika is now a single Go binary that
+# speaks Soulseek natively via github.com/ABCslime/gosk. Nothing else to
+# install alongside it.
 
 set -euo pipefail
 
@@ -21,20 +25,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 SOPS_VERSION="${SOPS_VERSION:-v3.8.1}"
 
-# Pick binary flavors matching the running kernel. Pi 3 CPU is aarch64 but
-# a 32-bit Ubuntu/Raspberry Pi OS userland only loads ARMv7 ELFs.
-#   aarch64 / arm64  → linux-arm64 assets  (64-bit userland)
-#   armv7l / armv6l  → linux-arm assets    (32-bit userland)
+# Pick sops architecture matching the running kernel. Pi 3 CPU is aarch64
+# but a 32-bit Ubuntu/Raspberry Pi OS userland only loads ARMv7 ELFs.
+#   aarch64 / arm64  → arm64  (64-bit userland)
+#   armv7l / armv6l  → arm    (32-bit userland)
 arch=$(uname -m)
 case "$arch" in
     aarch64|arm64)
-        SLSKD_ARCH_MATCH="linux-arm64"
         SOPS_ARCH="arm64"
         ;;
     armv7l|armv6l)
-        # slskd's 32-bit asset is named "linux-arm" (no 64). Anchor with
-        # regex to avoid matching linux-arm64 by accident.
-        SLSKD_ARCH_MATCH='linux-arm[^0-9]'
         SOPS_ARCH="arm"
         ;;
     *)
@@ -66,83 +66,26 @@ install -d -m 0750 -o "$MUZIKA_USER" -g "$MUZIKA_USER" /srv/muzika
 install -d -m 0750 -o "$MUZIKA_USER" -g "$MUZIKA_USER" /srv/muzika/data
 install -d -m 0750 -o "$MUZIKA_USER" -g "$MUZIKA_USER" /srv/muzika/data/music
 install -d -m 0750 -o "$MUZIKA_USER" -g "$MUZIKA_USER" /var/lib/muzika
-install -d -m 0750 -o "$MUZIKA_USER" -g "$MUZIKA_USER" /var/lib/slskd
 install -d -m 0750 -o root             -g "$MUZIKA_USER" /etc/muzika
-install -d -m 0755 -o root             -g root            /opt/slskd
 
 # ----------------------------------------------------------------------------
-# 3. slskd binary (prompt if already installed).
-# ----------------------------------------------------------------------------
-SLSKD_BIN="/opt/slskd/slskd"
-install_slskd=0
-
-if [ -x "$SLSKD_BIN" ]; then
-    read -r -p "slskd already installed at ${SLSKD_BIN}. Re-download latest? [y/N] " ans
-    case "$ans" in
-        [Yy]*) install_slskd=1 ;;
-        *)     log "keeping existing slskd" ;;
-    esac
-else
-    install_slskd=1
-fi
-
-if [ "$install_slskd" -eq 1 ]; then
-    log "downloading slskd latest ${SLSKD_ARCH_MATCH} release"
-    command -v jq     >/dev/null 2>&1 || { apt-get update && apt-get install -y jq; }
-    command -v curl   >/dev/null 2>&1 || { apt-get update && apt-get install -y curl; }
-    command -v unzip  >/dev/null 2>&1 || { apt-get update && apt-get install -y unzip; }
-
-    api=$(curl -fsSL https://api.github.com/repos/slskd/slskd/releases/latest)
-    tarball=$(
-        echo "$api" \
-        | jq -r --arg re "$SLSKD_ARCH_MATCH" '.assets[] | select(.name | test($re)) | .browser_download_url' \
-        | head -n1
-    )
-    [ -n "$tarball" ] || { echo "no ${SLSKD_ARCH_MATCH} asset in slskd latest release" >&2; exit 1; }
-
-    tmpdir=$(mktemp -d)
-    # shellcheck disable=SC2064
-    trap "rm -rf '$tmpdir'" EXIT
-
-    curl -fsSL -o "$tmpdir/slskd.zip" "$tarball"
-    unzip -q -o "$tmpdir/slskd.zip" -d /opt/slskd
-    chmod 0755 /opt/slskd/slskd
-
-    rm -rf "$tmpdir"
-    trap - EXIT
-    log "installed slskd to ${SLSKD_BIN}"
-fi
-
-# ----------------------------------------------------------------------------
-# 4. slskd config template.
-# ----------------------------------------------------------------------------
-if [ ! -f /etc/muzika/slskd.yml ]; then
-    log "installing slskd config template to /etc/muzika/slskd.yml"
-    install -m 0640 -o root -g "$MUZIKA_USER" \
-        "$REPO_ROOT/deploy/slskd.yml.template" /etc/muzika/slskd.yml
-else
-    log "slskd.yml already exists; keeping current"
-fi
-
-# ----------------------------------------------------------------------------
-# 5. systemd units.
+# 3. systemd units.
 # ----------------------------------------------------------------------------
 log "installing systemd units"
 install -m 0644 "$REPO_ROOT/deploy/systemd/muzika.service"          /etc/systemd/system/muzika.service
-install -m 0644 "$REPO_ROOT/deploy/systemd/slskd.service"           /etc/systemd/system/slskd.service
 install -m 0644 "$REPO_ROOT/deploy/systemd/muzika-updater.service"  /etc/systemd/system/muzika-updater.service
 install -m 0644 "$REPO_ROOT/deploy/systemd/muzika-updater.timer"    /etc/systemd/system/muzika-updater.timer
 systemctl daemon-reload
 
 # ----------------------------------------------------------------------------
-# 6. Updater + decrypt scripts.
+# 4. Updater + decrypt scripts.
 # ----------------------------------------------------------------------------
 log "installing updater scripts"
 install -m 0755 "$REPO_ROOT/deploy/bin/muzika-update"  /usr/local/bin/muzika-update
 install -m 0755 "$REPO_ROOT/deploy/bin/muzika-decrypt" /usr/local/bin/muzika-decrypt
 
 # ----------------------------------------------------------------------------
-# 7. age + sops.
+# 5. age + sops.
 # ----------------------------------------------------------------------------
 if ! command -v age-keygen >/dev/null 2>&1; then
     log "installing age"
@@ -162,7 +105,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# 8. age keypair.
+# 6. age keypair.
 # ----------------------------------------------------------------------------
 if [ ! -f /etc/muzika/age.key ]; then
     log "generating age keypair at /etc/muzika/age.key"
@@ -177,7 +120,7 @@ fi
 pub=$(grep -E '^# public key:' /etc/muzika/age.key | awk '{print $NF}')
 
 # ----------------------------------------------------------------------------
-# 9. Print checklist — intentionally do NOT start services.
+# 7. Print checklist — intentionally do NOT start services.
 # ----------------------------------------------------------------------------
 cat <<EOF
 
@@ -197,7 +140,7 @@ Next steps (do these in order):
     encrypt:
 
         cp .env.example .env
-        # edit .env, fill in JWT_SECRET, SLSKD_*, SOULSEEK_*, etc.
+        # edit .env, fill in MUZIKA_JWT_SECRET, MUZIKA_SOULSEEK_USERNAME, etc.
         sops -e .env > deploy/.env.sops
         git add deploy/.sops.yaml deploy/.env.sops
         git commit -m "deploy: seed encrypted env"
@@ -206,26 +149,21 @@ Next steps (do these in order):
 
  3. Push a v* tag to trigger the first release build:
 
-        git tag v0.1.0
+        git tag v0.3.0
         git push --tags
 
     Wait for the release workflow to finish (github.com/ABCslime/muzikaLite/actions).
 
  4. On this Pi, start the updater timer — it pulls the new binary on the
-    next tick and decrypts the env files:
+    next tick and decrypts the env file:
 
         sudo systemctl enable --now muzika-updater.timer
-
- 5. Start slskd once (auto-restarts thereafter):
-
-        sudo systemctl enable --now slskd.service
 
 The muzika service starts automatically after the first updater tick
 installs the binary (the updater calls systemctl restart muzika).
 
 Logs:
     journalctl -u muzika          -f
-    journalctl -u slskd           -f
     journalctl -u muzika-updater  -n 50
 
 =============================================================================

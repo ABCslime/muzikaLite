@@ -2,20 +2,16 @@
 
 Personal music platform — single Go binary, SQLite, Vue 3 SPA, Soulseek +
 Bandcamp discovery. Replaces five Java/Spring services that previously ran
-on Kubernetes. Runs on a Raspberry Pi 3 under systemd — **no Docker**.
+on Kubernetes. Runs on a Raspberry Pi 3 under systemd — **no Docker, no
+sidecar**.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design and
 [`CLAUDE.md`](./CLAUDE.md) for working conventions.
 
-**Status:** Phase 3 scaffold. Modules are stubs; business logic ports
-land module-by-module in Phases 4–9.
-
-**Frontend deferred.** The Vue SPA is not yet in the repo — it's being
-brought in after the `auth`, `playlist`, and `queue` modules are
-ported. Until then, the backend binary serves a minimal placeholder
-page at `/`, and every endpoint under `/api/*` returns
-`ErrNotImplemented` until its module lands. CI workflows detect the
-missing `frontend/` and skip the Node build steps automatically.
+**Status:** v0.3.0. Backend and frontend are in. The slskd HTTP sidecar
+was retired in v0.3.0 — Soulseek now runs in-process via
+[gosk](https://github.com/ABCslime/gosk), so the Pi deployment is a
+single binary plus its env file.
 
 ---
 
@@ -27,7 +23,7 @@ cd muzika
 git config core.hooksPath .githooks        # enable .env pre-commit guard
 
 # Backend
-cp .env.example .env                        # fill in JWT_SECRET, SLSKD_*
+cp .env.example .env                        # fill in MUZIKA_JWT_SECRET, MUZIKA_SOULSEEK_*
 go mod tidy
 go run ./cmd/muzika
 
@@ -44,8 +40,10 @@ Vite's dev server does, and proxies API traffic to Go on :8080.
 
 ## Getting started on the Pi
 
-Deployment is bare-metal systemd. Four units, one auto-updater that polls
-GitHub Releases for new `muzika-linux-arm64` binaries every 5 min.
+Deployment is bare-metal systemd. Three units (`muzika.service`,
+`muzika-updater.service`, `muzika-updater.timer`) and an auto-updater that
+polls GitHub Releases for new `muzika-linux-arm64` / `muzika-linux-armv7`
+binaries every 5 min.
 
 ### 1. Clone to /srv/muzika/repo
 
@@ -63,11 +61,10 @@ sudo deploy/install.sh
 ```
 
 `install.sh` is idempotent. It creates the `muzika` system user (UID
-1000), all required directories (`/srv/muzika/data`, `/var/lib/muzika`,
-`/var/lib/slskd`, `/etc/muzika`, `/opt/slskd`), installs the systemd
-units, downloads the latest slskd ARM64 release into `/opt/slskd`,
-installs `age` and `sops`, and generates an age keypair at
-`/etc/muzika/age.key`. It prints the **age public key** at the end.
+1001), all required directories (`/srv/muzika/data`, `/var/lib/muzika`,
+`/etc/muzika`), installs the systemd units, installs `age` and `sops`,
+and generates an age keypair at `/etc/muzika/age.key`. It prints the
+**age public key** at the end.
 
 It does **not** start any service. The rest of the steps are yours.
 
@@ -88,7 +85,7 @@ Commit and push.
 
 ```sh
 cp .env.example .env
-$EDITOR .env                        # fill in JWT_SECRET, SLSKD_*, SOULSEEK_*
+$EDITOR .env                        # fill in MUZIKA_JWT_SECRET, MUZIKA_SOULSEEK_*
 sops -e .env > deploy/.env.sops
 git add deploy/.sops.yaml deploy/.env.sops
 git commit -m "deploy: seed encrypted env"
@@ -99,32 +96,31 @@ rm .env                             # do NOT commit plaintext
 ### 5. Tag the first release
 
 ```sh
-git tag v0.1.0
+git tag v0.3.0
 git push --tags
 ```
 
-The `release.yml` workflow builds `muzika-linux-arm64` and publishes a
-GitHub Release. Wait for it to finish
+The `release.yml` workflow builds `muzika-linux-arm64` / `muzika-linux-armv7`
+and publishes a GitHub Release. Wait for it to finish
 (<https://github.com/ABCslime/muzikaLite/actions>).
 
-### 6. Enable services on the Pi
+### 6. Enable the updater timer
 
 ```sh
 sudo systemctl enable --now muzika-updater.timer   # triggers the first pull
-sudo systemctl enable --now slskd.service          # starts slskd
 ```
 
 The updater fires 2 min after boot and every 5 min thereafter. On its
-first tick it pulls the v0.1.0 binary from the GitHub Release, decrypts
-`deploy/.env.sops` into `/etc/muzika/muzika.env` and
-`/etc/muzika/slskd.env`, and starts muzika. Visit `http://<pi>:8080`.
+first tick it pulls the binary from the GitHub Release, decrypts
+`deploy/.env.sops` into `/etc/muzika/muzika.env`, and starts muzika.
+Visit `http://<pi>:8080`.
 
 ---
 
 ## Ongoing deploy
 
-Push to `main` → CI builds and uploads `muzika-linux-arm64` as a workflow
-artifact. **Nothing deploys.**
+Push to `main` → CI builds and uploads the binary as a workflow artifact.
+**Nothing deploys.**
 
 Push a `v*` tag → `release.yml` builds and creates a GitHub Release. The
 Pi's `muzika-updater.timer` picks it up within 5 min, verifies the
@@ -136,24 +132,24 @@ commit.
 
 Secrets updates propagate the same way: edit `.env`, `sops -e > deploy/.env.sops`,
 commit, push. The next updater tick re-pulls the repo, re-decrypts, sees
-the env files changed (sha256 diff), and restarts muzika. No new binary
+the env file changed (sha256 diff), and restarts muzika. No new binary
 required.
 
 ---
 
 ## Memory and swap (Pi 3 1 GB)
 
-Steady-state budget (see `deploy/systemd/*.service`):
+Steady-state budget (see `deploy/systemd/muzika.service`):
 
 | Unit                      | `MemoryMax` |
 |---------------------------|-------------|
 | `muzika.service`          | 150 MB      |
-| `slskd.service`           | 400 MB      |
 | `muzika-updater.service`  | — (oneshot) |
-| **Total**                 | **~550 MB** |
+| **Total**                 | **~150 MB** |
 
 Down from ~740 MB when this ran under Docker + Watchtower — the Docker
-daemon alone cost ~130 MB.
+daemon alone cost ~130 MB. And down another ~400 MB from pre-v0.3.0,
+when a slskd sidecar handled Soulseek.
 
 If you hit OOMs, add swap — **on a USB stick, not the SD card**. SD swap
 will destroy the card in weeks.
@@ -179,7 +175,7 @@ sudo systemctl disable --now zramswap.service 2>/dev/null || true
 
 # Monitor:
 free -h
-systemctl status muzika.service slskd.service
+systemctl status muzika.service
 ```
 
 If you still OOM after this, the real fix is bigger hardware, not more
@@ -218,13 +214,13 @@ journalctl -u muzika-updater -f
 sudo systemctl stop muzika-updater.timer
 ```
 
-**slskd can't write to /srv/muzika/data/music.** Check ownership:
+**muzika can't write to /srv/muzika/data/music.** Check ownership:
 ```sh
 ls -la /srv/muzika/data
 # should show `muzika muzika` on everything
 sudo chown -R muzika:muzika /srv/muzika/data
 ```
-Both services run as the `muzika` user — UID mismatch is the usual
+The service runs as the `muzika` user — UID mismatch is the usual
 cause of "file exists but empty" issues.
 
 **"sops: no recipient matches" on the Pi.** The `/etc/muzika/age.key`
@@ -236,19 +232,18 @@ updatekeys deploy/.env.sops`, commit.
 
 ## Soulseek backend
 
-Two implementations behind `internal/soulseek.Client`, selected by
-`MUZIKA_SOULSEEK_BACKEND`:
+One implementation behind `internal/soulseek.Client`:
 
-- `slskd` (default) — talks HTTP to the [slskd daemon](https://github.com/slskd/slskd)
-  running as a systemd sidecar. **This is what ships and what you should
-  use.**
-- `native` — [gosk](https://github.com/ABCslime/gosk) (separate Go module,
-  not in this repo). Returns `ErrNotImplemented` in v1; muzika refuses
-  to start. See `ARCHITECTURE.md` §7 for the gosk roadmap.
+- `native` — [gosk](https://github.com/ABCslime/gosk), a pure-Go
+  Soulseek client. Talks the Soulseek wire protocol directly; no
+  daemon required.
 
-To use slskd you need a Soulseek network account (register free at
-<https://www.slsknet.org/>). Set `SOULSEEK_USERNAME` / `SOULSEEK_PASSWORD`
-in your plaintext `.env` before encrypting.
+Register a Soulseek account at <https://www.slsknet.org/> and set
+`MUZIKA_SOULSEEK_USERNAME` / `MUZIKA_SOULSEEK_PASSWORD` in your
+plaintext `.env` before encrypting.
+
+The pre-v0.3.0 slskd HTTP sidecar and its `MUZIKA_SOULSEEK_BACKEND`
+switch were retired — there's only one code path now.
 
 ---
 
@@ -261,20 +256,18 @@ in your plaintext `.env` before encrypting.
 | `internal/playlist/`               | Playlists + "Liked" system playlist                     |
 | `internal/queue/`                  | Per-user queue, song catalog, audio byte serving        |
 | `internal/bandcamp/`               | Bandcamp discovery scrape                               |
-| `internal/slskd/`                  | RequestSlskdSong worker; wraps `internal/soulseek`      |
-| `internal/soulseek/`               | Backend interface + slskd impl + native (stub) impl     |
+| `internal/download/`               | RequestDownload worker; wraps `internal/soulseek`       |
+| `internal/soulseek/`               | Backend interface + gosk (native) impl                  |
 | `internal/bus/`                    | In-process event bus + transactional outbox            |
-| `internal/db/`                     | SQLite open + pragmas + migrations runner               |
+| `internal/db/`                     | SQLite open + pragmas + embedded migrations             |
 | `internal/httpx/`                  | Middleware (auth, CORS, logging), errors, userctx       |
 | `internal/config/`                 | envconfig-driven Config                                 |
 | `internal/web/`                    | Embeds `frontend/dist/` via `//go:embed`                |
-| `migrations/`                      | One linear stream of SQL migrations                     |
-| `frontend/`                        | Vue 3 SPA (copied unchanged from old repo)              |
-| `deploy/systemd/`                  | The four systemd units                                  |
+| `frontend/`                        | Vue 3 SPA                                               |
+| `deploy/systemd/`                  | The three systemd units                                 |
 | `deploy/bin/muzika-update`         | Updater script (timer target)                           |
-| `deploy/bin/muzika-decrypt`        | SOPS decrypt + split into service env files             |
+| `deploy/bin/muzika-decrypt`        | SOPS decrypt into `/etc/muzika/muzika.env`              |
 | `deploy/install.sh`                | One-shot Pi provisioning script                         |
-| `deploy/slskd.yml.template`        | slskd config template (seeded to `/etc/muzika/slskd.yml`) |
 | `deploy/.sops.yaml`                | SOPS recipient config                                   |
 | `deploy/.env.sops`                 | Encrypted env (committed)                               |
 | `.github/workflows/`               | `build.yml` (every push) + `release.yml` (v* tags)      |
@@ -287,13 +280,12 @@ in your plaintext `.env` before encrypting.
 - [x] **Phase 2** — Architecture (see `ARCHITECTURE.md`, `CHANGES.md`)
 - [x] **Phase 3** — Scaffold
 - [x] **Phase 3.5** — Docker → systemd deployment migration (see `CHANGES-deploy.md`)
-- [ ] **Phase 4** — Port auth module
-- [ ] **Phase 5** — Port playlist module
-- [ ] **Phase 6** — Port queue module
-- [ ] **Phase 7** — Port bandcamp module
-- [ ] **Phase 8** — Port slskd module (against slskd backend)
-- [ ] **Phase 9** — Frontend integration + smoke test on the Pi
-- [ ] **Later** — gosk v1 in a separate repo
+- [x] **Phase 4** — Port auth module
+- [x] **Phase 5** — Port playlist module
+- [x] **Phase 6** — Port queue module
+- [x] **Phase 7** — Port bandcamp module
+- [x] **Phase 8** — Port slskd module (retired in v0.3.0; replaced by `internal/download` + gosk)
+- [x] **Phase 9** — Frontend integration + smoke test on the Pi
 
 ---
 

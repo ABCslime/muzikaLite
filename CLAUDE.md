@@ -8,8 +8,8 @@ design rationale; this file is the short rulebook.
 ## 1. Project shape
 
 - Single Go binary under `cmd/muzika`. Five internal domain packages
-  (`auth`, `playlist`, `queue`, `bandcamp`, `slskd`) that never import each
-  other. They communicate via `internal/bus`.
+  (`auth`, `playlist`, `queue`, `bandcamp`, `download`) that never import
+  each other. They communicate via `internal/bus`.
 - Replaces five Spring Boot services (authManager, PlaylistManager,
   QueueManager, BandcampApi, SlskdDownloader) and embeds the Vue SPA.
 - Target: Raspberry Pi 3, 1 GB RAM. Memory budgets are load-bearing.
@@ -20,13 +20,14 @@ Memory budget (load-bearing):
 | Process                    | MemoryMax | Notes                           |
 |----------------------------|-----------|---------------------------------|
 | `muzika.service`           | 150 MB    | GOMEMLIMIT=120MiB, GOGC=50      |
-| `slskd.service`            | 400 MB    | Heavy hitter                    |
 | `muzika-updater.service`   | —         | Oneshot, ~5 s every 5 min       |
-| **Total steady-state**     | **~550 MB** | Leaves ~470 MB for kernel/SSH |
+| **Total steady-state**     | **~150 MB** | Leaves ~870 MB for kernel/SSH |
 
-Down from ~740 MB under Docker+Watchtower (the Docker daemon alone cost
-~130 MB). The RAM savings is the reason we migrated off Docker. See
-`ARCHITECTURE.md` §1 for the detailed budget and §3 for the full layout.
+Down from ~550 MB pre-v0.3.0 (muzika 150 + slskd 400). Down from
+~740 MB under Docker+Watchtower. The slskd sidecar was retired in v0.3.0
+when Soulseek moved in-process via gosk; the ~400 MB it held went back to
+the kernel page cache. See `ARCHITECTURE.md` §1 for the detailed budget
+and §3 for the full layout.
 
 ---
 
@@ -34,12 +35,12 @@ Down from ~740 MB under Docker+Watchtower (the Docker daemon alone cost
 
 ```
 cmd/muzika  ─►  all internal/*
-internal/{auth,playlist,queue,bandcamp,slskd}
+internal/{auth,playlist,queue,bandcamp,download}
       ├─► internal/bus
       ├─► internal/db
       ├─► internal/httpx
       └─► internal/config
-internal/slskd  ─►  internal/soulseek   (only — stays thin)
+internal/download  ─►  internal/soulseek   (only — stays thin)
 ```
 
 **No domain package imports another domain package.** If you feel tempted,
@@ -87,8 +88,8 @@ invent a second pattern "just for this one case."
 ### Audio serving
 - Use `http.ServeContent` so Range requests work (the Vue player scrubs).
 - Content-Type via `mime.TypeByExtension(filepath.Ext(path))`, fallback
-  `application/octet-stream`. Don't hardcode `audio/mpeg` — slskd returns
-  flac/ogg/m4a too.
+  `application/octet-stream`. Don't hardcode `audio/mpeg` — Soulseek
+  peers serve flac/ogg/m4a too.
 
 ---
 
@@ -133,8 +134,8 @@ plus a single unprefixed `outbox`. Don't invent new prefixes — if a module
 needs a new table, it goes under its existing prefix.
 
 ### Migrations
-One linear stream under `migrations/`. Next migration is `0002_*.up.sql`.
-Never edit a shipped migration; always add a new one.
+One linear stream under `migrations/`. Never edit a shipped migration;
+always add a new one.
 
 ---
 
@@ -146,7 +147,7 @@ Never edit a shipped migration; always add a new one.
   the row in the **same transaction** as the state mutation, then call
   `dispatcher.Wake()` after commit. This is the at-least-once contract;
   subscribers MUST be idempotent.
-- **Request events** (`RequestRandomSong`, `RequestSlskdSong`) are
+- **Request events** (`RequestRandomSong`, `RequestDownload`) are
   published directly with `bus.Publish`. If lost on process crash, the
   refiller regenerates them on the next short-queue observation.
 
@@ -195,8 +196,7 @@ All runtime knobs are in `internal/config/Config`, prefix `MUZIKA_`.
 `.env.example` is the canonical list. When adding a new knob:
 1. Add the field to `Config`.
 2. Add it to `.env.example` with a comment.
-3. If required in one backend mode and not another, extend
-   `Config.validate()` — don't `panic` at use-site.
+3. If required, extend `Config.validate()` — don't `panic` at use-site.
 
 ---
 
@@ -207,28 +207,32 @@ All runtime knobs are in `internal/config/Config`, prefix `MUZIKA_`.
   (encrypted) live in git.
 - SOPS + age. Private key lives only on the Pi at `/etc/muzika/age.key`.
   Rotate per the README.
-- The `muzika` system user on the Pi has UID 1000. Both `muzika.service`
-  and `slskd.service` run as `User=muzika`. The music directory
-  `/srv/muzika/data/music` is owned by `muzika:muzika` (mode 0750). Don't
-  invent a second UID for slskd — it must match muzika so both services
-  can read/write the shared directory without a permission dance.
-- Decrypted env files live at `/etc/muzika/muzika.env` and
-  `/etc/muzika/slskd.env`, both mode 0640 owned `muzika:muzika`. They are
-  consumed via `EnvironmentFile=` directives in the systemd units —
-  nothing else reads them.
+- The `muzika` system user on the Pi has UID 1001. `muzika.service` runs
+  as `User=muzika` and owns `/srv/muzika/data` (audio files + SQLite +
+  gosk state). Since v0.3.0 there's no second service sharing the music
+  volume — gosk runs in-process, so the shared-UID dance the slskd sidecar
+  needed is gone.
+- Decrypted env lives at `/etc/muzika/muzika.env`, mode 0640 owned
+  `muzika:muzika`. It's consumed via `EnvironmentFile=` in
+  `muzika.service` — nothing else reads it.
 
 ---
 
 ## 8. Soulseek backend
 
-- Production uses `MUZIKA_SOULSEEK_BACKEND=slskd`. Day-one.
-- `native` (gosk) is a separate Go module, not in this repo. Setting
-  `SOULSEEK_BACKEND=native` in v1 fails fast with a clear error.
-- `internal/slskd` is **thin**: it consumes `RequestSlskdSong`, calls
-  `soulseek.Client` methods, and publishes `LoadedSong` via outbox. It
-  does not know which backend is in use.
+- There is one backend: `internal/soulseek/native.go` wraps
+  [gosk](https://github.com/ABCslime/gosk), a pure-Go Soulseek client.
+  The pre-v0.3.0 HTTP-to-slskd-daemon backend and its
+  `MUZIKA_SOULSEEK_BACKEND` switch were retired — there's a single code
+  path now.
+- `internal/download` is **thin**: it consumes `RequestDownload`, calls
+  `soulseek.Client` methods, and publishes `LoadedSong` via the outbox.
+  It was named `internal/slskd` before v0.3.0; the event was
+  `RequestSlskdSong`. The package and event were renamed because the name
+  "slskd" no longer describes what the code does — it drives gosk, not an
+  external daemon.
 
-See `ARCHITECTURE.md` §7 for the gosk evolution plan.
+See `ARCHITECTURE.md` §7 for the gosk integration.
 
 ---
 
@@ -239,8 +243,8 @@ See `ARCHITECTURE.md` §7 for the gosk evolution plan.
 - Per-module tests never import another domain package; they import
   `internal/bus` and pass a fake/real `*bus.Bus`.
 - Integration tests spin up a real SQLite file in `t.TempDir()`.
-- No test hits the real slskd or bandcamp.com; use the `soulseek.Client`
-  interface and a fake.
+- No test hits the real Soulseek network or bandcamp.com; use the
+  `soulseek.Client` interface and a fake.
 
 ---
 
@@ -252,15 +256,11 @@ See `ARCHITECTURE.md` §7 for the gosk evolution plan.
 - Don't add a DI framework. `main.go` wiring is plenty.
 - Don't add a config YAML parser. Env vars only.
 - Don't bring back Kafka.
+- Don't bring back the slskd sidecar. gosk runs in-process; that's the
+  whole point of v0.3.0. See §1 — the ~400 MB slskd held was the single
+  largest line item in the Pi 3 budget.
 - Don't bring back Docker. We measured the Pi 3 1 GB budget; Docker
   daemon + Watchtower cost ~160 MB we don't have. See §1 and §11.
-- Don't assume the frontend exists. It's deferred. When `frontend/` gets
-  added in a later phase, remove the
-  `if: steps.frontend.outputs.exists` gates from both workflows
-  (`.github/workflows/build.yml`, `.github/workflows/release.yml`) and
-  remove the placeholder `internal/web/dist/index.html`. Leave
-  `internal/web/dist/.gitkeep` in place so the directory survives when
-  the real Vue build overwrites index.html.
 
 ---
 
@@ -269,12 +269,11 @@ See `ARCHITECTURE.md` §7 for the gosk evolution plan.
 This system runs on bare-metal systemd, not Docker. **If you see a
 Dockerfile or docker-compose in a PR, reject it.**
 
-Four systemd units on the Pi (sources under `deploy/systemd/`):
+Three systemd units on the Pi (sources under `deploy/systemd/`):
 
 | Unit                          | Type     | User   | Memory cap  |
 |-------------------------------|----------|--------|-------------|
 | `muzika.service`              | simple   | muzika | 150 MB      |
-| `slskd.service`               | simple   | muzika | 400 MB      |
 | `muzika-updater.service`      | oneshot  | root   | —           |
 | `muzika-updater.timer`        | —        | —      | fires every 5 min |
 
@@ -284,43 +283,41 @@ Every 5 minutes the timer runs `/usr/local/bin/muzika-update`, which:
 
 1. `git fetch` + `reset --hard origin/main` in `/srv/muzika/repo`.
 2. Calls `/usr/local/bin/muzika-decrypt` to SOPS-decrypt
-   `deploy/.env.sops` into `/etc/muzika/muzika.env` and
-   `/etc/muzika/slskd.env`, splitting by variable prefix
-   (`MUZIKA_*` vs `SLSKD_*`/`SOULSEEK_*`).
+   `deploy/.env.sops` into `/etc/muzika/muzika.env`. (Pre-v0.3.0 split
+   by prefix into two files; now a single file.)
 3. Queries `https://api.github.com/repos/<repo>/releases/latest`. On HTTP
    403 (rate-limited) logs and exits 0 — next tick retries.
 4. If the tag doesn't start with `v`, exits 1 (guards against upstream
    mistakes).
 5. Compares tag to `/var/lib/muzika/version`. If binary and env are
    both unchanged, exits 0.
-6. Otherwise downloads `muzika-linux-arm64` + `.sha256` from the
-   release, verifies checksum, atomic-renames into
-   `/usr/local/bin/muzika`, writes the tag.
+6. Otherwise downloads `muzika-linux-arm64` (or `muzika-linux-armv7`)
+   plus `.sha256` from the release, verifies checksum, atomic-renames
+   into `/usr/local/bin/muzika`, writes the tag.
 7. `systemctl restart muzika`.
 
 ### Useful commands on the Pi
 
 - Follow logs: `journalctl -u muzika -f` (slog JSON lives here).
-- Follow slskd: `journalctl -u slskd -f`.
 - Force an update check immediately: `sudo systemctl start muzika-updater.service`.
 - Halt autoupdates: `sudo systemctl stop muzika-updater.timer`.
 - List timer history: `systemctl list-timers muzika-updater.timer`.
 
 ### Where secrets live on the Pi
 
-- `/etc/muzika/age.key` — age private key, mode 0400, owned root.
-- `/etc/muzika/muzika.env` — decrypted `MUZIKA_*` vars.
-- `/etc/muzika/slskd.env`  — decrypted `SLSKD_*` and `SOULSEEK_*` vars.
-- `/etc/muzika/slskd.yml`  — slskd config (non-secret, seeded from
-  `deploy/slskd.yml.template` by the installer; operator-editable).
+- `/etc/muzika/age.key`    — age private key, mode 0400, owned root.
+- `/etc/muzika/muzika.env` — decrypted `MUZIKA_*` vars (including
+  `MUZIKA_SOULSEEK_USERNAME` / `_PASSWORD` for the gosk-driven Soulseek
+  login).
 
 `/etc/muzika` itself is 0750 owned `root:muzika` — the muzika user can
-read env files but nothing else can.
+read the env file but nothing else can.
 
 ### Where state lives on the Pi
 
-- `/srv/muzika/data/muzika.db` — SQLite file.
-- `/srv/muzika/data/music/` — audio files, shared with slskd.
-- `/srv/muzika/repo/` — git checkout maintained by the updater.
-- `/var/lib/muzika/version` — currently installed release tag.
-- `/var/lib/slskd/` — slskd's own state.
+- `/srv/muzika/data/muzika.db`      — SQLite file.
+- `/srv/muzika/data/music/`         — audio files, written by gosk.
+- `/srv/muzika/data/gosk-state.db`  — gosk in-flight download state
+  (survives restarts; `MUZIKA_GOSK_STATE_PATH`).
+- `/srv/muzika/repo/`               — git checkout maintained by the updater.
+- `/var/lib/muzika/version`         — currently installed release tag.

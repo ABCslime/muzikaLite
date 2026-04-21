@@ -84,3 +84,74 @@ In addition to the 28 line items, the review required:
 - v1 CORS wildcard plan ("mirrors the old nginx ingress, allow-origin `*`") → replaced with strict configurable origins (item 19).
 - v1 distroless:nonroot user → replaced with explicit `USER 1000:1000` to match slskd's PUID (item 24).
 - v1 manual-approval gate as a separate workflow job → replaced by tag-driven release promotion (item 4).
+
+---
+
+## v0.3.0 — slskd retired; Soulseek goes in-process (2026-04-21)
+
+The v2 plan (items 7–12 above) carried a two-backend design: ship on
+slskd, then swap to gosk once it met a 40–80 MB RAM target. v0.3.0 is
+the point where the swap happened — not as a runtime flip but as a
+deletion. The slskd implementation, the `MUZIKA_SOULSEEK_BACKEND`
+switch, and the `slskd.service` systemd unit were removed.
+
+### Code
+
+| Before (v0.2.x)                                    | After (v0.3.0)                                   |
+|----------------------------------------------------|--------------------------------------------------|
+| `internal/slskd/` package                          | `internal/download/` (renamed — drives gosk, not slskd) |
+| `bus.RequestSlskdSong` event                       | `bus.RequestDownload` (renamed)                  |
+| `internal/soulseek/slskd.go`, `slskd_test.go`, `id.go` | deleted                                      |
+| Two `soulseek.Client` impls behind a switch        | One impl: `internal/soulseek/native.go` (gosk)   |
+| `Config.SoulseekBackend`, `SlskdURL`, `SlskdUsername`, `SlskdPassword` | deleted                   |
+| `Config.SlskdWorkers` (`MUZIKA_SLSKD_WORKERS`)     | `Config.DownloadWorkers` (`MUZIKA_DOWNLOAD_WORKERS`) |
+| `Config.SoulseekUsername` / `Password` optional    | `required:"true"` — muzika won't start without Soulseek creds |
+| `DownloadHandle{ID, Peer, Filename}`               | `DownloadHandle{ID}` (gosk handles peer/filename internally) |
+
+### Deploy
+
+| Before                                             | After                                            |
+|----------------------------------------------------|--------------------------------------------------|
+| Two services: `muzika.service` + `slskd.service`   | One service: `muzika.service`                    |
+| Two env files: `/etc/muzika/muzika.env` + `/etc/muzika/slskd.env` | One file: `/etc/muzika/muzika.env` |
+| `/etc/muzika/slskd.yml` non-secret config          | gone — every gosk knob is a `MUZIKA_*` env var  |
+| `deploy/systemd/slskd.service`, `deploy/slskd.yml.template` | deleted                                 |
+| `install.sh` downloaded slskd binary, seeded yml   | `install.sh` installs only age/sops; no sidecar  |
+| `muzika-decrypt` split decrypted env by prefix     | writes a single file                             |
+| `muzika-update` restarted both services            | restarts only muzika                             |
+| UID 1000 chosen to match slskd's PUID              | UID 1001 (`muzika` system user) — no shared-UID constraint remaining |
+
+### Memory
+
+| Component              | Pre-v0.3.0 | Post-v0.3.0 | Delta   |
+|------------------------|------------|-------------|---------|
+| `muzika.service`       | 150 MB     | 150 MB      | 0       |
+| `slskd.service`        | 400 MB     | —           | −400 MB |
+| **Total**              | **~550 MB** | **~150 MB** | **−400 MB** |
+
+The Pi 3 went from ~470 MB headroom to ~870 MB. v0.3.0 is the largest
+memory delta since the Docker→systemd migration in Phase 3.5.
+
+### Why the rename
+
+`internal/slskd` described a module that drove an external daemon.
+With v0.3.0 the same code drives an in-process Go library. Keeping
+the name would misdescribe the package's responsibility. Same reasoning
+for the event: `RequestSlskdSong` → `RequestDownload`. The event
+name now describes intent (please obtain this track) rather than the
+backend that fulfills it — matching the shape of `RequestRandomSong`.
+
+### What the v2-plan evolution items 7–12 now mean
+
+- Item 7 (backend selector) — **removed**. One code path, no switch.
+- Item 8 (slskd first-class) — **satisfied and retired**. slskd shipped
+  through v0.2.x; gosk superseded it.
+- Items 9–10 (gosk module, scope, non-goals) — **shipped as v0.1.0 at
+  github.com/ABCslime/gosk**. Muzika consumes it as a library.
+- Item 11 (RAM target) — **met**. gosk runs in-process inside muzika's
+  150 MB cap; no dedicated cgroup to measure anymore, but the whole
+  muzika RSS sits well under the cap with gosk integrated.
+- Item 12 (strict dev order) — **followed**. Every module was ported
+  against slskd (Phases 4–8); muzika ran fully on slskd through v0.2.x;
+  gosk stabilized in Phase 8.5; v0.3.0 deleted slskd once gosk was
+  proven.

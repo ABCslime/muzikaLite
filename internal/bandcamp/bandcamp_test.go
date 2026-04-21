@@ -108,9 +108,9 @@ func TestSearch_ServerError(t *testing.T) {
 	}
 }
 
-// TestWorker_PublishesRequestSlskdSong drives the full worker contract:
-// RequestRandomSong → bandcamp search → RequestSlskdSong with the same SongID.
-func TestWorker_PublishesRequestSlskdSong(t *testing.T) {
+// TestWorker_PublishesRequestDownload drives the full worker contract:
+// RequestRandomSong → bandcamp search → RequestDownload with the same SongID.
+func TestWorker_PublishesRequestDownload(t *testing.T) {
 	srv := httptest.NewServer(fakeDiscover(t, []bandcamp.DiscoverItem{
 		{Title: "Hit", BandName: "Band"},
 	}, nil))
@@ -123,7 +123,7 @@ func TestWorker_PublishesRequestSlskdSong(t *testing.T) {
 	svc := bandcamp.NewService(client, nil, b, nil)
 
 	// Subscribe BEFORE triggering so we observe the publish.
-	outCh := bus.Subscribe[bus.RequestSlskdSong](b, "test/request-slskd-song")
+	outCh := bus.Subscribe[bus.RequestDownload](b, "test/request-download")
 
 	stubID := uuid.New()
 	if err := svc.OnRequestRandomSong(context.Background(), bus.RequestRandomSong{
@@ -141,7 +141,7 @@ func TestWorker_PublishesRequestSlskdSong(t *testing.T) {
 			t.Errorf("metadata mismatch: %+v", ev)
 		}
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("timed out waiting for RequestSlskdSong")
+		t.Fatal("timed out waiting for RequestDownload")
 	}
 }
 
@@ -155,7 +155,7 @@ func TestWorker_NoResultsIsNoop(t *testing.T) {
 	b := bus.New(64, log)
 	svc := bandcamp.NewService(client, nil, b, nil)
 
-	outCh := bus.Subscribe[bus.RequestSlskdSong](b, "test/noop")
+	outCh := bus.Subscribe[bus.RequestDownload](b, "test/noop")
 
 	err := svc.OnRequestRandomSong(context.Background(), bus.RequestRandomSong{
 		SongID: uuid.New(), Genre: "electronic",

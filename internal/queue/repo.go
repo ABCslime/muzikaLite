@@ -173,7 +173,7 @@ func (r *Repo) GetSong(ctx context.Context, id uuid.UUID) (Song, error) {
 }
 
 // InsertSongStub creates a placeholder song row the refiller can reference.
-// Metadata is filled in later by onRequestSlskdSong; url by onLoadedSong.
+// Metadata is filled in later by onRequestDownload; url by onLoadedSong.
 //
 // requestingUserID is stamped on the stub so onLoadedSong knows which user's
 // queue to append to when the download completes. Passing uuid.Nil stores
@@ -216,7 +216,7 @@ func (r *Repo) GetSongRequester(ctx context.Context, songID uuid.UUID) (uuid.UUI
 	return uid, true, nil
 }
 
-// UpdateSongMetadata updates title/artist. Called from onRequestSlskdSong.
+// UpdateSongMetadata updates title/artist. Called from onRequestDownload.
 func (r *Repo) UpdateSongMetadata(ctx context.Context, id uuid.UUID, title, artist string) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE queue_songs SET title = ?, artist = ? WHERE id = ?`,
@@ -227,7 +227,7 @@ func (r *Repo) UpdateSongMetadata(ctx context.Context, id uuid.UUID, title, arti
 	return nil
 }
 
-// UpdateSongFile sets the URL (filesystem path) after slskd reports success.
+// UpdateSongFile sets the URL (filesystem path) after the download worker reports success.
 func (r *Repo) UpdateSongFile(ctx context.Context, id uuid.UUID, filePath string) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE queue_songs SET url = ? WHERE id = ?`,

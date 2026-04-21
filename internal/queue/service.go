@@ -98,17 +98,17 @@ func (s *Service) lockFor(userID uuid.UUID) func() {
 	return m.Unlock
 }
 
-// StartWorkers subscribes to UserCreated, UserDeleted, LoadedSong, RequestSlskdSong.
+// StartWorkers subscribes to UserCreated, UserDeleted, LoadedSong, RequestDownload.
 func (s *Service) StartWorkers(ctx context.Context) {
 	userCreated := bus.Subscribe[bus.UserCreated](s.bus, "queue/user-created")
 	userDeleted := bus.Subscribe[bus.UserDeleted](s.bus, "queue/user-deleted")
 	loaded := bus.Subscribe[bus.LoadedSong](s.bus, "queue/loaded-song")
-	reqSlskd := bus.Subscribe[bus.RequestSlskdSong](s.bus, "queue/request-slskd-song")
+	reqDownload := bus.Subscribe[bus.RequestDownload](s.bus, "queue/request-download")
 
 	bus.RunPool(ctx, s.bus, "queue/user-created", 1, userCreated, s.onUserCreated)
 	bus.RunPool(ctx, s.bus, "queue/user-deleted", 1, userDeleted, s.onUserDeleted)
 	bus.RunPool(ctx, s.bus, "queue/loaded-song", 1, loaded, s.onLoadedSong)
-	bus.RunPool(ctx, s.bus, "queue/request-slskd-song", 1, reqSlskd, s.onRequestSlskdSong)
+	bus.RunPool(ctx, s.bus, "queue/request-download", 1, reqDownload, s.onRequestDownload)
 }
 
 // Exposed handler aliases for tests.
@@ -121,8 +121,8 @@ func (s *Service) OnUserDeleted(ctx context.Context, ev bus.UserDeleted) error {
 func (s *Service) OnLoadedSong(ctx context.Context, ev bus.LoadedSong) error {
 	return s.onLoadedSong(ctx, ev)
 }
-func (s *Service) OnRequestSlskdSong(ctx context.Context, ev bus.RequestSlskdSong) error {
-	return s.onRequestSlskdSong(ctx, ev)
+func (s *Service) OnRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
+	return s.onRequestDownload(ctx, ev)
 }
 
 // --- event handlers ---
@@ -130,7 +130,7 @@ func (s *Service) OnRequestSlskdSong(ctx context.Context, ev bus.RequestSlskdSon
 func (s *Service) onUserCreated(ctx context.Context, ev bus.UserCreated) error {
 	// Seed the user's queue by triggering the refiller: it inserts stubs and
 	// publishes RequestRandomSong events. The rest of the fan-out (Bandcamp
-	// search → slskd download → LoadedSong → onLoadedSong) completes async.
+	// search → download worker → LoadedSong → onLoadedSong) completes async.
 	s.refiller.Trigger(ctx, ev.UserID)
 	return nil
 }
@@ -185,10 +185,10 @@ func (s *Service) appendForRequester(ctx context.Context, songID uuid.UUID) erro
 	return nil
 }
 
-func (s *Service) onRequestSlskdSong(ctx context.Context, ev bus.RequestSlskdSong) error {
-	// Fan-out: bandcamp published this; slskd consumes it to drive the
-	// download, we consume it to keep metadata in sync with the search
-	// result. UPDATE misses if the stub was already deleted — that's fine.
+func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload) error {
+	// Fan-out: bandcamp published this; the download package consumes it to
+	// drive the transfer, we consume it to keep metadata in sync with the
+	// search result. UPDATE misses if the stub was already deleted — that's fine.
 	return s.repo.UpdateSongMetadata(ctx, ev.SongID, ev.Title, ev.Artist)
 }
 

@@ -15,13 +15,13 @@ import (
 )
 
 // Service consumes RequestRandomSong events, asks the Client for a song
-// matching the requested genre, and publishes RequestSlskdSong events.
+// matching the requested genre, and publishes RequestDownload events.
 //
 // On ErrNoResults (bandcamp returned no items for the tag) we emit a
 // LoadedSong{Status: Error} via the outbox. queue's onLoadedSong handler
 // deletes the orphaned stub; otherwise stubs accumulate forever whenever
 // bandcamp has nothing matching the configured tags. The outbox path
-// matches slskd's failure semantics so there's one cleanup code path.
+// matches the download worker's failure semantics so there's one cleanup code path.
 type Service struct {
 	client     *Client
 	db         *sql.DB
@@ -72,7 +72,7 @@ func (s *Service) onRequestRandomSong(ctx context.Context, ev bus.RequestRandomS
 			"song_id", ev.SongID, "genre", ev.Genre, "err", err)
 		return err
 	}
-	out := bus.RequestSlskdSong{
+	out := bus.RequestDownload{
 		SongID: ev.SongID,
 		Title:  result.Title,
 		Artist: result.Artist,

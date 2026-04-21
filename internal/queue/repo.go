@@ -110,41 +110,77 @@ func (r *Repo) PromoteToReady(ctx context.Context, userID, songID uuid.UUID, rel
 	return nil
 }
 
-// FindReadyUserSong returns the first queue_songs.id belonging to userID
-// whose (title, artist) matches the given pair case-insensitively AND is
-// surfaced via a status='ready' queue_entries row. Used by search-acquire
-// to avoid duplicate stubs when the user re-searches for something they
-// already have queued and playable. v0.4.2 PR A.
+// SongForReuse describes an existing catalog entry that a new search
+// should reuse rather than creating a duplicate stub. v0.4.2 PR A.1.
 //
-// Returns (uuid.Nil, nil) when no match exists — that's the "go ahead and
-// acquire fresh" signal. An actual SQL error propagates.
+// Found is true when any queue_songs row matched (title, artist)
+// case-insensitively. URL is the queue_songs.url column — may be empty
+// (never downloaded or currently probing) or point at a file (already
+// downloaded, possibly deleted from disk).
+type SongForReuse struct {
+	SongID uuid.UUID
+	URL    string
+	Found  bool
+}
+
+// FindSongForReuse looks up a catalog entry by (title, artist) for
+// reuse in search-acquire. Case-insensitive match. Prefers rows with
+// url set (existing downloads) over rows without (fresh stubs).
 //
-// We intentionally only match status='ready'. A probing/stale stub with
-// the same metadata shouldn't block a fresh attempt — the user clicking
-// a candidate is a clear "I want this one".
-func (r *Repo) FindReadyUserSong(ctx context.Context, userID uuid.UUID, title, artist string) (uuid.UUID, error) {
+// Catalog-wide, NOT per-user — if we've ever downloaded X, any user
+// searching for X should reuse that song id rather than create a fresh
+// row. The caller (searchAcquire) decides whether the URL-on-disk check
+// passes and whether to skip Soulseek.
+//
+// Returns (SongForReuse{Found: false}, nil) when no match — that's the
+// "go ahead and fresh-stub" signal. SQL errors propagate.
+func (r *Repo) FindSongForReuse(ctx context.Context, title, artist string) (SongForReuse, error) {
 	if title == "" || artist == "" {
-		return uuid.Nil, nil
+		return SongForReuse{}, nil
 	}
-	var idStr string
+	var (
+		idStr string
+		url   sql.NullString
+	)
+	// ORDER BY (url IS NULL) ASC: SQLite treats IS NULL as 0 (false) or
+	// 1 (true). Ascending puts 0 (non-null url) first. So if any row has
+	// a download path recorded, we reuse that one — even if other rows
+	// with the same metadata exist from mid-flight probes or old stubs.
 	err := r.db.QueryRowContext(ctx, `
-		SELECT qs.id
-		FROM queue_songs qs
-		JOIN queue_entries qe ON qe.song_id = qs.id
-		WHERE qe.user_id = ?
-		  AND qe.status = 'ready'
-		  AND LOWER(qs.title)  = LOWER(?)
-		  AND LOWER(qs.artist) = LOWER(?)
+		SELECT id, url
+		FROM queue_songs
+		WHERE LOWER(title)  = LOWER(?)
+		  AND LOWER(artist) = LOWER(?)
+		ORDER BY (url IS NULL) ASC, id ASC
 		LIMIT 1`,
-		userID.String(), title, artist).Scan(&idStr)
+		title, artist).Scan(&idStr, &url)
 	if errors.Is(err, sql.ErrNoRows) {
-		return uuid.Nil, nil
+		return SongForReuse{}, nil
 	}
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("find ready song: %w", err)
+		return SongForReuse{}, fmt.Errorf("find song for reuse: %w", err)
 	}
 	id, _ := uuid.Parse(idStr)
-	return id, nil
+	out := SongForReuse{SongID: id, Found: true}
+	if url.Valid {
+		out.URL = url.String
+	}
+	return out, nil
+}
+
+// UpdateSongRequester flips queue_songs.requesting_user_id. Used in the
+// reuse-existing-stub path so onRequestDownload inserts the probing
+// queue_entries row for the CURRENT searcher and onLoadedSong attributes
+// the promotion to them. Without this, a cross-user reuse would surface
+// the result in the original stamper's queue instead.
+func (r *Repo) UpdateSongRequester(ctx context.Context, songID, userID uuid.UUID) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE queue_songs SET requesting_user_id = ? WHERE id = ?`,
+		userID.String(), songID.String())
+	if err != nil {
+		return fmt.Errorf("update requester: %w", err)
+	}
+	return nil
 }
 
 // CountEntries returns how many songs are queued for userID.

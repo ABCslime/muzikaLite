@@ -669,53 +669,67 @@ func TestOnLoadedSong_NotFoundDeletesStub(t *testing.T) {
 	}
 }
 
-// TestSearch_DedupSkipsAlreadyReady: v0.4.2 PR A. Picking a search
-// candidate for a song the user already has ready returns the existing
-// SongID and does NOT insert a duplicate stub or emit a RequestDownload.
-// Guards the re-search→probe-fails paradox.
-func TestSearch_DedupSkipsAlreadyReady(t *testing.T) {
-	svc, d, _ := newService(t)
+// TestSearch_CacheHitSkipsSoulseekWhenFileOnDisk: v0.4.2 PR A.1. If
+// a queue_songs row for this (title, artist) exists AND its url
+// resolves to a file actually present on disk, re-search is a catalog
+// hit: append a ready queue_entries row for the user, return the
+// existing SongID, emit ZERO RequestDownload events. No need to bother
+// Soulseek — we already have the file.
+//
+// Fixes: "songs are not found on Soulseek even though we downloaded them."
+func TestSearch_CacheHitSkipsSoulseekWhenFileOnDisk(t *testing.T) {
+	svc, d, musicDir := newService(t)
 	uid := seedUser(t, d)
 	ctx := context.Background()
 
-	// Seed: existing ready song + queue_entries row for this user.
+	// Drop a real file into the music dir so the disk check passes.
+	relPath := "sha-mo-3000-test.mp3"
+	absPath := filepath.Join(musicDir, relPath)
+	if err := os.WriteFile(absPath, []byte("fake audio"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
 	existing := uuid.New()
 	if _, err := d.Exec(
-		`INSERT INTO queue_songs (id, title, artist, requesting_user_id) VALUES (?, ?, ?, ?)`,
-		existing.String(), "Sha Mo 3000", "Merzbow", uid.String()); err != nil {
+		`INSERT INTO queue_songs (id, title, artist, url, requesting_user_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		existing.String(), "Sha Mo 3000", "Merzbow", relPath, uid.String()); err != nil {
 		t.Fatalf("seed song: %v", err)
 	}
-	if _, err := d.Exec(
-		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
-		 VALUES (?, ?, ?, 0, 'ready')`,
-		uuid.NewString(), uid.String(), existing.String()); err != nil {
-		t.Fatalf("seed entry: %v", err)
-	}
 
-	// Subscribe so we can assert NO RequestDownload fires.
-	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/dedup-guard")
+	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/cache-hit")
 
-	// Same title+artist, different casing intentionally — dedup is
-	// case-insensitive.
 	resp, err := svc.Search(ctx, uid, queue.SearchRequest{
-		Title:  "SHA MO 3000",
-		Artist: "merzbow",
+		// Different casing on purpose — cache hit is case-insensitive.
+		Title:  "sha mo 3000",
+		Artist: "MERZBOW",
 		Query:  "sha mo 3000",
 	})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
 	if resp.SongID != existing {
-		t.Errorf("returned SongID %v, want existing %v", resp.SongID, existing)
+		t.Errorf("got SongID %v, want existing %v (cache hit should reuse)", resp.SongID, existing)
 	}
 
-	// Zero RequestDownloads should have been published.
+	// Zero RequestDownloads — we already have the file.
 	got := drain(ch, 1, 150*time.Millisecond)
 	if len(got) != 0 {
-		t.Errorf("dedup failed — RequestDownload fired: %+v", got)
+		t.Errorf("cache-hit path fired RequestDownload: %+v", got)
 	}
 
-	// queue_songs count unchanged (still 1 — the existing one).
+	// A ready queue_entries row exists for this user + song.
+	var status string
+	if err := d.QueryRow(
+		`SELECT status FROM queue_entries WHERE user_id = ? AND song_id = ?`,
+		uid.String(), existing.String()).Scan(&status); err != nil {
+		t.Fatalf("select entry: %v", err)
+	}
+	if status != "ready" {
+		t.Errorf("entry status=%q, want 'ready'", status)
+	}
+
+	// No duplicate queue_songs row was inserted.
 	var n int
 	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
 	if n != 1 {
@@ -723,29 +737,26 @@ func TestSearch_DedupSkipsAlreadyReady(t *testing.T) {
 	}
 }
 
-// TestSearch_DedupIgnoresProbingSongs: dedup only guards against
-// colliding with a READY entry. A probing or failed search shouldn't
-// block a fresh attempt.
-func TestSearch_DedupIgnoresProbingSongs(t *testing.T) {
+// TestSearch_ReuseStubIdWhenFileMissing: v0.4.2 PR A.1. If a
+// queue_songs row exists but its url is set to a path that DOESN'T
+// resolve to a file (deleted out-of-band), search-acquire reuses the
+// same SongID + re-emits RequestDownload so the download worker pulls
+// the file again into the SAME catalog row. No duplicate rows.
+func TestSearch_ReuseStubIdWhenFileMissing(t *testing.T) {
 	svc, d, _ := newService(t)
 	uid := seedUser(t, d)
 	ctx := context.Background()
 
-	// Seed: same-metadata song but still probing (not ready).
-	stale := uuid.New()
+	existing := uuid.New()
 	if _, err := d.Exec(
-		`INSERT INTO queue_songs (id, title, artist, requesting_user_id) VALUES (?, ?, ?, ?)`,
-		stale.String(), "Proper Lady", "Erez", uid.String()); err != nil {
+		`INSERT INTO queue_songs (id, title, artist, url, requesting_user_id)
+		 VALUES (?, ?, ?, ?, ?)`,
+		existing.String(), "Proper Lady", "Erez", "gone-from-disk.mp3", uid.String()); err != nil {
 		t.Fatalf("seed song: %v", err)
 	}
-	if _, err := d.Exec(
-		`INSERT INTO queue_entries (id, user_id, song_id, position, status)
-		 VALUES (?, ?, ?, 0, 'probing')`,
-		uuid.NewString(), uid.String(), stale.String()); err != nil {
-		t.Fatalf("seed entry: %v", err)
-	}
+	// Intentionally do NOT create the file at gone-from-disk.mp3.
 
-	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/no-dedup-on-probing")
+	ch := bus.Subscribe[bus.RequestDownload](svc.RefillerBus(), "test/reuse-missing-file")
 
 	resp, err := svc.Search(ctx, uid, queue.SearchRequest{
 		Title:  "Proper Lady",
@@ -755,13 +766,56 @@ func TestSearch_DedupIgnoresProbingSongs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if resp.SongID == stale {
-		t.Errorf("got stale SongID %v — should be a fresh stub", resp.SongID)
+	if resp.SongID != existing {
+		t.Errorf("got SongID %v, want existing %v (reuse path)", resp.SongID, existing)
 	}
 
 	got := drain(ch, 1, 500*time.Millisecond)
 	if len(got) != 1 {
-		t.Fatalf("expected a fresh RequestDownload, got %d", len(got))
+		t.Fatalf("expected one RequestDownload (reuse triggers re-probe), got %d", len(got))
+	}
+	if got[0].SongID != existing {
+		t.Errorf("RequestDownload SongID = %v, want %v", got[0].SongID, existing)
+	}
+
+	// queue_songs count still 1 — reuse, not insert.
+	var n int
+	_ = d.QueryRow(`SELECT COUNT(*) FROM queue_songs`).Scan(&n)
+	if n != 1 {
+		t.Errorf("duplicate stub inserted despite reuse path, count=%d", n)
+	}
+}
+
+// TestSearch_ReuseStubIdUpdatesRequester: when user B searches for a
+// song that user A originally stamped (in the queue_songs row), the
+// requesting_user_id gets flipped to user B so onRequestDownload's
+// probing insert and onLoadedSong's promote attribute correctly.
+func TestSearch_ReuseStubIdUpdatesRequester(t *testing.T) {
+	svc, d, _ := newService(t)
+	userA := seedUser(t, d)
+	userB := seedUser(t, d)
+	ctx := context.Background()
+
+	existing := uuid.New()
+	if _, err := d.Exec(
+		`INSERT INTO queue_songs (id, title, artist, requesting_user_id)
+		 VALUES (?, ?, ?, ?)`,
+		existing.String(), "Ambient 1", "Brian Eno", userA.String()); err != nil {
+		t.Fatalf("seed song: %v", err)
+	}
+
+	_, err := svc.Search(ctx, userB, queue.SearchRequest{
+		Title: "Ambient 1", Artist: "Brian Eno", Query: "ambient 1",
+	})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+
+	var reqStr string
+	_ = d.QueryRow(`SELECT requesting_user_id FROM queue_songs WHERE id = ?`,
+		existing.String()).Scan(&reqStr)
+	if reqStr != userB.String() {
+		t.Errorf("requesting_user_id = %q, want user B = %q", reqStr, userB.String())
 	}
 }
 

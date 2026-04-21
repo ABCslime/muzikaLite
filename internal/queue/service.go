@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -14,6 +15,10 @@ import (
 	"github.com/macabc/muzika/internal/bus"
 	"github.com/macabc/muzika/internal/db"
 )
+
+// osStat is a package-level seam so tests can force "file missing"
+// without actually deleting a real file. Defaults to os.Stat.
+var osStat = os.Stat
 
 // ErrNoFile is returned by ResolveSongPath when the song hasn't been downloaded.
 var ErrNoFile = errors.New("queue: song has no file yet")
@@ -379,58 +384,118 @@ func (s *Service) Search(ctx context.Context, userID uuid.UUID, req SearchReques
 }
 
 // searchAcquire is the pre-picked path: the user already chose a specific
-// release from the preview dropdown. Insert the stub with metadata already
-// populated (UI sees artist/title immediately), then emit RequestDownload
-// directly with Strategy=StrategySearch. The download worker's probe →
+// release from the preview dropdown. The download worker's probe →
 // ladder → promote-to-ready flow still drives status transitions.
 //
-// Works regardless of discogsEnabled — the Discogs HTTP call that produced
-// the candidates already happened during preview; now we're just asking
-// Soulseek to fetch the file.
+// v0.4.2 PR A.1 — three-path dedup against the catalog:
 //
-// Dedup (v0.4.2 PR A): if the user already has a ready song with the
-// same (title, artist), we skip the acquire and return the existing
-// SongID. Avoids the "in queue AND not available" paradox when the user
-// re-searches for something already playable and the re-probe happens to
-// fail. Case-insensitive match.
+//  1. Cache hit: a queue_songs row exists with url set AND the file is
+//     on disk. We skip Soulseek entirely; just add the song to the
+//     user's queue as 'ready'. No RequestDownload event.
+//
+//  2. Catalog match but file missing (deleted or never downloaded):
+//     reuse the existing queue_songs.id. Flip requesting_user_id to the
+//     current user so onRequestDownload's probing-entry insert and
+//     onLoadedSong's promote attribute correctly. Emit RequestDownload
+//     with the REUSED id — the user ends up with the same catalog row
+//     (no second entry), just with a fresh download.
+//
+//  3. Fresh stub: no catalog match. Insert a new queue_songs row and
+//     follow the original flow.
+//
+// Works regardless of discogsEnabled — the Discogs HTTP call that
+// produced the candidates already happened during preview.
 func (s *Service) searchAcquire(ctx context.Context, userID uuid.UUID, req SearchRequest, normalizedQuery string) (SearchResponse, error) {
-	if existing, err := s.repo.FindReadyUserSong(ctx, userID, req.Title, req.Artist); err != nil {
-		// Lookup failure shouldn't block the acquire — log and fall through
-		// to the normal path. Worst case we get a duplicate probe that
-		// promotes back to ready.
-		s.log.Warn("search-acquire: dedup lookup failed", "user_id", userID, "err", err)
-	} else if existing != uuid.Nil {
-		s.log.Info("search-acquire: skipping duplicate (already ready)",
-			"user_id", userID, "song_id", existing,
-			"title", req.Title, "artist", req.Artist)
-		return SearchResponse{SongID: existing, Query: normalizedQuery}, nil
+	reuse, err := s.repo.FindSongForReuse(ctx, req.Title, req.Artist)
+	if err != nil {
+		// Lookup failure isn't worth blocking acquire on — log and fall
+		// through to the fresh-stub path. Worst case we duplicate a row.
+		s.log.Warn("search-acquire: reuse lookup failed", "user_id", userID, "err", err)
 	}
 
+	if reuse.Found {
+		// Path 1 — cache hit. File actually present on the shared volume?
+		if reuse.URL != "" && s.fileExistsAtStoredURL(reuse.URL) {
+			s.log.Info("search-acquire: cache hit (file on disk, skipping Soulseek)",
+				"user_id", userID, "song_id", reuse.SongID,
+				"title", req.Title, "artist", req.Artist)
+			defer s.lockFor(userID)()
+			if err := s.repo.AppendEntry(ctx, userID, reuse.SongID); err != nil && !errors.Is(err, ErrDuplicate) {
+				return SearchResponse{}, fmt.Errorf("append cache-hit entry: %w", err)
+			}
+			return SearchResponse{SongID: reuse.SongID, Query: normalizedQuery}, nil
+		}
+
+		// Path 2 — reuse the id, re-probe. We need the stub's requester
+		// to be THIS user so onRequestDownload's probing insert and
+		// onLoadedSong's promote land on their queue, not some older
+		// requester's. If the URL was set but the file is gone, we leave
+		// the URL value — it gets overwritten by UpdateSongFile when the
+		// redownload completes.
+		if err := s.repo.UpdateSongRequester(ctx, reuse.SongID, userID); err != nil {
+			return SearchResponse{}, fmt.Errorf("update requester on reuse: %w", err)
+		}
+		// Refresh metadata too — the caller's (title, artist) matched
+		// case-insensitively but casing might differ; let the user's
+		// click define the canonical form.
+		if err := s.repo.UpdateSongMetadata(ctx, reuse.SongID, req.Title, req.Artist); err != nil {
+			return SearchResponse{}, fmt.Errorf("update metadata on reuse: %w", err)
+		}
+		s.log.Info("search-acquire: reusing existing song id",
+			"user_id", userID, "song_id", reuse.SongID,
+			"had_url", reuse.URL != "")
+		s.publishRequestDownload(ctx, userID, reuse.SongID, req)
+		return SearchResponse{SongID: reuse.SongID, Query: normalizedQuery}, nil
+	}
+
+	// Path 3 — fresh stub.
 	stubID := uuid.New()
 	if err := s.repo.InsertSongStub(ctx, stubID, "", userID); err != nil {
 		return SearchResponse{}, fmt.Errorf("insert stub: %w", err)
 	}
 	if err := s.repo.UpdateSongMetadata(ctx, stubID, req.Title, req.Artist); err != nil {
-		// Stub inserted but metadata update failed — UI would see a blank
-		// entry. Rare, but prefer to fail the whole operation and let the
-		// user retry than ship a nameless row.
 		return SearchResponse{}, fmt.Errorf("update metadata: %w", err)
 	}
+	s.publishRequestDownload(ctx, userID, stubID, req)
+	return SearchResponse{SongID: stubID, Query: normalizedQuery}, nil
+}
+
+// fileExistsAtStoredURL resolves queue_songs.url the same way
+// ResolveSongPath does (absolute stays absolute; relative joins with
+// MusicStoragePath) and stats the result. Any error — missing file,
+// permission denied, path traversal rejection — is treated as "not on
+// disk" so we fall back to a Soulseek re-probe rather than guessing.
+func (s *Service) fileExistsAtStoredURL(url string) bool {
+	if url == "" {
+		return false
+	}
+	path := url
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(s.musicStoragePath, path)
+	}
+	info, err := osStat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+// publishRequestDownload wraps the no-timeout Publish used by both the
+// reuse-existing and fresh-stub branches of searchAcquire, so the two
+// paths can't drift in their event payload shape.
+func (s *Service) publishRequestDownload(ctx context.Context, userID uuid.UUID, songID uuid.UUID, req SearchRequest) {
 	out := bus.RequestDownload{
-		SongID:        stubID,
+		SongID:        songID,
 		Title:         req.Title,
 		Artist:        req.Artist,
 		CatalogNumber: req.CatalogNumber,
 		Strategy:      bus.StrategySearch,
 	}
 	// No SendTimeout — v0.4.1 PR C option D2. Back-pressure is preferable
-	// to silent loss when the download worker is saturated. Handler blocks
-	// a few ms at worst; the refiller pattern that needs timeouts doesn't
-	// apply here (user initiated this one event).
+	// to silent loss when the download worker is saturated.
 	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{}); err != nil {
 		s.log.Warn("search-acquire: publish failed", "user_id", userID, "err", err)
 	}
-	return SearchResponse{SongID: stubID, Query: normalizedQuery}, nil
 }
 
 // searchAutoPick is the legacy path retained so direct API callers still

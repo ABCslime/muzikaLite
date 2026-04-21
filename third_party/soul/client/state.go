@@ -255,10 +255,24 @@ func (s *State) Search(ctx context.Context, query string, token soul.Token) (res
 		return
 	}
 
-	// Send search message.
-	s.client.Writer <- searchMessage
-
-	s.Debug().Str(fmt.Sprintf("%v", token), query).Msg("search message sent")
+	// Send search message. The Writer channel is unbuffered, so a
+	// stalled server-side write goroutine (TCP buffer full, server
+	// throttling, connection wedged) would block this send forever.
+	// Observed symptom before the select: a second search request
+	// never reached the server because the first search's FileSearch
+	// bytes were still being written, leaving the second stuck here.
+	// Select-with-ctx guarantees Search returns on caller cancel,
+	// and the caller's empty result propagates cleanly.
+	select {
+	case s.client.Writer <- searchMessage:
+		s.Debug().Str(fmt.Sprintf("%v", token), query).Msg("search message sent")
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.searches, token)
+		s.mu.Unlock()
+		s.Debug().Str(fmt.Sprintf("%v", token), query).Msg("search write abandoned: ctx done")
+		return results, ctx.Err()
+	}
 
 	go func() {
 		select {

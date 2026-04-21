@@ -104,8 +104,16 @@ func New(conf ...*Config) (*Client, error) {
 	c.Logger = c.Logger.With().Str("username", c.config.Username).Logger()
 
 	// Init all necessary maps and channels.
-	c.Writer = make(chan []byte)
-	c.queue = make(chan map[server.Code]io.Reader)
+	// muzika patch: buffer the server writer so a transiently slow
+	// TCP write (server-side buffer full, network jitter) doesn't
+	// block upstream callers trying to enqueue their next message.
+	// Observed symptom before the buffer: the second search's
+	// FileSearch bytes never reached the server because the first
+	// search's write was still in progress and the caller was
+	// stuck on the unbuffered send. 256 is generous — we only
+	// publish a handful of server messages per search.
+	c.Writer = make(chan []byte, 256)
+	c.queue = make(chan map[server.Code]io.Reader, 256)
 	c.Firewall = make(chan *PierceFirewall)
 	c.Init = make(chan *PeerInit)
 

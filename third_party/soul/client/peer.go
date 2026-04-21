@@ -228,6 +228,23 @@ func (p *Peer) write(ctx context.Context) {
 	}
 }
 
+// peerIdleTimeout bounds how long peer.read blocks on a silent
+// TCP connection before we assume the peer is idle and close it.
+// Upstream had no deadline at all: after a popular-artist search,
+// hundreds of responder peers kept their TCP open and peer.read
+// blocked indefinitely, leaving read/write/deserialize goroutines
+// alive per peer forever — the "zombie goroutine" leak. pprof on
+// a single Nujabes search showed 8173 goroutines, ~4000 of those
+// stuck in the per-peer goroutine quartet (read/write/deserialize/
+// fileResponse). After this patch: peak ~800 during the burst,
+// drain to baseline within the idle window.
+//
+// 15 s is the sweet spot: long enough to receive responses during
+// a 10 s search window with a few seconds of slack, short enough
+// that cross-artist user navigation (open artist A, 5 s later
+// open artist B) doesn't re-hit a saturated goroutine pool.
+const peerIdleTimeout = 15 * time.Second
+
 func (p *Peer) read(ctx context.Context) {
 	for {
 		select {
@@ -235,6 +252,10 @@ func (p *Peer) read(ctx context.Context) {
 			return
 
 		default:
+			// Set a per-read deadline so a silent peer times out
+			// rather than blocking this goroutine (and the three
+			// other per-peer goroutines it implies) forever.
+			_ = p.conn.SetReadDeadline(time.Now().Add(peerIdleTimeout))
 			p.mu.RLock()
 			r, size, code, err := peer.MessageRead(peer.Code(0), p.conn)
 			p.mu.RUnlock()
@@ -244,6 +265,20 @@ func (p *Peer) read(ctx context.Context) {
 					p.cancel()
 					p.mu.RUnlock()
 					continue
+				}
+
+				// Idle-timeout (netErr Timeout()). Treat as peer
+				// gone — close the connection and cancel the peer
+				// ctx so all sibling goroutines exit. This is the
+				// zombie-goroutine evict path.
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					p.Debug().Msg("peer idle timeout, closing")
+					p.mu.RLock()
+					_ = p.conn.Close()
+					p.cancel()
+					p.mu.RUnlock()
+					return
 				}
 
 				p.Error().Err(err).Msg("peer read")
@@ -287,6 +322,12 @@ func (p *Peer) readD(ctx context.Context) {
 			return
 
 		default:
+			// Same zombie-goroutine evict pattern as peer.read —
+			// a silent distributed peer would block this goroutine
+			// forever without a deadline.
+			if p.distributedConn != nil {
+				_ = p.distributedConn.SetReadDeadline(time.Now().Add(peerIdleTimeout))
+			}
 			p.mu.RLock()
 			r, _, code, err := distributed.MessageRead(p.distributedConn)
 			p.mu.RUnlock()
@@ -294,6 +335,20 @@ func (p *Peer) readD(ctx context.Context) {
 				if errors.Is(err, net.ErrClosed) {
 					time.Sleep(time.Second) // TODO: check if this is necessary
 					continue
+				}
+
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					p.Debug().Msg("distributed peer idle timeout, closing")
+					p.mu.RLock()
+					if p.distributedConn != nil {
+						_ = p.distributedConn.Close()
+					}
+					if p.cancelD != nil {
+						p.cancelD()
+					}
+					p.mu.RUnlock()
+					return
 				}
 
 				p.Error().Err(err).Msg("distributed read")

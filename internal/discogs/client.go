@@ -452,6 +452,248 @@ type entityResult struct {
 	Thumb string `json:"thumb"`
 }
 
+// ---- v0.4.2 PR C — detail endpoints (artist/label/release) ---------------
+
+// ReleaseDetail is the payload for a full release lookup — metadata +
+// tracklist. Used by the /album/:id frontend view.
+type ReleaseDetail struct {
+	ID            int
+	Title         string
+	Artist        string
+	Year          int
+	CatalogNumber string
+	Label         string
+	Thumb         string
+	Tracks        []Track
+}
+
+// Track is one row in a release's tracklist.
+type Track struct {
+	Position string // "A1", "B2", "1", ... — free-form per Discogs
+	Title    string
+	Duration string // "3:45" or "" when unknown
+}
+
+// ArtistReleases returns up to `limit` releases credited to artistID,
+// preserving Discogs' ordering (most-recent-first by default). Cached
+// under `artist:<id>:releases` with the standard 30-day TTL.
+//
+// Discogs' /artists/{id}/releases returns both "Master" entries (an
+// abstract "album release") and "Release" entries (specific pressings
+// under the master). We keep only Release entries — masters lack the
+// catno that the download ladder leans on.
+func (c *Client) ArtistReleases(ctx context.Context, artistID, limit int) ([]SearchResult, error) {
+	if artistID <= 0 {
+		return nil, fmt.Errorf("discogs: artistID must be positive")
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	key := fmt.Sprintf("artist:%d:releases", artistID)
+	path := fmt.Sprintf("/artists/%d/releases", artistID)
+	params := url.Values{}
+	params.Set("per_page", strconv.Itoa(limit))
+	return c.fetchArtistOrLabelReleases(ctx, key, path, params, limit)
+}
+
+// LabelReleases returns up to `limit` releases issued on labelID.
+// Cached under `label:<id>:releases`. Labels can have thousands of
+// releases; the first-page cap is pragmatic, not a leak.
+func (c *Client) LabelReleases(ctx context.Context, labelID, limit int) ([]SearchResult, error) {
+	if labelID <= 0 {
+		return nil, fmt.Errorf("discogs: labelID must be positive")
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	key := fmt.Sprintf("label:%d:releases", labelID)
+	path := fmt.Sprintf("/labels/%d/releases", labelID)
+	params := url.Values{}
+	params.Set("per_page", strconv.Itoa(limit))
+	return c.fetchArtistOrLabelReleases(ctx, key, path, params, limit)
+}
+
+// Release returns the full release metadata + tracklist for releaseID.
+// Cached under `release:<id>`.
+func (c *Client) Release(ctx context.Context, releaseID int) (ReleaseDetail, error) {
+	if releaseID <= 0 {
+		return ReleaseDetail{}, fmt.Errorf("discogs: releaseID must be positive")
+	}
+	key := fmt.Sprintf("release:%d", releaseID)
+	path := fmt.Sprintf("/releases/%d", releaseID)
+	payload, err := c.fetchRaw(ctx, key, path, nil)
+	if err != nil {
+		return ReleaseDetail{}, err
+	}
+	return parseReleaseDetail(payload)
+}
+
+// fetchArtistOrLabelReleases factors the shared pagination parse used
+// by ArtistReleases and LabelReleases. Both endpoints respond with
+// {pagination: {...}, releases: [...]} where each release carries an
+// id, title, artist, year, catno, role, thumb. Filters out "Master"
+// entries since they carry no download-relevant catno.
+func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path string, params url.Values, limit int) ([]SearchResult, error) {
+	payload, err := c.fetchRaw(ctx, key, path, params)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Releases []struct {
+			ID     int    `json:"id"`
+			Type   string `json:"type"`
+			Title  string `json:"title"`
+			Artist string `json:"artist"`
+			Year   int    `json:"year"`
+			Catno  string `json:"catno"`
+			Thumb  string `json:"thumb"`
+		} `json:"releases"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return nil, fmt.Errorf("discogs: unmarshal releases: %w", err)
+	}
+	out := make([]SearchResult, 0, limit)
+	seen := make(map[string]struct{}, limit)
+	for _, r := range resp.Releases {
+		if r.Type == "master" {
+			// Master entries are abstract groupings; downloads happen against
+			// concrete releases.
+			continue
+		}
+		title := strings.TrimSpace(r.Title)
+		artist := strings.TrimSpace(r.Artist)
+		if title == "" {
+			continue
+		}
+		key := strings.ToLower(artist) + "\x00" + strings.ToLower(title)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, SearchResult{
+			Title:         title,
+			Artist:        artist,
+			CatalogNumber: firstCatno(r.Catno),
+			Year:          r.Year,
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// fetchRaw is the low-level cached GET used by the detail endpoints.
+// Parallels fetchSearch but for /artists, /labels, /releases paths
+// rather than /database/search.
+func (c *Client) fetchRaw(ctx context.Context, key, path string, params url.Values) ([]byte, error) {
+	if c.cache != nil {
+		if payload, err := c.cache.Get(ctx, key); err == nil {
+			return payload, nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			c.log.Warn("discogs: cache read failed (falling through)", "err", err)
+		}
+	}
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	u, _ := url.Parse(c.baseURL + path)
+	if params != nil {
+		u.RawQuery = params.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: new request: %w", err)
+	}
+	req.Header.Set("Authorization", "Discogs token="+c.token)
+	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: http get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// fallthrough
+	case http.StatusTooManyRequests:
+		return nil, ErrRateLimited
+	case http.StatusNotFound:
+		return nil, ErrNoResults
+	default:
+		return nil, fmt.Errorf("discogs: http %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("discogs: read body: %w", err)
+	}
+	if c.cache != nil {
+		if err := c.cache.Put(ctx, key, body); err != nil {
+			c.log.Warn("discogs: cache write failed", "err", err)
+		}
+	}
+	return body, nil
+}
+
+// parseReleaseDetail decodes a /releases/{id} response. Discogs
+// returns the artist as an array (for collaborations) — we join the
+// names with " & " to produce a human-readable string.
+func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
+	var resp struct {
+		ID      int `json:"id"`
+		Title   string `json:"title"`
+		Year    int    `json:"year"`
+		Thumb   string `json:"thumb"`
+		Artists []struct {
+			Name string `json:"name"`
+		} `json:"artists"`
+		Labels []struct {
+			Name string `json:"name"`
+			Catno string `json:"catno"`
+		} `json:"labels"`
+		Tracklist []struct {
+			Position string `json:"position"`
+			Title    string `json:"title"`
+			Duration string `json:"duration"`
+		} `json:"tracklist"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return ReleaseDetail{}, fmt.Errorf("discogs: unmarshal release: %w", err)
+	}
+	out := ReleaseDetail{
+		ID:    resp.ID,
+		Title: strings.TrimSpace(resp.Title),
+		Year:  resp.Year,
+		Thumb: resp.Thumb,
+	}
+	names := make([]string, 0, len(resp.Artists))
+	for _, a := range resp.Artists {
+		if n := strings.TrimSpace(a.Name); n != "" {
+			names = append(names, n)
+		}
+	}
+	out.Artist = strings.Join(names, " & ")
+	if len(resp.Labels) > 0 {
+		out.Label = strings.TrimSpace(resp.Labels[0].Name)
+		out.CatalogNumber = firstCatno(resp.Labels[0].Catno)
+	}
+	for _, t := range resp.Tracklist {
+		title := strings.TrimSpace(t.Title)
+		if title == "" {
+			continue // Discogs sometimes has heading rows with empty titles
+		}
+		out.Tracks = append(out.Tracks, Track{
+			Position: strings.TrimSpace(t.Position),
+			Title:    title,
+			Duration: strings.TrimSpace(t.Duration),
+		})
+	}
+	return out, nil
+}
+
 // SweepCache is an optional maintenance hook: drops cache rows older than
 // cacheTTL. Main.go calls it once at startup if Discogs is enabled.
 func (c *Client) SweepCache(ctx context.Context) {

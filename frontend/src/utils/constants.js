@@ -5,6 +5,7 @@ export const API_URLS = {
   PLAYLIST: import.meta.env.VITE_PLAYLIST_API_URL || '/api/playlist',
   QUEUE: import.meta.env.VITE_QUEUE_API_URL || '/api/queue',
   USER: import.meta.env.VITE_USER_API_URL || '/api/user',
+  DISCOGS: import.meta.env.VITE_DISCOGS_API_URL || '/api/discogs',
 }
 
 export const STORAGE_KEYS = {

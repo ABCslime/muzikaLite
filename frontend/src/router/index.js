@@ -35,6 +35,25 @@ const router = createRouter({
       component: () => import('@/views/SettingsView.vue'),
       meta: { requiresAuth: true },
     },
+    // v0.4.2 PR C — Discogs detail views. id is always a positive integer.
+    {
+      path: '/artist/:id',
+      name: 'Artist',
+      component: () => import('@/views/ArtistView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/label/:id',
+      name: 'Label',
+      component: () => import('@/views/LabelView.vue'),
+      meta: { requiresAuth: true },
+    },
+    {
+      path: '/album/:id',
+      name: 'Album',
+      component: () => import('@/views/AlbumView.vue'),
+      meta: { requiresAuth: true },
+    },
   ],
 })
 

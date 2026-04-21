@@ -185,3 +185,153 @@ func TestPreview_NilClientReturnsErrDiscogsDisabled(t *testing.T) {
 		t.Errorf("got %v, want ErrDiscogsDisabled", err)
 	}
 }
+
+// TestArtist_ReturnsReleases: v0.4.2 PR C. Artist detail fetches
+// /artists/{id}/releases and returns a Candidate slice the frontend
+// can feed back into searchAcquire. Master entries are filtered out.
+func TestArtist_ReturnsReleases(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/artists/1289/releases" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"releases": []map[string]any{
+				// Master entry — must be filtered out.
+				{"id": 1, "type": "master", "title": "Discovery", "artist": "Daft Punk", "year": 2001, "catno": ""},
+				// Real releases.
+				{"id": 2, "type": "release", "title": "Discovery", "artist": "Daft Punk", "year": 2001, "catno": "WPCR-80083"},
+				{"id": 3, "type": "release", "title": "Homework", "artist": "Daft Punk", "year": 1997, "catno": "VUS45"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := discogs.NewClient(srv.URL, "tok", nil,
+		discogs.WithRand(rand.New(rand.NewSource(1))),
+		discogs.WithLimiter(100, 100),
+	)
+	p := search.NewPreviewer(c)
+
+	detail, err := p.Artist(context.Background(), 1289)
+	if err != nil {
+		t.Fatalf("Artist: %v", err)
+	}
+	if detail.ID != 1289 {
+		t.Errorf("ID = %d, want 1289", detail.ID)
+	}
+	if detail.Name != "Daft Punk" {
+		t.Errorf("Name = %q, want 'Daft Punk' (inherited from first release)", detail.Name)
+	}
+	if len(detail.Releases) != 2 {
+		t.Fatalf("Releases count = %d, want 2 (master filtered out)", len(detail.Releases))
+	}
+	if detail.Releases[0].Title != "Discovery" || detail.Releases[0].CatalogNumber != "WPCR-80083" {
+		t.Errorf("first release wrong: %+v", detail.Releases[0])
+	}
+}
+
+// TestLabel_ReturnsReleases: same as Artist path but for labels.
+func TestLabel_ReturnsReleases(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/labels/23528/releases" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"releases": []map[string]any{
+				{"id": 10, "type": "release", "title": "Selected Ambient Works", "artist": "Aphex Twin", "year": 1994, "catno": "WARP LP 39"},
+				{"id": 11, "type": "release", "title": "Music Has The Right To Children", "artist": "Boards Of Canada", "year": 1998, "catno": "WARPCD55"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := discogs.NewClient(srv.URL, "tok", nil,
+		discogs.WithRand(rand.New(rand.NewSource(1))),
+		discogs.WithLimiter(100, 100),
+	)
+	p := search.NewPreviewer(c)
+
+	detail, err := p.Label(context.Background(), 23528)
+	if err != nil {
+		t.Fatalf("Label: %v", err)
+	}
+	if len(detail.Releases) != 2 {
+		t.Fatalf("Releases count = %d, want 2", len(detail.Releases))
+	}
+	if detail.Releases[0].Artist != "Aphex Twin" {
+		t.Errorf("first release artist = %q", detail.Releases[0].Artist)
+	}
+}
+
+// TestRelease_ReturnsTracklist: /releases/{id} returns full detail
+// including tracklist. Artists array joins with " & ". Empty
+// tracklist rows (heading separators Discogs sometimes returns)
+// must be dropped.
+func TestRelease_ReturnsTracklist(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/releases/55" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    55,
+			"title": "Discovery",
+			"year":  2001,
+			"artists": []map[string]any{
+				{"name": "Daft Punk"},
+			},
+			"labels": []map[string]any{
+				{"name": "Virgin", "catno": "WPCR-80083"},
+			},
+			"tracklist": []map[string]any{
+				{"position": "1", "title": "One More Time", "duration": "5:20"},
+				{"position": "2", "title": "Aerodynamic", "duration": "3:27"},
+				// Heading row — empty title, must be dropped.
+				{"position": "", "title": "", "duration": ""},
+				{"position": "3", "title": "Digital Love", "duration": "4:58"},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := discogs.NewClient(srv.URL, "tok", nil,
+		discogs.WithRand(rand.New(rand.NewSource(1))),
+		discogs.WithLimiter(100, 100),
+	)
+	p := search.NewPreviewer(c)
+
+	detail, err := p.Release(context.Background(), 55)
+	if err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if detail.Title != "Discovery" || detail.Artist != "Daft Punk" {
+		t.Errorf("metadata wrong: %+v", detail)
+	}
+	if detail.CatalogNumber != "WPCR-80083" {
+		t.Errorf("catno = %q", detail.CatalogNumber)
+	}
+	if detail.Label != "Virgin" {
+		t.Errorf("label = %q", detail.Label)
+	}
+	if len(detail.Tracks) != 3 {
+		t.Fatalf("tracks = %d, want 3 (empty-title row dropped)", len(detail.Tracks))
+	}
+	if detail.Tracks[0].Title != "One More Time" || detail.Tracks[0].Duration != "5:20" {
+		t.Errorf("first track wrong: %+v", detail.Tracks[0])
+	}
+}
+
+// TestArtist_NilClientReturnsErrDiscogsDisabled: Discogs off -> 503
+// via the shared ErrDiscogsDisabled from the preview path.
+func TestArtist_NilClientReturnsErrDiscogsDisabled(t *testing.T) {
+	p := search.NewPreviewer(nil)
+	_, err := p.Artist(context.Background(), 1)
+	if !errors.Is(err, search.ErrDiscogsDisabled) {
+		t.Errorf("got %v, want ErrDiscogsDisabled", err)
+	}
+}

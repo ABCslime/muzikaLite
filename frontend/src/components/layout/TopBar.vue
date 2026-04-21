@@ -74,23 +74,19 @@
             </ul>
           </section>
 
-          <!-- Album artists: stub for 4.2.C, non-interactive for now. -->
+          <!-- Album artists: v0.4.2 PR C wires these to /artist/:id. -->
           <section v-if="results.artists?.length" class="bg-blue-50 border-b-2 border-blue-600">
             <h3 class="px-3 py-1 text-xs font-bold text-blue-900 uppercase tracking-wide">
               Album Artists
             </h3>
             <ul>
               <li
-                v-for="(a, i) in results.artists"
+                v-for="a in results.artists"
                 :key="`a-${a.id}`"
-                :class="[
-                  'px-4 py-2 border-b border-blue-200 last:border-0 flex items-center justify-between',
-                  'cursor-not-allowed opacity-70',
-                ]"
-                :title="'Artist pages land in v0.4.2 PR C'"
+                class="px-4 py-2 border-b border-blue-200 last:border-0 cursor-pointer hover:bg-blue-100"
+                @mousedown.prevent="goArtist(a.id)"
               >
                 <span class="font-semibold text-gray-900">{{ a.name }}</span>
-                <span class="text-xs text-blue-700 italic">coming soon</span>
               </li>
             </ul>
           </section>
@@ -119,21 +115,17 @@
             </ul>
           </section>
 
-          <!-- Labels: stub for 4.2.C. -->
+          <!-- Labels: v0.4.2 PR C wires these to /label/:id. -->
           <section v-if="results.labels?.length" class="bg-yellow-50">
             <h3 class="px-3 py-1 text-xs font-bold text-yellow-900 uppercase tracking-wide">Labels</h3>
             <ul>
               <li
-                v-for="(l, i) in results.labels"
+                v-for="l in results.labels"
                 :key="`l-${l.id}`"
-                :class="[
-                  'px-4 py-2 border-b border-yellow-200 last:border-0 flex items-center justify-between',
-                  'cursor-not-allowed opacity-70',
-                ]"
-                :title="'Label pages land in v0.4.2 PR C'"
+                class="px-4 py-2 border-b border-yellow-200 last:border-0 cursor-pointer hover:bg-yellow-100"
+                @mousedown.prevent="goLabel(l.id)"
               >
                 <span class="font-semibold text-gray-900">{{ l.name }}</span>
-                <span class="text-xs text-yellow-700 italic">coming soon</span>
               </li>
             </ul>
           </section>
@@ -172,11 +164,13 @@
 
 <script setup>
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { useQueueStore } from '@/stores/queue'
 import { usePreferencesStore } from '@/stores/preferences'
 
 const queueStore = useQueueStore()
 const prefsStore = usePreferencesStore()
+const router = useRouter()
 
 const searchQuery = ref('')
 // v0.4.2 PR B: results is now a Preview object with 4 arrays rather
@@ -328,6 +322,23 @@ async function pickGenre(g) {
 
 function isGenrePinned(g) {
   return (prefsStore.discogsGenres || []).some(x => x.toLowerCase() === g.toLowerCase())
+}
+
+// v0.4.2 PR C: artist + label rows navigate to their detail view.
+// Dropdown closes first so it's gone from view by the time the route
+// transition completes.
+function goArtist(id) {
+  dropdownOpen.value = false
+  searchQuery.value = ''
+  results.value = emptyPreview()
+  router.push({ name: 'Artist', params: { id } })
+}
+
+function goLabel(id) {
+  dropdownOpen.value = false
+  searchQuery.value = ''
+  results.value = emptyPreview()
+  router.push({ name: 'Label', params: { id } })
 }
 
 async function pickRelease(candidate) {

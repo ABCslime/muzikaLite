@@ -206,3 +206,123 @@ func emptyPreview() Preview {
 		Labels:   []Entity{},
 	}
 }
+
+// ---- v0.4.2 PR C — artist / label / release detail views ----------------
+
+// ArtistDetail is the payload for /api/discogs/artist/{id}. The UI
+// renders Name at the top, Releases as a grid with a "Queue" button
+// that routes through the normal search-acquire path.
+type ArtistDetail struct {
+	ID       int         `json:"id"`
+	Name     string      `json:"name"`
+	Releases []Candidate `json:"releases"`
+}
+
+// LabelDetail is the label analog of ArtistDetail.
+type LabelDetail struct {
+	ID       int         `json:"id"`
+	Name     string      `json:"name"`
+	Releases []Candidate `json:"releases"`
+}
+
+// ReleaseDetail is the payload for /api/discogs/release/{id}. Carries
+// enough metadata to re-acquire the release plus a tracklist for
+// display. "Add album to queue" on the frontend calls the existing
+// search-acquire path with {title, artist, catalogNumber}.
+type ReleaseDetail struct {
+	ID            int     `json:"id"`
+	Title         string  `json:"title"`
+	Artist        string  `json:"artist"`
+	Year          int     `json:"year,omitempty"`
+	CatalogNumber string  `json:"catalogNumber,omitempty"`
+	Label         string  `json:"label,omitempty"`
+	Tracks        []Track `json:"tracks"`
+}
+
+// Track is one row in a release's tracklist.
+type Track struct {
+	Position string `json:"position,omitempty"`
+	Title    string `json:"title"`
+	Duration string `json:"duration,omitempty"`
+}
+
+// Artist fetches the artist detail + their releases. The artist name
+// comes from the FIRST release's "artist" field since Discogs doesn't
+// return a direct name field on the /artists/{id}/releases endpoint;
+// that's usually correct for single-artist IDs. For collaboration IDs
+// where releases credit multiple artists, the first-release heuristic
+// shows "A & B" which is acceptable.
+func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
+	if p.client == nil {
+		return ArtistDetail{}, ErrDiscogsDisabled
+	}
+	releases, err := p.client.ArtistReleases(ctx, id, 50)
+	if err != nil {
+		return ArtistDetail{}, err
+	}
+	out := ArtistDetail{ID: id, Releases: make([]Candidate, 0, len(releases))}
+	for _, r := range releases {
+		out.Releases = append(out.Releases, Candidate{
+			Title:         r.Title,
+			Artist:        r.Artist,
+			CatalogNumber: r.CatalogNumber,
+			Year:          r.Year,
+		})
+		if out.Name == "" && r.Artist != "" {
+			out.Name = r.Artist
+		}
+	}
+	return out, nil
+}
+
+// Label is the label analog of Artist.
+func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
+	if p.client == nil {
+		return LabelDetail{}, ErrDiscogsDisabled
+	}
+	releases, err := p.client.LabelReleases(ctx, id, 50)
+	if err != nil {
+		return LabelDetail{}, err
+	}
+	out := LabelDetail{ID: id, Releases: make([]Candidate, 0, len(releases))}
+	for _, r := range releases {
+		out.Releases = append(out.Releases, Candidate{
+			Title:         r.Title,
+			Artist:        r.Artist,
+			CatalogNumber: r.CatalogNumber,
+			Year:          r.Year,
+		})
+	}
+	// Label Name isn't on per-release rows. Leave blank; the frontend
+	// either shows the ID or falls back to a search/suggestion. A
+	// future PR could add a /labels/{id} lookup to enrich this.
+	return out, nil
+}
+
+// Release fetches a full release detail by ID: metadata + tracklist.
+func (p *Previewer) Release(ctx context.Context, id int) (ReleaseDetail, error) {
+	if p.client == nil {
+		return ReleaseDetail{}, ErrDiscogsDisabled
+	}
+	r, err := p.client.Release(ctx, id)
+	if err != nil {
+		return ReleaseDetail{}, err
+	}
+	out := ReleaseDetail{
+		ID:            r.ID,
+		Title:         r.Title,
+		Artist:        r.Artist,
+		Year:          r.Year,
+		CatalogNumber: r.CatalogNumber,
+		Label:         r.Label,
+		Tracks:        make([]Track, 0, len(r.Tracks)),
+	}
+	for _, t := range r.Tracks {
+		out.Tracks = append(out.Tracks, Track{
+			Position: t.Position,
+			Title:    t.Title,
+			Duration: t.Duration,
+		})
+	}
+	return out, nil
+}

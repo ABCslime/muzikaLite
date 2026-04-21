@@ -232,6 +232,11 @@ func buildServer(
 	mux.Handle("POST /api/queue/search", withAuth(http.HandlerFunc(qH.Search)))
 	// v0.4.1 PR C — typeahead preview. Stateless; wraps Discogs /database/search.
 	mux.Handle("GET /api/queue/search/preview", withAuth(http.HandlerFunc(searchH.Preview)))
+	// v0.4.2 PR C — artist / label / release detail browse routes.
+	// Read-only Discogs wrappers — no queue state mutation.
+	mux.Handle("GET /api/discogs/artist/{id}", withAuth(http.HandlerFunc(searchH.Artist)))
+	mux.Handle("GET /api/discogs/label/{id}", withAuth(http.HandlerFunc(searchH.Label)))
+	mux.Handle("GET /api/discogs/release/{id}", withAuth(http.HandlerFunc(searchH.Release)))
 	mux.Handle("DELETE /api/queue/queue/{id}", withAuth(http.HandlerFunc(qH.RemoveSong)))
 	mux.Handle("GET /api/queue/songs/{id}", withAuth(http.HandlerFunc(qH.StreamSong)))
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))

@@ -113,11 +113,14 @@ func TestWorker_HappyPath(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
+	// v0.4.2 PR E: filematch filter now requires the filename to
+	// contain every title token. Synthetic filenames include the title
+	// so these tests exercise the post-PR-E pipeline realistically.
 	fc := &fakeClient{
 		searchResp: []soulseek.SearchResult{
-			goodResult("peer1", "/x/song.mp3", 0),
+			goodResult("peer1", "/x/some title.mp3", 0),
 			// Queue too long — rejected by the gate's PeerMaxQueue.
-			{Peer: "peer-busy", Filename: "/y/song.mp3", Size: 5_000_000, Bitrate: 320, QueueLen: 9999},
+			{Peer: "peer-busy", Filename: "/y/some title.mp3", Size: 5_000_000, Bitrate: 320, QueueLen: 9999},
 		},
 		states: completedStates("song.mp3"),
 	}
@@ -243,9 +246,10 @@ func TestGate_AllBelowFloorStrict_RelaxFallback(t *testing.T) {
 
 	fc := &fakeClient{
 		searchResp: []soulseek.SearchResult{
-			{Peer: "low", Filename: "a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
+			// Filename contains title "X" so the PR E filter keeps it.
+			{Peer: "low", Filename: "x.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
 		},
-		states: completedStates("a.mp3"),
+		states: completedStates("x.mp3"),
 	}
 
 	svc := download.NewService(d, fc, "/music", b, nil)
@@ -308,11 +312,14 @@ func TestLadder_CatnoRungWins(t *testing.T) {
 
 	fc := &fakeClient{
 		responsesByQuery: map[string][]soulseek.SearchResult{
+			// v0.4.2 PR E: filter demands title tokens in the filename.
+			// Embed "music has right" (stopword "the" dropped by tokens)
+			// in each filename so all four pass the filter.
 			"WARP-55": {
-				goodResult("peer-a", "a.flac", 0),
-				goodResult("peer-b", "b.flac", 1),
-				goodResult("peer-c", "c.flac", 2),
-				goodResult("peer-d", "d.flac", 3),
+				goodResult("peer-a", "music has right - a.flac", 0),
+				goodResult("peer-b", "music has right - b.flac", 1),
+				goodResult("peer-c", "music has right - c.flac", 2),
+				goodResult("peer-d", "music has right - d.flac", 3),
 			},
 		},
 		states: completedStates("a.flac"),
@@ -345,10 +352,11 @@ func TestLadder_FallsThroughToArtistTitle(t *testing.T) {
 		responsesByQuery: map[string][]soulseek.SearchResult{
 			"MADEUP-42": nil, // catno miss
 			"Boards Of Canada Music Has The Right": {
-				goodResult("peer-a", "a.flac", 0),
-				goodResult("peer-b", "b.flac", 1),
-				goodResult("peer-c", "c.flac", 2),
-				goodResult("peer-d", "d.flac", 3),
+				// v0.4.2 PR E: filenames embed title tokens.
+				goodResult("peer-a", "music has right - a.flac", 0),
+				goodResult("peer-b", "music has right - b.flac", 1),
+				goodResult("peer-c", "music has right - c.flac", 2),
+				goodResult("peer-d", "music has right - d.flac", 3),
 			},
 		},
 		states: completedStates("a.flac"),
@@ -419,11 +427,11 @@ func TestLadder_TitleOnlyIsFinalRung(t *testing.T) {
 			"CAT-1": nil,
 			// artist+title
 			"Artist Title": nil,
-			// title-only
+			// title-only — filenames must contain "title" for PR E filter.
 			"Title": {
-				goodResult("peer-a", "a.flac", 0),
-				goodResult("peer-b", "b.flac", 1),
-				goodResult("peer-c", "c.flac", 2),
+				goodResult("peer-a", "title-a.flac", 0),
+				goodResult("peer-b", "title-b.flac", 1),
+				goodResult("peer-c", "title-c.flac", 2),
 			},
 		},
 		states: completedStates("a.flac"),
@@ -474,11 +482,12 @@ func TestRelax_SurfacedOnlyForSearchStrategy(t *testing.T) {
 
 			// 96 kbps: fails strict (192 min), passes relaxed (96 min).
 			// Forces the worker into the relax branch.
+			// Filename contains title "X" for the PR E filter.
 			fc := &fakeClient{
 				searchResp: []soulseek.SearchResult{
-					{Peer: "lowbr", Filename: "a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
+					{Peer: "lowbr", Filename: "x.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
 				},
-				states: completedStates("a.mp3"),
+				states: completedStates("x.mp3"),
 			}
 
 			svc := download.NewService(d, fc, "/music", b, nil)
@@ -554,7 +563,8 @@ func TestProbe_PeersFound_RunsLadder(t *testing.T) {
 
 	fc := &fakeClient{
 		// Same result list served for probe AND artist+title rungs.
-		searchResp: []soulseek.SearchResult{goodResult("peer1", "song.mp3", 0)},
+		// Filename embeds title "Has Peers" for the PR E filter.
+		searchResp: []soulseek.SearchResult{goodResult("peer1", "has peers - song.mp3", 0)},
 		states:     completedStates("song.mp3"),
 	}
 	svc := download.NewService(d, fc, "/music", b, nil)
@@ -591,7 +601,8 @@ func TestProbe_NotRunForPassiveRefill(t *testing.T) {
 	b := bus.New(64, log)
 
 	fc := &fakeClient{
-		searchResp: []soulseek.SearchResult{goodResult("peer1", "song.mp3", 0)},
+		// Filename contains title "X" for the PR E filter.
+		searchResp: []soulseek.SearchResult{goodResult("peer1", "x song.mp3", 0)},
 		states:     completedStates("song.mp3"),
 	}
 	svc := download.NewService(d, fc, "/music", b, nil)
@@ -716,9 +727,10 @@ func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 		responsesByQuery: map[string][]soulseek.SearchResult{
 			"CAT-1":        nil,
 			"Artist Title": nil,
-			"Title":        {goodResult("peer-a", "a.flac", 0)},
+			// PR E filter demands "title" token in the filename.
+			"Title": {goodResult("peer-a", "title-a.flac", 0)},
 		},
-		states: completedStates("a.flac"),
+		states: completedStates("title-a.flac"),
 	}
 
 	cfg := download.DefaultConfig()
@@ -759,8 +771,8 @@ func TestDiscoveryLog_RecordsLadderAndPicked(t *testing.T) {
 	var gotFilename string
 	var gotBitrate int
 	_ = d.QueryRow(`SELECT filename, bitrate FROM discovery_log WHERE stage = 'gate'`).Scan(&gotFilename, &gotBitrate)
-	if gotFilename != "a.flac" {
-		t.Errorf("gate row filename = %q, want a.flac", gotFilename)
+	if gotFilename != "title-a.flac" {
+		t.Errorf("gate row filename = %q, want title-a.flac", gotFilename)
 	}
 	if gotBitrate != 320 {
 		t.Errorf("gate row bitrate = %d, want 320", gotBitrate)
@@ -782,13 +794,16 @@ func TestDiscoveryLog_RejectedCandidatesLogged(t *testing.T) {
 	}
 
 	// All four results fail a different gate threshold.
+	// Filenames contain "title" so they survive the PR E filename
+	// filter and actually reach the gate — the gate is what this test
+	// is exercising.
 	fc := &fakeClient{
 		responsesByQuery: map[string][]soulseek.SearchResult{
 			"Artist Title": {
-				{Peer: "lowbr", Filename: "a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
-				{Peer: "small", Filename: "b.mp3", Size: 100, Bitrate: 320, QueueLen: 0},
-				{Peer: "huge", Filename: "c.flac", Size: 500_000_000, Bitrate: 1000, QueueLen: 0},
-				{Peer: "busy", Filename: "d.mp3", Size: 5_000_000, Bitrate: 320, QueueLen: 999},
+				{Peer: "lowbr", Filename: "title-a.mp3", Size: 5_000_000, Bitrate: 96, QueueLen: 0},
+				{Peer: "small", Filename: "title-b.mp3", Size: 100, Bitrate: 320, QueueLen: 0},
+				{Peer: "huge", Filename: "title-c.flac", Size: 500_000_000, Bitrate: 1000, QueueLen: 0},
+				{Peer: "busy", Filename: "title-d.mp3", Size: 5_000_000, Bitrate: 320, QueueLen: 999},
 			},
 			"Title": nil,
 		},

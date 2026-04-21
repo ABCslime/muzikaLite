@@ -186,13 +186,15 @@ async function load(id) {
 async function runAvailability() {
   if (!detail.value.title || !detail.value.artist) return
   availability.value = 'checking'
-  const results = await discogsAPI.checkAvailability([
-    {
-      title: detail.value.title,
-      artist: detail.value.artist,
-      catalogNumber: detail.value.catalogNumber || '',
-    },
-  ])
+  // v0.4.2 PR E: one Soulseek search against the artist, then
+  // backend filters filenames by the album title. Better tolerance
+  // of parens / punctuation / stopword differences between the
+  // Discogs title and Soulseek filenames (e.g. "Discovery
+  // (Remastered 2021)" Discogs title vs "Discovery" Soulseek).
+  const results = await discogsAPI.checkAvailabilityByArtist(
+    detail.value.artist,
+    [detail.value.title],
+  )
   const r = results[0]
   if (!r) {
     availability.value = 'unknown'

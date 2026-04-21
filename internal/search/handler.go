@@ -178,3 +178,37 @@ func (h *Handler) Availability(w http.ResponseWriter, r *http.Request) {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results})
 }
+
+// AvailabilityByArtist handles POST /api/queue/search/availability/by-artist
+// (v0.4.2 PR E). Body: {"artist":"...","titles":["...","..."]}.
+// Response: {"results":[{"available":bool,"peerCount":int}...]} in input order.
+//
+// One Soulseek search for the whole artist, then filematch-filter per
+// title. More efficient and more reliable than the per-release probe
+// for artist/album pages where every row shares an artist.
+func (h *Handler) AvailabilityByArtist(w http.ResponseWriter, r *http.Request) {
+	if _, ok := httpx.GetUserID(r.Context()); !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	var req ArtistAvailabilityQuery
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(req.Titles) > maxAvailabilityItems {
+		httpx.WriteError(w, http.StatusBadRequest, "too many titles")
+		return
+	}
+	results, err := h.prev.CheckByArtistAvailability(r.Context(), req.Artist, req.Titles)
+	if err != nil {
+		if errors.Is(err, ErrSoulseekDisabled) {
+			httpx.WriteError(w, http.StatusServiceUnavailable,
+				"Soulseek backend is not configured")
+			return
+		}
+		httpx.WriteError(w, http.StatusInternalServerError, "availability check failed")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results})
+}

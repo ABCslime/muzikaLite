@@ -50,4 +50,31 @@ export const discogsAPI = {
       return []
     }
   },
+
+  // v0.4.2 PR E — artist-broad availability. One Soulseek search per
+  // artist, then the backend filters the returned filenames against
+  // the title list with the shared filematch package. Much more
+  // efficient and reliable for artist + album pages than the N
+  // per-release probes of PR D, because:
+  //
+  //   - Soulseek scales better with fewer deeper searches than many
+  //     shallow ones (peer response is rate-limited per search).
+  //   - Filename filtering tolerates title variance ("Song (Remastered)"
+  //     vs "Song"), parens, punctuation, and stopwords — matching the
+  //     same token-set semantics the download worker now uses.
+  //
+  // artist: string, titles: string[] — returns results[] parallel to titles.
+  async checkAvailabilityByArtist(artist, titles) {
+    if (!artist || !titles || titles.length === 0) return []
+    try {
+      const response = await client.post(
+        `${API_URLS.QUEUE}/search/availability/by-artist`,
+        { artist, titles },
+      )
+      return response.data?.results || []
+    } catch (error) {
+      console.warn('artist-broad availability check failed:', error.message)
+      return []
+    }
+  },
 }

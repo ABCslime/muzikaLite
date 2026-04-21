@@ -114,13 +114,29 @@ async function runAvailability() {
   if (!detail.value.releases?.length) return
   availabilityChecking.value = true
   try {
-    availability.value = await discogsAPI.checkAvailability(
-      detail.value.releases.map(r => ({
-        title: r.title,
-        artist: r.artist,
-        catalogNumber: r.catalogNumber || '',
-      })),
-    )
+    // v0.4.2 PR E: artist-broad probe. ONE Soulseek search for
+    // detail.name, then backend filters the filename list against
+    // each release title. Replaces the PR-D per-release fan-out,
+    // which was slower (N peer calls) and more prone to false
+    // negatives from filename variance.
+    //
+    // detail.name comes from the first release's artist field —
+    // should be the same for every row on a real artist page, but
+    // fall back to the per-item path if name is somehow missing.
+    if (detail.value.name) {
+      availability.value = await discogsAPI.checkAvailabilityByArtist(
+        detail.value.name,
+        detail.value.releases.map(r => r.title),
+      )
+    } else {
+      availability.value = await discogsAPI.checkAvailability(
+        detail.value.releases.map(r => ({
+          title: r.title,
+          artist: r.artist,
+          catalogNumber: r.catalogNumber || '',
+        })),
+      )
+    }
   } finally {
     availabilityChecking.value = false
   }

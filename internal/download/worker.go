@@ -36,6 +36,7 @@ import (
 	"github.com/macabc/muzika/internal/bus"
 	"github.com/macabc/muzika/internal/db"
 	"github.com/macabc/muzika/internal/discovery"
+	"github.com/macabc/muzika/internal/filematch"
 	"github.com/macabc/muzika/internal/soulseek"
 )
 
@@ -324,6 +325,18 @@ func (s *Service) runRung(
 		return "", soulseek.SearchResult{}, 0, false
 	}
 
+	// v0.4.2 PR E: filename filter. Soulseek's query matcher is fuzzy
+	// and routinely returns files whose metadata contained a query
+	// token but whose actual filename is a different song — a peer
+	// shared folder named "Daft Punk" drags in unrelated tracks on a
+	// "Daft Punk Homework" search. Drop results whose filename tokens
+	// don't include every word of ev.Title so the gate + picker never
+	// see those wrong-song candidates.
+	//
+	// filterByTitle is a no-op when the title tokenizes to nothing
+	// (all stopwords) — the original behavior is preserved.
+	results = filterByTitle(results, ev.Title)
+
 	s.logw.Record(ctx, discovery.Record{
 		SongID:      ev.SongID,
 		Source:      discovery.SourceDownload,
@@ -456,6 +469,16 @@ func (s *Service) probeAvailability(ctx context.Context, ev bus.RequestDownload)
 		return false
 	}
 
+	// v0.4.2 PR E: filter results by ev.Title tokens before counting.
+	// The probe's question is "does Soulseek have this song?", not
+	// "did any file containing one query word come back?". Without
+	// this filter the probe green-lights searches where Soulseek
+	// returned unrelated files that happened to share a query token,
+	// and the user's ladder then can't find the song at gate time —
+	// the familiar "Available → queued → never actually downloaded"
+	// frustration loop.
+	results = filterByTitle(results, ev.Title)
+
 	outcome := discovery.OutcomeOK
 	if len(results) == 0 {
 		outcome = discovery.OutcomeNoResults
@@ -491,6 +514,37 @@ func bestProbeQuery(ev bus.RequestDownload) string {
 		return t
 	}
 	return strings.TrimSpace(ev.CatalogNumber)
+}
+
+// filterByTitle drops Soulseek results whose filename doesn't contain
+// every token of `title` (via filematch.Contains — word-set match
+// on the normalized forms, so parens / punctuation / case / stopword
+// differences don't cause rejection).
+//
+// v0.4.2 PR E. Defense against Soulseek's fuzzy query matcher
+// returning files whose metadata shared a query token but whose
+// actual filename is clearly a different song. Pre-PR-E, these
+// wrong-song results survived into the gate, sometimes even got
+// downloaded as a "match" for the requested title — a false-positive
+// failure mode users noticed most on common artist names ("Merzbow"
+// search returning every track on Merzbox Vol. 1 labeled with their
+// own titles, not the requested one).
+//
+// When `title` tokenizes to nothing (empty string, all stopwords),
+// the filter is a no-op — we'd rather have unfiltered results than
+// reject everything on a degenerate input.
+func filterByTitle(results []soulseek.SearchResult, title string) []soulseek.SearchResult {
+	tokens := filematch.Tokens(title)
+	if len(tokens) == 0 {
+		return results
+	}
+	out := make([]soulseek.SearchResult, 0, len(results))
+	for _, r := range results {
+		if filematch.Contains(r.Filename, tokens) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // recordFailed writes a terminal StageFailed row for post-mortem.

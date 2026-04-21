@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/macabc/muzika/internal/discogs"
+	"github.com/macabc/muzika/internal/filematch"
 	"github.com/macabc/muzika/internal/soulseek"
 )
 
@@ -405,6 +406,82 @@ func (p *Previewer) CheckAvailability(ctx context.Context, items []AvailabilityQ
 		}(i, query)
 	}
 	wg.Wait()
+	return results, nil
+}
+
+// ---- v0.4.2 PR E: artist-broad availability -----------------------------
+
+// artistBroadWindow is longer than availabilityProbeWindow because ONE
+// search now carries an entire page's worth of signal; we'd rather
+// pay the wall time once than N times. 5 s matches the download
+// worker's probe window — if the artist has any Soulseek presence,
+// results arrive well within that.
+const artistBroadWindow = 5 * time.Second
+
+// ArtistAvailabilityQuery is the PR E request shape. The frontend
+// passes the artist name once plus the list of titles to test; the
+// backend runs a single Soulseek search and filters client-side.
+type ArtistAvailabilityQuery struct {
+	Artist string   `json:"artist"`
+	Titles []string `json:"titles"`
+}
+
+// CheckByArtistAvailability runs ONE Soulseek search for `artist` and
+// reports which of `titles` appear among the returned filenames.
+//
+// Why this over CheckAvailability? Two reasons:
+//
+//  1. Efficiency — a 20-release artist page hits Soulseek once
+//     instead of 20 times. One longer window produces more hits
+//     than twenty short parallel ones against a jittery network.
+//
+//  2. Reliability — per-release probes use the literal title, which
+//     loses on filename variance ("Song (Remastered).flac" vs
+//     "Song"). Here we tokenize via filematch and match as a
+//     word-set, so parens, punctuation, and stopword differences
+//     don't cause false negatives.
+//
+// Returns one AvailabilityResult per title, in input order. PeerCount
+// is the count of filtered filename matches for THIS title — not the
+// raw search result count. Empty artist or no titles short-circuits
+// to all-zero results without hitting Soulseek.
+func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string, titles []string) ([]AvailabilityResult, error) {
+	if p.soulseek == nil {
+		return nil, ErrSoulseekDisabled
+	}
+	artist = strings.TrimSpace(artist)
+	results := make([]AvailabilityResult, len(titles))
+	if artist == "" || len(titles) == 0 {
+		return results, nil
+	}
+
+	soulseekResults, err := p.soulseek.Search(ctx, artist, artistBroadWindow)
+	if err != nil {
+		p.log.Debug("artist-broad availability search failed",
+			"artist", artist, "err", err)
+		return results, nil // all unavailable; not a hard error
+	}
+	if len(soulseekResults) == 0 {
+		return results, nil
+	}
+
+	// Per-title token match against each filename. The filename set is
+	// small (tens to low hundreds) so O(titles × results) is fine.
+	for i, title := range titles {
+		tokens := filematch.Tokens(title)
+		if len(tokens) == 0 {
+			continue
+		}
+		count := 0
+		for _, r := range soulseekResults {
+			if filematch.Contains(r.Filename, tokens) {
+				count++
+			}
+		}
+		if count > 0 {
+			results[i] = AvailabilityResult{Available: true, PeerCount: count}
+		}
+	}
 	return results, nil
 }
 

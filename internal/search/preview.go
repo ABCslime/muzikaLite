@@ -61,29 +61,18 @@ type Candidate struct {
 	IsAlbum       bool   `json:"isAlbum,omitempty"`
 }
 
-// isAlbumFormat reports whether a Discogs release `format` string
-// describes a multi-track album. Discogs returns this as a comma-
-// separated string of free-form tokens like "CD, Album, Compilation"
-// or "12\", EP" or "7\", Single". We bucket "Album", "LP", "EP",
-// and "Mini-Album" as Album; everything else (Single, etc.) as
-// Single. Empty format → not an album (defensive: classify as
-// single so the user can still queue without "Add to playlist"
-// expanding into nothing).
-//
-// Match is case-insensitive but boundary-aware so "EPK" doesn't
-// trigger on "EP". v0.4.4.
-func isAlbumFormat(format string) bool {
-	if format == "" {
-		return false
+// isAlbum reports whether a Discogs SearchResult should bucket into
+// the Album section of the artist/label view. The source endpoint
+// (/artists/{id}/releases, /database/search, …) sets r.IsAlbum
+// directly when it can — that's the authoritative signal. Otherwise
+// we fall back to parsing the format string for Album/LP/EP/Mini-
+// Album tokens, the way /database/search rows describe themselves.
+// v0.4.4.
+func isAlbum(r discogs.SearchResult) bool {
+	if r.IsAlbum {
+		return true
 	}
-	for _, tok := range strings.Split(format, ",") {
-		tok = strings.TrimSpace(strings.ToLower(tok))
-		switch tok {
-		case "album", "lp", "ep", "mini-album":
-			return true
-		}
-	}
-	return false
+	return discogs.IsAlbumFormat(r.Format)
 }
 
 // Entity is the JSON payload for an artist or label hit.
@@ -263,7 +252,7 @@ func (p *Previewer) Preview(ctx context.Context, query string) (Preview, error) 
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
-			IsAlbum:       isAlbumFormat(r.Format),
+			IsAlbum:       isAlbum(r),
 		})
 	}
 	for _, a := range artists {
@@ -418,7 +407,7 @@ func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
-			IsAlbum:       isAlbumFormat(r.Format),
+			IsAlbum:       isAlbum(r),
 		})
 		// Fallbacks if /artists/{id} didn't return a name/image —
 		// e.g. transient Discogs error, brand new artist record.
@@ -475,7 +464,7 @@ func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
-			IsAlbum:       isAlbumFormat(r.Format),
+			IsAlbum:       isAlbum(r),
 		})
 		if out.Image == "" && r.Thumb != "" {
 			out.Image = r.Thumb

@@ -188,7 +188,14 @@ func TestPreview_NilClientReturnsErrDiscogsDisabled(t *testing.T) {
 
 // TestArtist_ReturnsReleases: v0.4.2 PR C. Artist detail fetches
 // /artists/{id}/releases and returns a Candidate slice the frontend
-// can feed back into searchAcquire. Master entries are filtered out.
+// can feed back into searchAcquire.
+//
+// v0.4.4 update: masters are NO LONGER filtered out — they carry the
+// album concept on the /artists/{id}/releases endpoint (which
+// doesn't return "Album" format tokens on non-master releases).
+// Masters pass through with IsAlbum=true and ID=main_release, so
+// /album/{id} resolves to a specific pressing's tracklist. A
+// master deduplicates a same-title release that follows it.
 func TestArtist_ReturnsReleases(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/artists/1289/releases" {
@@ -198,10 +205,11 @@ func TestArtist_ReturnsReleases(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"releases": []map[string]any{
-				// Master entry — must be filtered out.
-				{"id": 1, "type": "master", "title": "Discovery", "artist": "Daft Punk", "year": 2001, "catno": ""},
-				// Real releases.
+				// Master — main_release gives the routing target.
+				{"id": 1, "type": "master", "main_release": 42, "title": "Discovery", "artist": "Daft Punk", "year": 2001, "catno": ""},
+				// Same-title release — deduped by the master above.
 				{"id": 2, "type": "release", "title": "Discovery", "artist": "Daft Punk", "year": 2001, "catno": "WPCR-80083"},
+				// Different title, passes through as a single (no format token).
 				{"id": 3, "type": "release", "title": "Homework", "artist": "Daft Punk", "year": 1997, "catno": "VUS45"},
 			},
 		})
@@ -225,10 +233,17 @@ func TestArtist_ReturnsReleases(t *testing.T) {
 		t.Errorf("Name = %q, want 'Daft Punk' (inherited from first release)", detail.Name)
 	}
 	if len(detail.Releases) != 2 {
-		t.Fatalf("Releases count = %d, want 2 (master filtered out)", len(detail.Releases))
+		t.Fatalf("Releases count = %d, want 2 (master + non-dedup release)", len(detail.Releases))
 	}
-	if detail.Releases[0].Title != "Discovery" || detail.Releases[0].CatalogNumber != "WPCR-80083" {
-		t.Errorf("first release wrong: %+v", detail.Releases[0])
+	// First entry: the master, with ID rewritten to main_release and IsAlbum=true.
+	r0 := detail.Releases[0]
+	if r0.Title != "Discovery" || r0.ID != 42 || !r0.IsAlbum {
+		t.Errorf("first release wrong: %+v (want Title=Discovery ID=42 IsAlbum=true)", r0)
+	}
+	// Second entry: the single, NOT flagged as album.
+	r1 := detail.Releases[1]
+	if r1.Title != "Homework" || r1.IsAlbum {
+		t.Errorf("second release wrong: %+v (want Title=Homework IsAlbum=false)", r1)
 	}
 }
 

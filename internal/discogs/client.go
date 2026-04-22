@@ -141,6 +141,15 @@ type SearchResult struct {
 	// release: "CD, Album", "12\", EP", "7\", Single", etc. Used
 	// downstream to classify Album vs Single. v0.4.4.
 	Format string
+
+	// IsAlbum is true when this row should bucket into the Album
+	// section of the artist/label view. Populated by
+	// fetchArtistOrLabelReleases — true for Discogs master rows
+	// (which stand in for the abstract album) and for non-master
+	// rows whose format string carries an Album/LP/EP token. Kept
+	// separate from Format because /artists/{id}/releases rarely
+	// includes the token and masters would otherwise be lost. v0.4.4.
+	IsAlbum bool
 }
 
 // Search picks one random release from the top page of /database/search
@@ -640,8 +649,29 @@ func (c *Client) Release(ctx context.Context, releaseID int) (ReleaseDetail, err
 // fetchArtistOrLabelReleases factors the shared pagination parse used
 // by ArtistReleases and LabelReleases. Both endpoints respond with
 // {pagination: {...}, releases: [...]} where each release carries an
-// id, title, artist, year, catno, role, thumb. Filters out "Master"
-// entries since they carry no download-relevant catno.
+// id, title, artist, year, catno, role, thumb.
+//
+// v0.4.4 update: masters are INCLUDED and treated as albums.
+//
+// Discogs' /artists/{id}/releases endpoint returns `format` as only
+// the physical medium (`"12\""`, `"CD, Comp"`, etc.) — it does NOT
+// include the "Album" / "EP" / "LP" classification tokens that
+// /database/search emits. That meant our original "skip masters +
+// parse format for Album" heuristic classified roughly zero
+// entries as Album on real artists.
+//
+// Masters ARE exactly what users think of as albums ("Modal Soul",
+// "Metaphorical Music"); each one has a `main_release` int pointing
+// to a specific pressing that /releases/{id} will dereference into
+// a tracklist. So we:
+//   - keep masters, flag them IsAlbum=true, and rewrite their ID
+//     to main_release so the AlbumView URL resolves
+//   - also classify non-master releases with an Album/LP/EP
+//     format token as albums (rarer on this endpoint, but they
+//     show up and without this we'd miss them)
+//   - prefer the master entry when a (artist,title) pair appears
+//     in both master and release form; masters carry the album
+//     concept and tend to have better thumbnails.
 func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path string, params url.Values, limit int) ([]SearchResult, error) {
 	payload, err := c.fetchRaw(ctx, key, path, params)
 	if err != nil {
@@ -649,20 +679,15 @@ func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path strin
 	}
 	var resp struct {
 		Releases []struct {
-			ID     int    `json:"id"`
-			Type   string `json:"type"`
-			Title  string `json:"title"`
-			Artist string `json:"artist"`
-			Year   int    `json:"year"`
-			Catno  string `json:"catno"`
-			Thumb  string `json:"thumb"`
-			// Discogs returns format on the artist/label releases
-			// endpoint as a comma-separated STRING (not the array
-			// form you get on /releases/{id}). Examples: "CD, Album",
-			// "12\", EP", "7\", Single". We parse it into IsAlbum
-			// downstream by checking for "Album", "LP", or "EP"
-			// tokens. v0.4.4.
-			Format string `json:"format"`
+			ID          int    `json:"id"`
+			Type        string `json:"type"`
+			Title       string `json:"title"`
+			Artist      string `json:"artist"`
+			Year        int    `json:"year"`
+			Catno       string `json:"catno"`
+			Thumb       string `json:"thumb"`
+			Format      string `json:"format"`
+			MainRelease int    `json:"main_release"`
 		} `json:"releases"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
@@ -671,35 +696,75 @@ func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path strin
 	out := make([]SearchResult, 0, limit)
 	seen := make(map[string]struct{}, limit)
 	for _, r := range resp.Releases {
-		if r.Type == "master" {
-			// Master entries are abstract groupings; downloads happen against
-			// concrete releases.
-			continue
-		}
 		title := strings.TrimSpace(r.Title)
 		artist := strings.TrimSpace(r.Artist)
 		if title == "" {
 			continue
 		}
-		key := strings.ToLower(artist) + "\x00" + strings.ToLower(title)
-		if _, dup := seen[key]; dup {
+		dedup := strings.ToLower(artist) + "\x00" + strings.ToLower(title)
+		if _, dup := seen[dedup]; dup {
 			continue
 		}
-		seen[key] = struct{}{}
+
+		isMaster := r.Type == "master"
+		id := r.ID
+		if isMaster {
+			// Routing target: main_release is the specific pressing
+			// /releases/{id} can dereference. Fall back to the master id
+			// (rare; Discogs virtually always sets main_release on
+			// surfaced masters).
+			if r.MainRelease > 0 {
+				id = r.MainRelease
+			}
+		}
+		if isMaster && id == 0 {
+			// Nothing we can route to — skip rather than emit a broken row.
+			continue
+		}
+
+		seen[dedup] = struct{}{}
 		out = append(out, SearchResult{
 			Title:         title,
 			Artist:        artist,
 			CatalogNumber: firstCatno(r.Catno),
 			Year:          r.Year,
 			Thumb:         r.Thumb,
-			ID:            r.ID,
+			ID:            id,
 			Format:        r.Format,
+			IsAlbum:       isMaster || IsAlbumFormat(r.Format),
 		})
 		if len(out) >= limit {
 			break
 		}
 	}
 	return out, nil
+}
+
+// IsAlbumFormat reports whether a Discogs release `format` string
+// describes a multi-track album. Discogs returns this as a comma-
+// separated string of tokens like "CD, Album" or "12\", EP". We
+// treat "Album", "LP", "EP", and "Mini-Album" as album; everything
+// else (Single, Compilation without Album token, etc.) as single.
+// Match is case-insensitive but boundary-aware via comma splitting
+// so "EPK" doesn't false-positive on "EP". v0.4.4.
+//
+// Exported so internal/search can reuse the same classification.
+// The artist/label releases endpoint rarely returns these tokens
+// (it mostly returns physical medium only); masters carry the
+// album concept on that endpoint. /database/search DOES return
+// these tokens, which is where this function earns its keep.
+func IsAlbumFormat(format string) bool {
+	if format == "" {
+		return false
+	}
+	for _, tok := range strings.Split(format, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		switch tok {
+		case "album", "lp", "ep", "mini-album":
+			return true
+		}
+	}
+	return false
 }
 
 // fetchRaw is the low-level cached GET used by the detail endpoints.

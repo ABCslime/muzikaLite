@@ -2,6 +2,7 @@ package similarity
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -31,72 +32,98 @@ type Handler struct {
 // the seed-mode routes testable without constructing a Service.
 func NewHandler(r *Repo, s *Service) *Handler { return &Handler{repo: r, svc: s} }
 
-// SimilarModeResponse is the GET reply shape. seedSongId is the
-// JSON-stringified UUID, or null when similar mode is off.
-// Frontend reads the "active" boolean as the visual indicator
-// for the lens icon.
+// SimilarModeResponse is the GET reply shape. Active is the
+// single boolean the frontend uses for "similar mode on/off"
+// state. SeedSongID + SeedTitle + SeedArtist are the
+// v0.5-compatible singular fields (first element of the seed
+// set); Seeds is the full v0.6 multi-seed list.
 //
-// v0.5 PR E: LastError surfaces the most recent NextPick failure
-// reason from the similarity service so the lens icon can render
-// a third "active but not working" state (orange) when the seed
-// has no Discogs match or all buckets came back empty. Empty
-// string = last cycle succeeded (or no cycle has run yet, which
-// the frontend treats as "assume OK until proven otherwise").
-//
-// v0.5 PR F: SeedTitle + SeedArtist are populated when a seed is
-// active. Lets the Home view render a chip ("Similar: <artist> —
-// <title>") without a second round-trip to fetch the song. Empty
-// strings when similar mode is off; populated from queue_songs
-// via the same SeedReader adapter the engine uses.
+// Backward compat: v0.5 clients that only know seedSongId keep
+// working — it's the first entry of Seeds, stable under a
+// deterministic order. New v0.6+ clients read Seeds for the
+// full list.
 type SimilarModeResponse struct {
-	SeedSongID *string `json:"seedSongId"`
-	Active     bool    `json:"active"`
-	LastError  string  `json:"lastError,omitempty"`
-	SeedTitle  string  `json:"seedTitle,omitempty"`
-	SeedArtist string  `json:"seedArtist,omitempty"`
+	Active     bool        `json:"active"`
+	SeedSongID *string     `json:"seedSongId"`
+	SeedTitle  string      `json:"seedTitle,omitempty"`
+	SeedArtist string      `json:"seedArtist,omitempty"`
+	LastError  string      `json:"lastError,omitempty"`
+	Seeds      []SeedEntry `json:"seeds"`
 }
 
-// SimilarModeRequest is the POST body. SeedSongID nil OR empty
-// string clears the mode; non-empty UUID sets it.
+// SeedEntry is one row in the multi-seed list returned to the
+// frontend. Includes enough metadata for the Home-view chip
+// renderer so it doesn't need a second fetch.
+type SeedEntry struct {
+	ID     string `json:"id"`
+	Title  string `json:"title,omitempty"`
+	Artist string `json:"artist,omitempty"`
+}
+
+// SimilarModeRequest is the POST body for the "replace the
+// entire seed set" route. Supports both shapes:
+//
+//   v0.5 singular: {"seedSongId": "uuid"}  — replaces set with [uuid]
+//   v0.5 clear:    {"seedSongId": null}    — clears set
+//   v0.6 multi:    {"seedSongIds": ["u1","u2"]} — replaces set
+//
+// When both fields are present SeedSongIDs wins. Missing both =
+// empty set = clear mode.
 type SimilarModeRequest struct {
-	SeedSongID *string `json:"seedSongId"`
+	SeedSongID  *string  `json:"seedSongId"`
+	SeedSongIDs []string `json:"seedSongIds"`
 }
 
 // Get returns the current similar-mode state for the caller.
+// Populates both the v0.6 Seeds array (all seeds with metadata)
+// and the v0.5-compat singular fields (first seed's id/title/
+// artist for backward compat).
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.GetUserID(r.Context())
 	if !ok {
 		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
-	seed, err := h.repo.SeedFor(r.Context(), userID)
+	seeds, err := h.repo.SeedsFor(r.Context(), userID)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "read similar mode failed")
 		return
 	}
-	resp := SimilarModeResponse{Active: seed != uuid.Nil}
-	if seed != uuid.Nil {
-		s := seed.String()
-		resp.SeedSongID = &s
+	resp := SimilarModeResponse{
+		Active: len(seeds) > 0,
+		Seeds:  make([]SeedEntry, 0, len(seeds)),
+	}
+	for i, s := range seeds {
+		entry := SeedEntry{ID: s.String()}
+		// Hydrate metadata via the same adapter the engine uses
+		// for picks. Failures (Bandcamp-only seed, dead row) are
+		// tolerated — the frontend renders the id as a fallback
+		// and the chip's tooltip explains via lastError.
 		if h.svc != nil {
-			resp.LastError = h.svc.LastError(userID)
-			// v0.5 PR F: hydrate the seed's (title, artist) for the
-			// Home-view chip. Same adapter the engine uses for the
-			// refill path — so an inconsistent "chip shows one thing
-			// but picks are made from another" is impossible.
-			// Hydration failure is silently tolerated: the chip just
-			// renders with the id as a fallback label.
-			if seedMeta, err := h.svc.ReadSeedMetadata(r.Context(), userID, seed); err == nil {
-				resp.SeedTitle = seedMeta.Title
-				resp.SeedArtist = seedMeta.Artist
+			if meta, err := h.svc.ReadSeedMetadata(r.Context(), userID, s); err == nil {
+				entry.Title = meta.Title
+				entry.Artist = meta.Artist
 			}
 		}
+		resp.Seeds = append(resp.Seeds, entry)
+		// v0.5-compat singular fields — first seed wins.
+		if i == 0 {
+			id := s.String()
+			resp.SeedSongID = &id
+			resp.SeedTitle = entry.Title
+			resp.SeedArtist = entry.Artist
+		}
+	}
+	if resp.Active && h.svc != nil {
+		resp.LastError = h.svc.LastError(userID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
 
-// Set updates the similar-mode seed. POSTing a body with
-// seedSongId=null (or omitted) clears the mode.
+// Set replaces the entire similar-mode seed set. Accepts both
+// v0.5 singular (seedSongId) and v0.6 multi (seedSongIds) body
+// shapes; multi wins when both are supplied. Empty body or
+// nulls on both fields = clear similar mode.
 func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.GetUserID(r.Context())
 	if !ok {
@@ -104,36 +131,113 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req SimilarModeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+	// Empty body is valid (= clear). json.NewDecoder.Decode on
+	// an empty body returns io.EOF; treat that as the zero
+	// request.
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	seeds, err := parseSeedList(req)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	var seed uuid.UUID
-	if req.SeedSongID != nil && *req.SeedSongID != "" {
-		parsed, err := uuid.Parse(*req.SeedSongID)
-		if err != nil {
-			httpx.WriteError(w, http.StatusBadRequest, "invalid seedSongId")
-			return
-		}
-		seed = parsed
-	}
-	if err := h.repo.SetSeed(r.Context(), userID, seed); err != nil {
+	if err := h.repo.ReplaceSeeds(r.Context(), userID, seeds); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "set similar mode failed")
 		return
 	}
-	// v0.5 PR E: changing the seed invalidates any prior error —
-	// the new seed hasn't been tried yet. Clear so the lens flips
-	// out of orange immediately rather than waiting for a fresh
-	// successful cycle.
+	// v0.5 PR E: any seed change invalidates the prior lastError.
 	if h.svc != nil {
 		h.svc.ClearLastError(userID)
 	}
-	resp := SimilarModeResponse{Active: seed != uuid.Nil}
-	if seed != uuid.Nil {
-		s := seed.String()
-		resp.SeedSongID = &s
+	h.writeCurrent(w, r, userID)
+}
+
+// AddSeed appends one song to the user's seed set. Idempotent
+// on the backend. POST /api/queue/similar-mode/seeds/{songId}.
+func (h *Handler) AddSeed(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, resp)
+	songID, err := uuid.Parse(r.PathValue("songId"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid songId")
+		return
+	}
+	if err := h.repo.AddSeed(r.Context(), userID, songID); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "add seed failed")
+		return
+	}
+	if h.svc != nil {
+		h.svc.ClearLastError(userID)
+	}
+	h.writeCurrent(w, r, userID)
+}
+
+// RemoveSeed drops one song from the user's seed set. Idempotent.
+// DELETE /api/queue/similar-mode/seeds/{songId}.
+func (h *Handler) RemoveSeed(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	songID, err := uuid.Parse(r.PathValue("songId"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid songId")
+		return
+	}
+	if err := h.repo.RemoveSeed(r.Context(), userID, songID); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "remove seed failed")
+		return
+	}
+	if h.svc != nil {
+		h.svc.ClearLastError(userID)
+	}
+	h.writeCurrent(w, r, userID)
+}
+
+// writeCurrent is the shared "reply with the current state"
+// tail of Set / AddSeed / RemoveSeed. Extracting it keeps the
+// three handlers in lockstep — all mutations return the full
+// freshly-read state including Seeds metadata.
+func (h *Handler) writeCurrent(w http.ResponseWriter, r *http.Request, _ uuid.UUID) {
+	// Delegate to Get's assembly logic. A second query is
+	// cheap; the alternative is reshaping Get's body into a
+	// helper + duplicating the error-handling wrapper.
+	h.Get(w, r)
+}
+
+// parseSeedList extracts the target seed-set slice from a
+// SimilarModeRequest. Multi (seedSongIds) wins over singular
+// (seedSongId) when both are present. Returns the parsed slice
+// or an error for malformed UUIDs.
+func parseSeedList(req SimilarModeRequest) ([]uuid.UUID, error) {
+	if len(req.SeedSongIDs) > 0 {
+		out := make([]uuid.UUID, 0, len(req.SeedSongIDs))
+		for _, s := range req.SeedSongIDs {
+			if s == "" {
+				continue
+			}
+			id, err := uuid.Parse(s)
+			if err != nil {
+				return nil, fmt.Errorf("invalid seedSongIds[]: %s", s)
+			}
+			out = append(out, id)
+		}
+		return out, nil
+	}
+	if req.SeedSongID != nil && *req.SeedSongID != "" {
+		id, err := uuid.Parse(*req.SeedSongID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid seedSongId")
+		}
+		return []uuid.UUID{id}, nil
+	}
+	return nil, nil
 }
 
 // BucketInfo is the JSON shape for one row in

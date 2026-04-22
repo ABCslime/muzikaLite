@@ -23,17 +23,18 @@ import (
 type PreferredGenres func(ctx context.Context, userID uuid.UUID) (bandcampTags, discogsGenres []string)
 
 // SimilarModeFunc is the v0.5 PR B refiller hook into the similarity
-// package. Returns the queue_songs ID the user picked as their
-// similar-mode seed, or uuid.Nil when similar mode is off.
+// package, generalized in v0.6 PR D to return the user's multi-seed
+// set instead of a single id. Empty slice = similar mode is off.
 //
-// When non-Nil, the refiller emits DiscoveryIntent{
-// Strategy=StrategySimilarSong, SeedSongID=<this>} for each needed
-// stub instead of the genre-random intent. The similarity worker
-// (similarity.Service) consumes those events.
+// When the slice is non-empty, the refiller picks ONE seed at
+// random per refill cycle (not per trigger — a single Trigger
+// emits `needed` intents, each with an independently sampled
+// seed). Over many cycles the queue blends contributions from
+// every seed in the user's set.
 //
 // Same function-type-not-interface rationale as PreferredGenres:
 // avoids queue → similarity cross-import; main.go wires the adapter.
-type SimilarModeFunc func(ctx context.Context, userID uuid.UUID) (seedSongID uuid.UUID)
+type SimilarModeFunc func(ctx context.Context, userID uuid.UUID) (seedSongIDs []uuid.UUID)
 
 // Refiller keeps each user's queue topped up to minQueueSize by publishing
 // DiscoveryIntent events (Strategy=StrategyRandom) when the queue is short.
@@ -151,26 +152,22 @@ func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 		return
 	}
 
-	// v0.5 PR B: per-user similar mode. Looked up ONCE per Trigger
-	// — same rationale as prefs. If the user has an active seed,
-	// every stub in this refill pass goes through similarity
-	// (StrategySimilarSong) instead of genre-random; the similarity
-	// worker picks one related candidate per intent.
-	//
-	// Mode set + seed song deleted between calls = uuid.Nil here
-	// (the migration's ON DELETE SET NULL handles this), and we
-	// fall through to the genre path. Same fall-through if the
-	// hook itself isn't wired.
-	var similarSeed uuid.UUID
+	// v0.5 PR B + v0.6 PR D: per-user similar mode. Looked up
+	// ONCE per Trigger — same rationale as prefs. Empty slice =
+	// off; the refiller takes the genre-random path for this
+	// refill pass. Otherwise we pick a random seed PER STUB so
+	// a single refill pass with multiple seeds blends them.
+	var similarSeeds []uuid.UUID
 	if r.similarMode != nil {
-		similarSeed = r.similarMode(ctx, userID)
+		similarSeeds = r.similarMode(ctx, userID)
 	}
+	similarOn := len(similarSeeds) > 0
 
 	// Look up per-user preferences once per Trigger rather than per stub —
 	// they don't change between stubs in the same refill pass. Skipped
 	// when similar mode is on; the genre path won't be taken.
 	var bandcampPrefs, discogsPrefs []string
-	if similarSeed == uuid.Nil && r.prefs != nil {
+	if !similarOn && r.prefs != nil {
 		bandcampPrefs, discogsPrefs = r.prefs(ctx, userID)
 	}
 
@@ -181,7 +178,7 @@ func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 		// append to this specific user's queue when the download completes
 		// — not to every user with a short queue.
 		var stubGenre string
-		if similarSeed == uuid.Nil {
+		if !similarOn {
 			stubGenre = r.pickGenre(r.pickSource(), bandcampPrefs, discogsPrefs)
 		}
 		if err := r.repo.InsertSongStub(ctx, stubID, stubGenre, userID); err != nil {
@@ -190,12 +187,19 @@ func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 		}
 
 		var ev bus.DiscoveryIntent
-		if similarSeed != uuid.Nil {
+		if similarOn {
+			// Random pick (not round-robin) across the seed set.
+			// Avoids the queue feeling like a predictable cycle of
+			// "seed1 pick, seed2 pick, seed3 pick, repeat" — random
+			// mixes the buckets into a believable blend.
+			r.mu.Lock()
+			seed := similarSeeds[r.rng.Intn(len(similarSeeds))]
+			r.mu.Unlock()
 			ev = bus.DiscoveryIntent{
 				SongID:     stubID,
 				UserID:     userID,
 				Strategy:   bus.StrategySimilarSong,
-				SeedSongID: similarSeed,
+				SeedSongID: seed,
 				// PreferredSources left nil — the similarity worker
 				// is the only subscriber for similar_song intents.
 			}

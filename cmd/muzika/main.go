@@ -211,18 +211,18 @@ func run() error {
 	}
 	simSvc.StartWorkers(ctx)
 
-	// Wire the refiller's similar-mode hook so each user's active
-	// seed (if any) routes refill cycles through the similarity
-	// worker. simRepo.SeedFor errors collapse to uuid.Nil = "no
-	// seed", which falls through to the existing genre path.
-	qSvc.Refiller().WithSimilarMode(func(ctx context.Context, userID uuid.UUID) uuid.UUID {
-		seed, err := simRepo.SeedFor(ctx, userID)
+	// Wire the refiller's similar-mode hook. v0.6: returns the
+	// full seed set; refiller random-picks one per stub. Errors
+	// collapse to an empty slice → refiller falls through to
+	// genre-random for that cycle.
+	qSvc.Refiller().WithSimilarMode(func(ctx context.Context, userID uuid.UUID) []uuid.UUID {
+		seeds, err := simRepo.SeedsFor(ctx, userID)
 		if err != nil {
-			log.Warn("similarity: SeedFor failed; falling back to genre",
+			log.Warn("similarity: SeedsFor failed; falling back to genre",
 				"err", err, "user_id", userID)
-			return uuid.Nil
+			return nil
 		}
-		return seed
+		return seeds
 	})
 
 	// ---- HTTP ----
@@ -344,6 +344,12 @@ func buildServer(
 	simH := similarity.NewHandler(simRepo, simSvc)
 	mux.Handle("GET /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Get)))
 	mux.Handle("POST /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Set)))
+	// v0.6 PR D: multi-seed add/remove. The POST on similar-mode
+	// replaces the entire set; these operate on one element at a
+	// time so the frontend's "+ add this song" / "× remove" UX is
+	// a single round-trip per action.
+	mux.Handle("POST /api/queue/similar-mode/seeds/{songId}", withAuth(http.HandlerFunc(simH.AddSeed)))
+	mux.Handle("DELETE /api/queue/similar-mode/seeds/{songId}", withAuth(http.HandlerFunc(simH.RemoveSeed)))
 	// v0.5 PR D: bucket registry + per-user weight tuning.
 	// Registry is read-only (code-owned); weights are per-user
 	// JSON merged with defaults at pick time.

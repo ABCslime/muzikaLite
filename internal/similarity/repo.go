@@ -20,60 +20,163 @@ type Repo struct{ db *sql.DB }
 // NewRepo wires a Repo. Pass nil for tests that stub the storage.
 func NewRepo(d *sql.DB) *Repo { return &Repo{db: d} }
 
-// SeedFor returns the user's currently active similar-mode seed
-// song id, or uuid.Nil if similar mode is off (no row OR NULL
-// seed_song_id). No-row and NULL-seed are deliberately collapsed
-// — the frontend doesn't care about the difference, and treating
-// them uniformly keeps the upsert simpler.
+// SeedsFor returns the user's current similar-mode seed set.
+// Empty slice = similar mode is off (user has no seeds queued).
+// Order is stable across calls (lexicographic on song UUID) —
+// matters because the singular seedSongId API field and the
+// random per-refill pick both derive from this list and both
+// should behave deterministically against a given set.
+func (r *Repo) SeedsFor(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	if r == nil || r.db == nil {
+		return nil, nil
+	}
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT song_id FROM user_similarity_seeds
+		 WHERE user_id = ? ORDER BY song_id`,
+		userID.String(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("similarity: list seeds: %w", err)
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, fmt.Errorf("similarity: scan seed: %w", err)
+		}
+		id, err := uuid.Parse(s)
+		if err != nil {
+			continue // defensive: skip malformed rows rather than fail
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// AddSeed appends a song to the user's seed set. Idempotent —
+// the PRIMARY KEY on (user_id, song_id) means a duplicate INSERT
+// is silently ignored. No-op on uuid.Nil.
+func (r *Repo) AddSeed(ctx context.Context, userID, songID uuid.UUID) error {
+	if r == nil || r.db == nil || songID == uuid.Nil {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO user_similarity_seeds (user_id, song_id)
+		 VALUES (?, ?)
+		 ON CONFLICT(user_id, song_id) DO NOTHING`,
+		userID.String(), songID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("similarity: add seed: %w", err)
+	}
+	return nil
+}
+
+// RemoveSeed drops one song from the seed set. No-op when the
+// seed wasn't in the set — no error, idempotent shape matches
+// AddSeed.
+func (r *Repo) RemoveSeed(ctx context.Context, userID, songID uuid.UUID) error {
+	if r == nil || r.db == nil || songID == uuid.Nil {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx,
+		`DELETE FROM user_similarity_seeds
+		 WHERE user_id = ? AND song_id = ?`,
+		userID.String(), songID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("similarity: remove seed: %w", err)
+	}
+	return nil
+}
+
+// ReplaceSeeds atomically overwrites the user's seed set with
+// `songIDs`. Pass nil or an empty slice to clear similar mode.
+// Duplicates in the input are tolerated (UNION the list before
+// INSERT).
+//
+// Atomic via a transaction so a partial failure can't leave the
+// set in a half-migrated state — the singular "set seedSongId"
+// API shape (backward compat) routes through here.
+func (r *Repo) ReplaceSeeds(ctx context.Context, userID uuid.UUID, songIDs []uuid.UUID) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("similarity: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // harmless after Commit
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM user_similarity_seeds WHERE user_id = ?`,
+		userID.String(),
+	); err != nil {
+		return fmt.Errorf("similarity: clear seeds: %w", err)
+	}
+	seen := make(map[uuid.UUID]struct{}, len(songIDs))
+	for _, id := range songIDs {
+		if id == uuid.Nil {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO user_similarity_seeds (user_id, song_id)
+			 VALUES (?, ?)`,
+			userID.String(), id.String(),
+		); err != nil {
+			return fmt.Errorf("similarity: insert seed: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("similarity: commit seeds: %w", err)
+	}
+	return nil
+}
+
+// SeedFor returns the first element of the user's seed set, or
+// uuid.Nil when the set is empty. Preserved for the singular
+// backward-compat API field (similar-mode GET's seedSongId) and
+// for callers that need a single representative seed.
+//
+// Order matches SeedsFor's stable sort — two calls return the
+// same "first" against an unchanged set.
 func (r *Repo) SeedFor(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
 	if r == nil || r.db == nil {
 		return uuid.Nil, nil
 	}
-	var raw sql.NullString
+	var raw string
 	err := r.db.QueryRowContext(ctx,
-		`SELECT seed_song_id FROM user_similarity_settings WHERE user_id = ?`,
+		`SELECT song_id FROM user_similarity_seeds
+		 WHERE user_id = ? ORDER BY song_id LIMIT 1`,
 		userID.String(),
 	).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return uuid.Nil, nil
 	}
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("similarity: read seed: %w", err)
+		return uuid.Nil, fmt.Errorf("similarity: read first seed: %w", err)
 	}
-	if !raw.Valid || raw.String == "" {
-		return uuid.Nil, nil
-	}
-	id, err := uuid.Parse(raw.String)
+	id, err := uuid.Parse(raw)
 	if err != nil {
 		return uuid.Nil, nil
 	}
 	return id, nil
 }
 
-// SetSeed sets (or clears with uuid.Nil) the user's similar-mode
-// seed. Upsert — one row per user, no history. Clearing on a row
-// that doesn't exist is a no-op (the SET NULL on a missing key is
-// the same observed state as no row).
+// SetSeed replaces the seed set with a single song (or clears
+// when seedSongID is uuid.Nil). Kept as a compat wrapper over
+// ReplaceSeeds so the v0.5 handler's "set one seed" behavior
+// still works unchanged during the frontend transition.
 func (r *Repo) SetSeed(ctx context.Context, userID, seedSongID uuid.UUID) error {
-	if r == nil || r.db == nil {
-		return nil
-	}
-	var seedArg any
 	if seedSongID == uuid.Nil {
-		seedArg = nil
-	} else {
-		seedArg = seedSongID.String()
+		return r.ReplaceSeeds(ctx, userID, nil)
 	}
-	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO user_similarity_settings (user_id, seed_song_id)
-		VALUES (?, ?)
-		ON CONFLICT(user_id) DO UPDATE SET seed_song_id = excluded.seed_song_id`,
-		userID.String(), seedArg,
-	)
-	if err != nil {
-		return fmt.Errorf("similarity: set seed: %w", err)
-	}
-	return nil
+	return r.ReplaceSeeds(ctx, userID, []uuid.UUID{seedSongID})
 }
 
 // WeightsFor satisfies similarity.WeightStore. Returns the

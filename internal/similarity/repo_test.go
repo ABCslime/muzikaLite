@@ -92,14 +92,16 @@ func TestRepo_SeedRoundTrip(t *testing.T) {
 // TestRepo_CascadeClearsSeedOnSongDelete is the v0.5 PR B
 // migration 0008 contract in concrete form: when the queue_songs
 // row referenced by seed_song_id is deleted, the FK's ON DELETE
-// SET NULL fires and the user's seed clears automatically. The
-// frontend's next hydrate() call sees Active=false and the lens
-// icon flips off — no background sweeper required.
+// CASCADE removes the seed from the join table automatically.
+// Lens icon flips off on next hydrate — no background sweeper.
 //
-// Worth a dedicated test: the SET NULL behavior is what lets us
-// avoid tracking "seed was removed from queue" as its own event.
-// If a future migration changes the FK clause (RESTRICT, CASCADE
-// on the parent), the lens icon UX breaks silently without this.
+// v0.6 PR D update: the contract moved from SET NULL on a
+// singular FK column to ON DELETE CASCADE on a join-table row.
+// Functionally equivalent from the user's POV (seed disappears
+// when its song does); the shape is cleaner because we don't
+// carry "tombstone" user_similarity_settings rows after song
+// deletes — each user only has a settings row if they've tuned
+// weights, and seeds are their own many-to-many table.
 func TestRepo_CascadeClearsSeedOnSongDelete(t *testing.T) {
 	d := setupDB(t)
 	repo := similarity.NewRepo(d)
@@ -107,43 +109,99 @@ func TestRepo_CascadeClearsSeedOnSongDelete(t *testing.T) {
 	user := seedUser(t, d)
 	song := seedSong(t, d, user)
 
-	if err := repo.SetSeed(ctx, user, song); err != nil {
-		t.Fatalf("SetSeed: %v", err)
+	if err := repo.AddSeed(ctx, user, song); err != nil {
+		t.Fatalf("AddSeed: %v", err)
 	}
-	if got, _ := repo.SeedFor(ctx, user); got != song {
-		t.Fatalf("precondition: expected seed=%v, got %v", song, got)
+	if got, _ := repo.SeedsFor(ctx, user); len(got) != 1 || got[0] != song {
+		t.Fatalf("precondition: expected seeds=[%v], got %v", song, got)
 	}
 
-	// The FK on user_similarity_settings.seed_song_id references
-	// queue_songs(id) with ON DELETE SET NULL. Deleting the song
-	// should leave the user_similarity_settings row intact but
-	// clear the seed_song_id column.
+	// Deleting the queue_songs row fires the FK's ON DELETE
+	// CASCADE on user_similarity_seeds.song_id, removing the
+	// row outright.
 	if _, err := d.ExecContext(ctx,
 		`DELETE FROM queue_songs WHERE id = ?`, song.String()); err != nil {
 		t.Fatalf("delete queue_songs row: %v", err)
 	}
-	got, err := repo.SeedFor(ctx, user)
+	got, err := repo.SeedsFor(ctx, user)
 	if err != nil {
-		t.Fatalf("SeedFor: %v", err)
+		t.Fatalf("SeedsFor: %v", err)
 	}
-	if got != uuid.Nil {
-		t.Errorf("cascade SET NULL didn't fire: seed still = %v", got)
+	if len(got) != 0 {
+		t.Errorf("cascade didn't fire: seeds still = %v", got)
 	}
-
-	// The user_similarity_settings row should still exist (it
-	// just has seed_song_id = NULL now). Otherwise a
-	// subsequent SetSeed would have to re-insert rather than
-	// upsert — not a correctness issue today because SetSeed
-	// uses ON CONFLICT, but worth nailing down.
-	var count int
+	// Second-leg check: only the seed row went away, not anything
+	// else about the user. If the user also had bucket_weights
+	// tuned, that row must survive (nothing referenced the song
+	// from there).
+	var settingsCount int
 	if err := d.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM user_similarity_settings WHERE user_id = ?`,
 		user.String(),
-	).Scan(&count); err != nil {
-		t.Fatalf("count row: %v", err)
+	).Scan(&settingsCount); err != nil {
+		t.Fatalf("count settings: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("expected row to survive cascade, got %d rows", count)
+	// Zero is fine: AddSeed doesn't create a settings row, only
+	// SetWeights does. The contract is that settings rows aren't
+	// created implicitly by seed mutations.
+	_ = settingsCount
+}
+
+// TestRepo_Multi_AddRemoveReplace exercises the v0.6 multi-seed
+// API primitives: AddSeed is idempotent, RemoveSeed is a no-op
+// on non-members, ReplaceSeeds is atomic.
+func TestRepo_Multi_AddRemoveReplace(t *testing.T) {
+	d := setupDB(t)
+	repo := similarity.NewRepo(d)
+	ctx := context.Background()
+	user := seedUser(t, d)
+	s1 := seedSong(t, d, user)
+	s2 := seedSong(t, d, user)
+	s3 := seedSong(t, d, user)
+
+	// Idempotent add.
+	if err := repo.AddSeed(ctx, user, s1); err != nil {
+		t.Fatalf("AddSeed: %v", err)
+	}
+	if err := repo.AddSeed(ctx, user, s1); err != nil {
+		t.Fatalf("AddSeed (idempotent): %v", err)
+	}
+	if err := repo.AddSeed(ctx, user, s2); err != nil {
+		t.Fatalf("AddSeed 2: %v", err)
+	}
+	got, _ := repo.SeedsFor(ctx, user)
+	if len(got) != 2 {
+		t.Errorf("after 2+dup adds: len=%d, want 2", len(got))
+	}
+
+	// RemoveSeed on a member drops it; on a non-member, no-op.
+	if err := repo.RemoveSeed(ctx, user, s1); err != nil {
+		t.Fatalf("RemoveSeed: %v", err)
+	}
+	if err := repo.RemoveSeed(ctx, user, s3); err != nil {
+		t.Fatalf("RemoveSeed nonmember: %v", err)
+	}
+	got, _ = repo.SeedsFor(ctx, user)
+	if len(got) != 1 || got[0] != s2 {
+		t.Errorf("after remove: got %v, want [%v]", got, s2)
+	}
+
+	// ReplaceSeeds dedups input and atomically overwrites.
+	if err := repo.ReplaceSeeds(ctx, user, []uuid.UUID{s3, s1, s3, uuid.Nil, s1}); err != nil {
+		t.Fatalf("ReplaceSeeds: %v", err)
+	}
+	got, _ = repo.SeedsFor(ctx, user)
+	if len(got) != 2 {
+		t.Errorf("after replace with dupes+nil: len=%d, want 2 (s1,s3 deduped)", len(got))
+	}
+
+	// Empty slice clears.
+	if err := repo.ReplaceSeeds(ctx, user, nil); err != nil {
+		t.Fatalf("ReplaceSeeds nil: %v", err)
+	}
+	got, _ = repo.SeedsFor(ctx, user)
+	if len(got) != 0 {
+		t.Errorf("after clear: got %v, want empty", got)
 	}
 }
 

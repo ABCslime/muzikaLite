@@ -150,6 +150,54 @@
               />
             </svg>
           </button>
+
+          <!-- v0.5 PR B: similar-mode toggle. Lens icon next to
+               like, peer in shape: outline=off, filled=on. Click
+               re-seeds to whatever's playing right now. Disabled
+               while there's no current song or a request is in
+               flight. -->
+          <button
+            @click="handleSimilarToggle"
+            :disabled="!playerStore.currentSong || similarStore.pending"
+            class="transition-colors"
+            :class="{
+              'text-vibrant-pink hover:text-vibrant-pink-light': similarFromCurrent,
+              'text-gray-400 hover:text-white': !similarFromCurrent && playerStore.currentSong,
+              'text-gray-700 cursor-not-allowed': !playerStore.currentSong,
+            }"
+            :title="similarTooltip"
+          >
+            <svg
+              v-if="similarFromCurrent"
+              class="w-5 h-5"
+              fill="currentColor"
+              viewBox="0 0 20 20"
+            >
+              <!-- filled magnifying glass = similar mode is on
+                   for the currently playing song. -->
+              <path
+                fill-rule="evenodd"
+                d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z"
+                clip-rule="evenodd"
+              />
+            </svg>
+            <svg
+              v-else
+              class="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <!-- outline magnifying glass = off, or seeded by a
+                   different song than what's currently playing. -->
+              <path
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="2"
+                d="M21 21l-4.35-4.35M11 18a7 7 0 100-14 7 7 0 000 14z"
+              />
+            </svg>
+          </button>
         </div>
 
         <!-- Progress Bar -->
@@ -209,11 +257,13 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { usePlayerStore } from '@/stores/player'
+import { useSimilarStore } from '@/stores/similar'
 import { formatTime } from '@/utils/formatTime'
 import { getSongTitle, getSongArtist, getSongImage } from '@/utils/songHelpers'
 import { goToArtistByName } from '@/utils/navigation'
 
 const router = useRouter()
+const similarStore = useSimilarStore()
 
 const playerStore = usePlayerStore()
 const audioElement = ref(null)
@@ -244,10 +294,36 @@ const handleImageError = () => {
   imageError.value = true
 }
 
+// v0.5 PR B — similar-mode lens. "Lit" only when the active
+// seed matches the currently-playing song (same-seed-different-
+// song case shows outline so the user can tell they need to
+// click to re-seed, rather than seeing it lit and assuming the
+// queue is following the current track).
+const similarFromCurrent = computed(() =>
+  similarStore.active &&
+  playerStore.currentSong?.id &&
+  similarStore.seedSongId === playerStore.currentSong.id,
+)
+
+const similarTooltip = computed(() => {
+  if (!playerStore.currentSong) return 'Play a song first'
+  if (similarFromCurrent.value) return 'Stop similar mode'
+  if (similarStore.active) return 'Re-seed similar mode with this song'
+  return 'Fill queue with similar songs'
+})
+
+async function handleSimilarToggle() {
+  if (!playerStore.currentSong?.id) return
+  await similarStore.toggleForSong(playerStore.currentSong.id)
+}
+
 onMounted(() => {
   if (audioElement.value) {
     playerStore.setAudioElement(audioElement.value)
   }
+  // Hydrate from backend so the lens shows the right state on
+  // page reload — the user might have left similar mode on.
+  similarStore.hydrate()
 })
 
 onUnmounted(() => {

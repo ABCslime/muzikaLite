@@ -185,6 +185,21 @@ export const queueAPI = {
   // Legacy shape (auto-pick on the backend) still supported: pass just
   // { query }. Kept so scripted clients continue to work, but the UI
   // uses preview + acquire.
+  // v0.5 PR B — read the user's active similar-mode seed.
+  // Response shape: {seedSongId: "uuid"|null, active: bool}.
+  async getSimilarMode() {
+    const response = await client.get(`${API_URLS.QUEUE}/similar-mode`)
+    return response.data
+  },
+
+  // Set or clear the seed. Pass null/undefined to clear.
+  async setSimilarMode(seedSongId) {
+    const response = await client.post(`${API_URLS.QUEUE}/similar-mode`, {
+      seedSongId: seedSongId || null,
+    })
+    return response.data
+  },
+
   async searchAndQueue(candidate) {
     try {
       const response = await client.post(`${API_URLS.QUEUE}/search`, candidate)

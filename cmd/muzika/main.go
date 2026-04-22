@@ -30,6 +30,7 @@ import (
 	"github.com/macabc/muzika/internal/queue"
 	"github.com/macabc/muzika/internal/search"
 	"github.com/macabc/muzika/internal/similarity"
+	discogsbuckets "github.com/macabc/muzika/internal/similarity/buckets/discogs"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
@@ -160,17 +161,19 @@ func run() error {
 	}
 	previewer := search.NewPreviewer(dgClient).WithSoulseek(sk)
 
-	// ---- Similarity service (v0.5 PR A scaffolding) ----
+	// ---- Similarity service (v0.5 PR B) ----
 	//
-	// Empty bucket registry on PR A — Service.NextPick returns
-	// ErrNoCandidates and the refiller (when wired in PR B) will
-	// fall back to genre-random. PR B registers the first two
-	// Discogs buckets; PR C the remaining three.
+	// Continuous similar-mode refill source. simQueueAdapter
+	// bridges to queue.Service + discogs.Client without an
+	// import cycle (mirrors playlist.AlbumExpander pattern).
+	// PR B registers two buckets (same_artist, same_label_era);
+	// PR C adds three more.
 	//
-	// All cross-domain wiring goes through the small adapter types
-	// at the bottom of this file, mirroring the playlist.AlbumExpander
-	// pattern so internal/similarity stays free of queue imports.
-	simAdapter := &simQueueAdapter{q: qSvc}
+	// Buckets are skipped when Discogs isn't configured — they'd
+	// have nothing to query — and similar mode just returns no
+	// candidates, falling back to the genre path.
+	simRepo := similarity.NewRepo(database)
+	simAdapter := &simQueueAdapter{q: qSvc, dg: dgClient}
 	simSvc := similarity.NewService(similarity.Config{
 		SeedReader:   simAdapter,
 		SongAcquirer: simAdapter,
@@ -178,10 +181,32 @@ func run() error {
 		Bus:          b,
 		Discovery:    logw,
 	})
+	if dgClient != nil {
+		simSvc.Register(discogsbuckets.NewSameArtist(dgClient))
+		simSvc.Register(discogsbuckets.NewSameLabelEra(dgClient))
+		log.Info("similarity: registered Discogs buckets",
+			"buckets", len(simSvc.Buckets()))
+	} else {
+		log.Info("similarity: no Discogs client; running with empty bucket registry")
+	}
 	simSvc.StartWorkers(ctx)
 
+	// Wire the refiller's similar-mode hook so each user's active
+	// seed (if any) routes refill cycles through the similarity
+	// worker. simRepo.SeedFor errors collapse to uuid.Nil = "no
+	// seed", which falls through to the existing genre path.
+	qSvc.Refiller().WithSimilarMode(func(ctx context.Context, userID uuid.UUID) uuid.UUID {
+		seed, err := simRepo.SeedFor(ctx, userID)
+		if err != nil {
+			log.Warn("similarity: SeedFor failed; falling back to genre",
+				"err", err, "user_id", userID)
+			return uuid.Nil
+		}
+		return seed
+	})
+
 	// ---- HTTP ----
-	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer)
+	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer, simRepo)
 	go func() {
 		log.Info("http listening", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -216,6 +241,7 @@ func buildServer(
 	q *queue.Service,
 	pref *preferences.Service,
 	previewer *search.Previewer,
+	simRepo *similarity.Repo,
 ) *http.Server {
 	mux := http.NewServeMux()
 
@@ -282,6 +308,14 @@ func buildServer(
 	mux.Handle("GET /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.IsLiked)))
 	mux.Handle("POST /api/queue/songs/{id}/liked", withAuth(http.HandlerFunc(qH.Like)))
 	mux.Handle("POST /api/queue/songs/{id}/unliked", withAuth(http.HandlerFunc(qH.Unlike)))
+
+	// --- Similar mode toggle (v0.5 PR B) ---
+	// GET returns the user's active seed (or null); POST sets it
+	// (or clears with seedSongId=null). Refiller reads the same
+	// state on each Trigger via the SimilarMode hook wired above.
+	simH := similarity.NewHandler(simRepo)
+	mux.Handle("GET /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Get)))
+	mux.Handle("POST /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Set)))
 
 	// --- User preferences (v0.4.1 PR A) ---
 	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))
@@ -400,34 +434,62 @@ func (a *albumExpander) ReprobeNotFoundTrack(ctx context.Context, userID uuid.UU
 
 // simQueueAdapter implements similarity.SeedReader,
 // similarity.SongAcquirer, and similarity.QueueDeduper against
-// the existing queue.Service + queue.Repo. v0.5 PR A — same
-// adapter pattern as albumExpander, keeping internal/similarity
-// free of internal/queue imports.
-//
-// PR A wires the adapter and exercises the SongAcquirer +
-// QueueDeduper paths (zero callers today). PR B starts using
-// SeedReader to hydrate Discogs IDs from the seed song's
-// (title, artist).
+// the existing queue.Service + queue.Repo + discogs.Client.
+// Mirrors the playlist.AlbumExpander pattern — keeps
+// internal/similarity free of internal/queue + internal/discogs
+// imports.
 type simQueueAdapter struct {
-	q *queue.Service
+	q  *queue.Service
+	dg *discogs.Client // nil → no hydration; buckets receive a partial Seed
 }
 
-// ReadSeed populates a similarity.Seed from queue_songs metadata.
-// PR A returns title + artist + image only; PR B will also resolve
-// the Discogs release ID + extract the similarity features
-// (artist ID, label ID, year, styles, genres, collaborators) so
-// buckets have something to work from.
+// ReadSeed pulls (title, artist) from queue_songs and, when
+// Discogs is configured, resolves the matching Discogs release
+// to populate the similarity features the buckets need
+// (artist_id, label_id, year, styles, genres, collaborators).
+//
+// Hydration is best-effort: a Discogs miss returns a partial
+// Seed with just title+artist set. Buckets bail out gracefully
+// on zero IDs and the engine collapses an empty fan-out into
+// ErrNoCandidates / ErrSeedUnknown — refiller falls back to
+// genre-random for that cycle.
+//
+// Cache fully amortized: search hit + release detail hit are
+// both cached for 30 days, so subsequent refills with the same
+// seed cost zero Discogs API calls.
 func (a *simQueueAdapter) ReadSeed(ctx context.Context, userID, songID uuid.UUID) (similarity.Seed, error) {
 	sg, err := a.q.Repo().GetSong(ctx, songID)
 	if err != nil {
 		return similarity.Seed{SongID: songID, UserID: userID}, err
 	}
-	return similarity.Seed{
+	seed := similarity.Seed{
 		SongID: songID,
 		UserID: userID,
 		Title:  sg.Title,
 		Artist: sg.Artist,
-	}, nil
+	}
+	if a.dg == nil || sg.Title == "" || sg.Artist == "" {
+		return seed, nil
+	}
+	// Step 1: resolve title+artist → Discogs release id.
+	// Cached search call; subsequent refills are free.
+	hit, err := a.dg.SearchQuery(ctx, sg.Artist+" "+sg.Title)
+	if err != nil || hit.ID == 0 {
+		return seed, nil
+	}
+	seed.DiscogsReleaseID = hit.ID
+	// Step 2: full release detail → features. Also cached.
+	rd, err := a.dg.Release(ctx, hit.ID)
+	if err != nil {
+		return seed, nil
+	}
+	seed.DiscogsArtistID = rd.ArtistID
+	seed.DiscogsLabelID = rd.LabelID
+	seed.Year = rd.Year
+	seed.Styles = rd.Styles
+	seed.Genres = rd.Genres
+	seed.Collaborators = rd.Collaborators
+	return seed, nil
 }
 
 // AcquireForUser routes a similarity pick through the existing

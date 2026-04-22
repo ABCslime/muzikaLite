@@ -22,6 +22,19 @@ import (
 // over *preferences.Service.
 type PreferredGenres func(ctx context.Context, userID uuid.UUID) (bandcampTags, discogsGenres []string)
 
+// SimilarModeFunc is the v0.5 PR B refiller hook into the similarity
+// package. Returns the queue_songs ID the user picked as their
+// similar-mode seed, or uuid.Nil when similar mode is off.
+//
+// When non-Nil, the refiller emits DiscoveryIntent{
+// Strategy=StrategySimilarSong, SeedSongID=<this>} for each needed
+// stub instead of the genre-random intent. The similarity worker
+// (similarity.Service) consumes those events.
+//
+// Same function-type-not-interface rationale as PreferredGenres:
+// avoids queue → similarity cross-import; main.go wires the adapter.
+type SimilarModeFunc func(ctx context.Context, userID uuid.UUID) (seedSongID uuid.UUID)
+
 // Refiller keeps each user's queue topped up to minQueueSize by publishing
 // DiscoveryIntent events (Strategy=StrategyRandom) when the queue is short.
 // On-demand only — callers invoke Trigger after queue-mutating HTTP handlers;
@@ -51,9 +64,18 @@ type Refiller struct {
 	discogsEnabled       bool
 	discogsWeight        float64 // P(discogs) when enabled; 1 - P = P(bandcamp)
 	prefs                PreferredGenres
+	similarMode          SimilarModeFunc // nil = similar mode disabled (v0.5 PR B)
 
 	mu  sync.Mutex
 	rng *rand.Rand
+}
+
+// WithSimilarMode wires the v0.5 PR B similar-mode hook. nil
+// (the default) leaves the refiller on its existing genre-random
+// path. Returns the receiver for chaining at construction.
+func (r *Refiller) WithSimilarMode(fn SimilarModeFunc) *Refiller {
+	r.similarMode = fn
+	return r
 }
 
 // NewRefiller constructs a Refiller with Bandcamp as the sole source and
@@ -129,32 +151,65 @@ func (r *Refiller) Trigger(ctx context.Context, userID uuid.UUID) {
 		return
 	}
 
+	// v0.5 PR B: per-user similar mode. Looked up ONCE per Trigger
+	// — same rationale as prefs. If the user has an active seed,
+	// every stub in this refill pass goes through similarity
+	// (StrategySimilarSong) instead of genre-random; the similarity
+	// worker picks one related candidate per intent.
+	//
+	// Mode set + seed song deleted between calls = uuid.Nil here
+	// (the migration's ON DELETE SET NULL handles this), and we
+	// fall through to the genre path. Same fall-through if the
+	// hook itself isn't wired.
+	var similarSeed uuid.UUID
+	if r.similarMode != nil {
+		similarSeed = r.similarMode(ctx, userID)
+	}
+
 	// Look up per-user preferences once per Trigger rather than per stub —
-	// they don't change between stubs in the same refill pass.
+	// they don't change between stubs in the same refill pass. Skipped
+	// when similar mode is on; the genre path won't be taken.
 	var bandcampPrefs, discogsPrefs []string
-	if r.prefs != nil {
+	if similarSeed == uuid.Nil && r.prefs != nil {
 		bandcampPrefs, discogsPrefs = r.prefs(ctx, userID)
 	}
 
 	for i := 0; i < needed; i++ {
 		stubID := uuid.New()
-		source := r.pickSource()
-		genre := r.pickGenre(source, bandcampPrefs, discogsPrefs)
 
 		// requesting_user_id is stamped on the stub so onLoadedSong can
 		// append to this specific user's queue when the download completes
 		// — not to every user with a short queue.
-		if err := r.repo.InsertSongStub(ctx, stubID, genre, userID); err != nil {
+		var stubGenre string
+		if similarSeed == uuid.Nil {
+			stubGenre = r.pickGenre(r.pickSource(), bandcampPrefs, discogsPrefs)
+		}
+		if err := r.repo.InsertSongStub(ctx, stubID, stubGenre, userID); err != nil {
 			r.log.Error("refiller: insert stub", "err", err, "user_id", userID)
 			continue
 		}
-		ev := bus.DiscoveryIntent{
-			SongID:           stubID,
-			UserID:           userID,
-			Strategy:         bus.StrategyRandom,
-			Genre:            genre,
-			PreferredSources: source,
+
+		var ev bus.DiscoveryIntent
+		if similarSeed != uuid.Nil {
+			ev = bus.DiscoveryIntent{
+				SongID:     stubID,
+				UserID:     userID,
+				Strategy:   bus.StrategySimilarSong,
+				SeedSongID: similarSeed,
+				// PreferredSources left nil — the similarity worker
+				// is the only subscriber for similar_song intents.
+			}
+		} else {
+			source := r.pickSource()
+			ev = bus.DiscoveryIntent{
+				SongID:           stubID,
+				UserID:           userID,
+				Strategy:         bus.StrategyRandom,
+				Genre:            stubGenre,
+				PreferredSources: source,
+			}
 		}
+
 		// Request events publish directly with a short timeout — if the
 		// subscriber channel is full, the refiller will re-observe the short
 		// queue on the next Trigger call and re-emit.

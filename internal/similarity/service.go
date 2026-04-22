@@ -141,13 +141,77 @@ func (s *Service) StartWorkers(ctx context.Context) {
 // silently (the bandcamp + discogs seeders handle the other
 // strategies — same fan-out pattern as the rest of the system).
 //
-// v0.5 PR A: logs and no-ops. PR B: drives NextPick + acquire.
-func (s *Service) onDiscoveryIntent(_ context.Context, ev bus.DiscoveryIntent) error {
+// Mirrors the discogs seeder's onDiscoveryIntent shape: a stub
+// has already been inserted by the refiller and lives at
+// ev.SongID. Our job is to pick a (title, artist) and publish
+// RequestDownload back at the same SongID. The download worker
+// + queue.onRequestDownload handle the rest exactly as for any
+// other seeded intent.
+//
+// On ErrNoCandidates / ErrSeedUnknown we publish a
+// LoadedSong{Error} so queue.onLoadedSong reaps the orphaned
+// stub — same cleanup contract bandcamp + discogs already use
+// for "this seeder couldn't pick anything."
+func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent) error {
 	if ev.Strategy != bus.StrategySimilarSong {
 		return nil
 	}
-	s.log.Debug("similarity: received intent (no-op until PR B)",
-		"user_id", ev.UserID, "seed_song_id", ev.SeedSongID)
+	if ev.SeedSongID == uuid.Nil {
+		return s.cleanupOrphanedStub(ctx, ev.SongID, "similar intent missing seed_song_id")
+	}
+
+	picked, err := s.NextPick(ctx, ev.UserID, ev.SeedSongID)
+	if err != nil {
+		// ErrSeedUnknown / ErrNoCandidates: not exceptional. Just
+		// reap the stub and let the refiller observe-short-queue +
+		// re-trigger on the next cycle. The user's frontend may
+		// eventually flip the lens off in a future PR; for now the
+		// next click on the lens with a different seed recovers.
+		s.log.Debug("similarity: pick failed",
+			"err", err, "seed_song_id", ev.SeedSongID, "user_id", ev.UserID)
+		return s.cleanupOrphanedStub(ctx, ev.SongID, err.Error())
+	}
+
+	out := bus.RequestDownload{
+		SongID:   ev.SongID,
+		Title:    picked.Title,
+		Artist:   picked.Artist,
+		Strategy: bus.StrategySimilarSong,
+		ImageURL: picked.ImageURL,
+	}
+	if err := bus.Publish(ctx, s.bus, out, bus.PublishOpts{}); err != nil {
+		s.log.Warn("similarity: publish RequestDownload failed",
+			"err", err, "song_id", ev.SongID)
+		return err
+	}
+	return nil
+}
+
+// cleanupOrphanedStub publishes a LoadedSong{Error} so queue's
+// onLoadedSong handler deletes the unfilled stub. Mirrors the
+// failure path in discogs/worker.go (emitLoadedError) without
+// importing it. We keep this private; only the on-intent failure
+// path needs it.
+func (s *Service) cleanupOrphanedStub(ctx context.Context, songID uuid.UUID, reason string) error {
+	if s.bus == nil {
+		return nil
+	}
+	s.log.Debug("similarity: reaping orphaned stub",
+		"song_id", songID, "reason", reason)
+	ev := bus.LoadedSong{
+		SongID: songID,
+		Status: bus.LoadedStatusError,
+	}
+	// Direct publish (not via outbox): we don't have a tx in scope
+	// here, and the Error status only triggers a delete — at-most-
+	// once is fine for cleanup. If the publish itself fails we'll
+	// have one orphaned row in queue_songs; the refiller's existing
+	// "count entries" arithmetic still works because orphans aren't
+	// in queue_entries.
+	if err := bus.Publish(ctx, s.bus, ev, bus.PublishOpts{}); err != nil {
+		s.log.Warn("similarity: cleanup publish failed",
+			"err", err, "song_id", songID)
+	}
 	return nil
 }
 

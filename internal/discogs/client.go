@@ -286,6 +286,7 @@ func buildResult(r releaseResult) (SearchResult, bool) {
 		CatalogNumber: firstCatno(r.CatalogNumber),
 		Year:          parseYear(r.Year),
 		Thumb:         r.Thumb,
+		ID:            r.ID,
 	}, true
 }
 
@@ -502,6 +503,34 @@ type ReleaseDetail struct {
 	Thumb         string
 	Cover         string
 	Tracks        []Track
+
+	// v0.5: features used by similarity hydration. All optional —
+	// missing fields stay zero/empty and similarity buckets that
+	// need them bail out gracefully on zero IDs / empty slices.
+
+	// ArtistID is the primary artist's Discogs ID (artists[0].id).
+	// 0 when the release has no resolved primary artist (rare;
+	// most releases credit at least one).
+	ArtistID int
+
+	// LabelID is the primary label's Discogs ID (labels[0].id).
+	// 0 on white-label / not-on-label releases.
+	LabelID int
+
+	// Styles is the Discogs sub-genre vocabulary applied to the
+	// release ("House", "Detroit Techno", "Vaporwave"). Often
+	// 0-3 entries. Empty for under-tagged releases.
+	Styles []string
+
+	// Genres is the Discogs broad genre vocabulary ("Electronic",
+	// "Rock"). Usually 1 entry. Empty rare.
+	Genres []string
+
+	// Collaborators are Discogs IDs of extraartists credited on
+	// this release (vocalists, producers, remixers), excluding the
+	// primary Artists[]. Used by the same-collaborators bucket in
+	// PR C. Empty when the release has no extra credits.
+	Collaborators []int
 }
 
 // Track is one row in a release's tracklist.
@@ -832,9 +861,11 @@ func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 		Year    int    `json:"year"`
 		Thumb   string `json:"thumb"`
 		Artists []struct {
+			ID   int    `json:"id"`
 			Name string `json:"name"`
 		} `json:"artists"`
 		Labels []struct {
+			ID    int    `json:"id"`
 			Name  string `json:"name"`
 			Catno string `json:"catno"`
 		} `json:"labels"`
@@ -843,6 +874,15 @@ func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 			Title    string `json:"title"`
 			Duration string `json:"duration"`
 		} `json:"tracklist"`
+		// v0.5: similarity hydration fields. styles[] are the
+		// Discogs sub-genres ("House"); genres[] are the broad
+		// vocabulary ("Electronic"). extraartists[].id are
+		// non-primary credits we treat as collaborators.
+		Styles       []string `json:"styles"`
+		Genres       []string `json:"genres"`
+		ExtraArtists []struct {
+			ID int `json:"id"`
+		} `json:"extraartists"`
 		// Discogs release responses include an "images" array where
 		// one entry has type=="primary" (front cover) and the rest
 		// are type=="secondary" (back, inner, etc). Each has
@@ -881,9 +921,33 @@ func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 		}
 	}
 	out.Artist = strings.Join(names, " & ")
+	if len(resp.Artists) > 0 {
+		out.ArtistID = resp.Artists[0].ID
+	}
 	if len(resp.Labels) > 0 {
 		out.Label = strings.TrimSpace(resp.Labels[0].Name)
 		out.CatalogNumber = firstCatno(resp.Labels[0].Catno)
+		out.LabelID = resp.Labels[0].ID
+	}
+	out.Styles = resp.Styles
+	out.Genres = resp.Genres
+	if len(resp.ExtraArtists) > 0 {
+		out.Collaborators = make([]int, 0, len(resp.ExtraArtists))
+		seenCollab := make(map[int]struct{}, len(resp.ExtraArtists))
+		for _, ea := range resp.ExtraArtists {
+			if ea.ID <= 0 {
+				continue
+			}
+			if _, dup := seenCollab[ea.ID]; dup {
+				continue
+			}
+			// Don't list the primary artist as their own collaborator.
+			if ea.ID == out.ArtistID {
+				continue
+			}
+			seenCollab[ea.ID] = struct{}{}
+			out.Collaborators = append(out.Collaborators, ea.ID)
+		}
 	}
 	for _, t := range resp.Tracklist {
 		title := strings.TrimSpace(t.Title)
@@ -922,6 +986,11 @@ type searchResponse struct {
 }
 
 type releaseResult struct {
+	// ID is the Discogs release ID. Populated on /database/search
+	// responses (every result includes it). v0.5: hydration uses
+	// this to follow up with /releases/{id} for the similarity
+	// feature extraction.
+	ID int `json:"id"`
 	// Title is "Artist - Release" by Discogs convention.
 	Title string `json:"title"`
 	// CatalogNumber can be "" or "CAT-001, CAT-002" (comma-separated). We

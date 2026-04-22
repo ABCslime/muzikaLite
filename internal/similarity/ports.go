@@ -6,15 +6,22 @@ import (
 	"github.com/google/uuid"
 )
 
-// SeedReader resolves a queue_songs row to the (title, artist)
-// pair that anchors a similar-mode session. Implemented in
-// cmd/muzika/main.go by an adapter over queue.Service so this
-// package doesn't import queue.
+// SeedReader resolves a queue_songs row to a fully-hydrated Seed
+// ready for the engine: title + artist from queue_songs, plus
+// the optional Discogs-derived features (release/artist/label
+// IDs, year, styles, genres, collaborators) used by the buckets.
 //
-// Returns the zero Seed (with SongID, UserID set) if the row is
-// missing or has no usable metadata — the caller decides how to
-// surface that to the user (typically: "couldn't find this on
-// Discogs — try another seed").
+// Implemented in cmd/muzika/main.go by an adapter over
+// queue.Service + discogs.Client so this package doesn't import
+// either. The adapter does the Discogs resolution; the engine
+// stays I/O-free.
+//
+// Hydration policy: hard-fail only when the queue_songs row
+// itself is missing. A successful read with no Discogs match
+// returns a partial Seed (Title + Artist set, Discogs IDs zero)
+// — buckets that need Discogs IDs bail out gracefully on zero,
+// and the engine returns ErrSeedUnknown when no bucket produced
+// anything.
 type SeedReader interface {
 	ReadSeed(ctx context.Context, userID, songID uuid.UUID) (Seed, error)
 }

@@ -205,6 +205,48 @@ func TestRepo_Multi_AddRemoveReplace(t *testing.T) {
 	}
 }
 
+// TestRepo_GraphNodeLimitRoundTrip covers the v0.7 PR C graph
+// settings path: read default (0 = use fallback), set a value,
+// read it back, clear via 0. Range clamping (values >
+// MaxGraphLimit saturate at the cap) is tested explicitly — a
+// client sending 9999 shouldn't smuggle a huge Discogs fan-out.
+func TestRepo_GraphNodeLimitRoundTrip(t *testing.T) {
+	d := setupDB(t)
+	repo := similarity.NewRepo(d)
+	ctx := context.Background()
+	user := seedUser(t, d)
+
+	got, err := repo.GraphNodeLimit(ctx, user)
+	if err != nil || got != 0 {
+		t.Fatalf("fresh user: got (%d, %v), want (0, nil)", got, err)
+	}
+	if err := repo.SetGraphNodeLimit(ctx, user, 12); err != nil {
+		t.Fatalf("SetGraphNodeLimit: %v", err)
+	}
+	got, _ = repo.GraphNodeLimit(ctx, user)
+	if got != 12 {
+		t.Errorf("after set: got %d, want 12", got)
+	}
+
+	// Clamp-on-write: 9999 should land as MaxGraphLimit (30).
+	if err := repo.SetGraphNodeLimit(ctx, user, 9999); err != nil {
+		t.Fatalf("SetGraphNodeLimit clamp: %v", err)
+	}
+	got, _ = repo.GraphNodeLimit(ctx, user)
+	if got != similarity.MaxGraphLimit {
+		t.Errorf("clamp: got %d, want %d", got, similarity.MaxGraphLimit)
+	}
+
+	// Clear via 0 / negative.
+	if err := repo.SetGraphNodeLimit(ctx, user, 0); err != nil {
+		t.Fatalf("SetGraphNodeLimit clear: %v", err)
+	}
+	got, _ = repo.GraphNodeLimit(ctx, user)
+	if got != 0 {
+		t.Errorf("after clear: got %d, want 0", got)
+	}
+}
+
 // TestRepo_WeightsRoundTrip exercises PR D's bucket_weights JSON
 // path: empty → set → read → clear. Negative values clamp to 0
 // on write (the engine also clamps on read, but cleaning both

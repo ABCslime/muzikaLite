@@ -48,10 +48,27 @@ export const similarityAPI = {
   // Cytoscape-shaped with the center at Nodes[0]. Cheap per-
   // call against the Discogs cache; safe to refetch on every
   // currentSong change.
-  async getGraph(songId, limit = 8) {
-    const response = await client.get('/api/similarity/graph', {
-      params: { songId, limit },
-    })
+  //
+  // limit omitted → backend uses the user's saved setting (or
+  // DefaultGraphLimit when the user hasn't tuned one). Pass
+  // limit explicitly only for one-off overrides (e.g., a
+  // future "expand graph" button).
+  async getGraph(songId, limit) {
+    const params = { songId }
+    if (limit) params.limit = limit
+    const response = await client.get('/api/similarity/graph', { params })
+    return response.data
+  },
+
+  // v0.7 PR C: per-user graph settings (currently just node
+  // limit; more fields may land in future minor releases).
+  async getGraphSettings() {
+    const response = await client.get('/api/similarity/graph-settings')
+    return response.data
+  },
+
+  async setGraphSettings(settings) {
+    const response = await client.put('/api/similarity/graph-settings', settings)
     return response.data
   },
 }

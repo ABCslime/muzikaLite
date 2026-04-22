@@ -106,6 +106,12 @@
       <div class="mt-12 pt-8 border-t border-gray-300">
         <BucketWeights />
       </div>
+
+      <!-- v0.7 PR C: Discovery-graph-specific tuning
+           (currently just neighbor count). -->
+      <div class="mt-12 pt-8 border-t border-gray-300">
+        <GraphSettings />
+      </div>
         </div>
       </div>
       <PlayerBar />
@@ -120,6 +126,7 @@ import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import BucketWeights from '@/components/settings/BucketWeights.vue'
+import GraphSettings from '@/components/settings/GraphSettings.vue'
 
 // v0.4.2 PR B.1: the list covers Discogs' top-level genres PLUS the
 // styles people actually type (House, Techno, Trance, Ambient, …).

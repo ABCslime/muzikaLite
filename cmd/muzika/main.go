@@ -370,6 +370,10 @@ func buildServer(
 	// Discogs cache absorbs the cost of repeat calls on the same
 	// center.
 	mux.Handle("GET /api/similarity/graph", withAuth(http.HandlerFunc(simH.Graph)))
+	// v0.7 PR C: per-user graph settings (node_limit for now,
+	// more knobs possible later).
+	mux.Handle("GET /api/similarity/graph-settings", withAuth(http.HandlerFunc(simH.GetGraphSettings)))
+	mux.Handle("PUT /api/similarity/graph-settings", withAuth(http.HandlerFunc(simH.PutGraphSettings)))
 
 	// --- User preferences (v0.4.1 PR A) ---
 	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))

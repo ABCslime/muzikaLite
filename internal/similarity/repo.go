@@ -216,6 +216,61 @@ func (r *Repo) WeightsFor(ctx context.Context, userID uuid.UUID) (map[string]flo
 	return out, nil
 }
 
+// GraphNodeLimit returns the user's configured v0.7 graph
+// neighbor count. 0 means "unset" — the handler maps that to
+// DefaultGraphLimit. Values outside [1, MaxGraphLimit] are
+// clamped at write time; on read we tolerate out-of-range
+// legacy data by passing it through (the handler clamps too).
+func (r *Repo) GraphNodeLimit(ctx context.Context, userID uuid.UUID) (int, error) {
+	if r == nil || r.db == nil {
+		return 0, nil
+	}
+	var raw sql.NullInt64
+	err := r.db.QueryRowContext(ctx,
+		`SELECT graph_node_limit FROM user_similarity_settings WHERE user_id = ?`,
+		userID.String(),
+	).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("similarity: read graph_node_limit: %w", err)
+	}
+	if !raw.Valid {
+		return 0, nil
+	}
+	return int(raw.Int64), nil
+}
+
+// SetGraphNodeLimit persists the user's graph neighbor count.
+// Pass 0 to clear (falls back to DefaultGraphLimit on next
+// read). Values > MaxGraphLimit clamp to the cap; values < 1
+// are treated as "clear."
+func (r *Repo) SetGraphNodeLimit(ctx context.Context, userID uuid.UUID, limit int) error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	var arg any
+	switch {
+	case limit < 1:
+		arg = nil
+	case limit > MaxGraphLimit:
+		arg = MaxGraphLimit
+	default:
+		arg = limit
+	}
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO user_similarity_settings (user_id, graph_node_limit)
+		VALUES (?, ?)
+		ON CONFLICT(user_id) DO UPDATE SET graph_node_limit = excluded.graph_node_limit`,
+		userID.String(), arg,
+	)
+	if err != nil {
+		return fmt.Errorf("similarity: set graph_node_limit: %w", err)
+	}
+	return nil
+}
+
 // SetWeights replaces the user's bucket_weights JSON. nil or
 // empty map clears to NULL (pure defaults). Upsert so calling
 // SetWeights on a user who hasn't toggled similar mode yet still

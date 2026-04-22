@@ -326,7 +326,14 @@ func (h *Handler) Graph(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid songId")
 		return
 	}
+	// Per-user graph_node_limit persistence: if the user has
+	// tuned a limit, use it. Explicit ?limit= query param wins
+	// over the setting so the frontend can override for tests
+	// or future "expand" affordances.
 	limit := DefaultGraphLimit
+	if stored, err := h.repo.GraphNodeLimit(r.Context(), userID); err == nil && stored > 0 {
+		limit = stored
+	}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -345,6 +352,73 @@ func (h *Handler) Graph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, graph)
+}
+
+// GraphSettingsResponse exposes per-user v0.7 graph settings.
+// nodeLimit is the user's current configured limit; default is
+// the code-side fallback so the frontend slider knows its
+// baseline. Shape is a tiny object rather than an int so future
+// settings can land here without bumping the route version.
+type GraphSettingsResponse struct {
+	NodeLimit    int `json:"nodeLimit"`
+	DefaultNodeLimit int `json:"defaultNodeLimit"`
+	MaxNodeLimit int `json:"maxNodeLimit"`
+}
+
+// GraphSettingsRequest is the PUT body for updating the user's
+// graph settings. nodeLimit < 1 clears to default.
+type GraphSettingsRequest struct {
+	NodeLimit int `json:"nodeLimit"`
+}
+
+// GetGraphSettings returns the user's current per-graph-view
+// settings. Missing = use defaults — the response always echoes
+// the active effective value so the frontend slider snaps to
+// it without extra lookup.
+func (h *Handler) GetGraphSettings(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	stored, err := h.repo.GraphNodeLimit(r.Context(), userID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "read graph settings failed")
+		return
+	}
+	effective := stored
+	if effective < 1 {
+		effective = DefaultGraphLimit
+	}
+	httpx.WriteJSON(w, http.StatusOK, GraphSettingsResponse{
+		NodeLimit:        effective,
+		DefaultNodeLimit: DefaultGraphLimit,
+		MaxNodeLimit:     MaxGraphLimit,
+	})
+}
+
+// PutGraphSettings persists the user's graph settings. nodeLimit
+// < 1 clears to default; values > MaxGraphLimit clamp to the
+// cap (handled in the repo) so malicious clients can't balloon
+// Discogs fan-out.
+func (h *Handler) PutGraphSettings(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	var req GraphSettingsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := h.repo.SetGraphNodeLimit(r.Context(), userID, req.NodeLimit); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "write graph settings failed")
+		return
+	}
+	// Echo the post-write effective state so the frontend stays
+	// in sync with clamping/clearing the repo applied.
+	h.GetGraphSettings(w, r)
 }
 
 // ListPresets returns the v0.6 weight presets ("Familiar",

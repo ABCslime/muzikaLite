@@ -14,17 +14,20 @@
           <div class="flex items-center justify-between flex-wrap gap-4 mb-8">
             <h1 class="text-3xl font-bold text-gray-900">Home</h1>
             <div class="flex items-center gap-2 flex-wrap">
-              <!-- v0.5 PR F: similar-mode seed pin. Appears first
-                   so the user's eye reads "your queue is being
-                   seeded by THIS song" before the genre chips.
-                   When similar mode is on, the refiller ignores
-                   genre pins anyway; showing the similar pin
-                   first makes that ordering legible. -->
+              <!-- v0.5 PR F + v0.6 PR E: similar-mode seed pins.
+                   One chip per seed in the user's set. When
+                   similar mode is on, the refiller ignores
+                   genre pins anyway; showing the similar pins
+                   first makes that ordering legible. × on an
+                   individual pin removes just that seed; if it
+                   was the last, similar mode turns off and the
+                   chip row reverts to genre-only. -->
               <SimilarPin
-                v-if="similarStore.active"
-                :title="similarStore.seedTitle"
-                :artist="similarStore.seedArtist"
-                @unpin="similarStore.clear()"
+                v-for="s in similarStore.seeds"
+                :key="s.id"
+                :title="s.title"
+                :artist="s.artist"
+                @unpin="similarStore.removeSeed(s.id)"
               />
               <GenreChip
                 v-for="t in prefsStore.bandcampTags"

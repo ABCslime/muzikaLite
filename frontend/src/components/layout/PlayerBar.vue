@@ -167,15 +167,15 @@
             :disabled="!playerStore.currentSong || similarStore.pending"
             class="transition-colors"
             :class="{
-              'text-amber-500 hover:text-amber-400': similarFromCurrent && similarStore.hasError,
-              'text-vibrant-pink hover:text-vibrant-pink-light': similarFromCurrent && !similarStore.hasError,
-              'text-gray-400 hover:text-white': !similarFromCurrent && playerStore.currentSong,
+              'text-amber-500 hover:text-amber-400': currentIsSeed && similarStore.hasError,
+              'text-vibrant-pink hover:text-vibrant-pink-light': currentIsSeed && !similarStore.hasError,
+              'text-gray-400 hover:text-white': !currentIsSeed && playerStore.currentSong,
               'text-gray-700 cursor-not-allowed': !playerStore.currentSong,
             }"
             :title="similarTooltip"
           >
             <svg
-              v-if="similarFromCurrent"
+              v-if="currentIsSeed"
               class="w-5 h-5"
               fill="currentColor"
               viewBox="0 0 20 20"
@@ -302,36 +302,39 @@ const handleImageError = () => {
   imageError.value = true
 }
 
-// v0.5 PR B — similar-mode lens. "Lit" only when the active
-// seed matches the currently-playing song (same-seed-different-
-// song case shows outline so the user can tell they need to
-// click to re-seed, rather than seeing it lit and assuming the
-// queue is following the current track).
-const similarFromCurrent = computed(() =>
-  similarStore.active &&
-  playerStore.currentSong?.id &&
-  similarStore.seedSongId === playerStore.currentSong.id,
-)
+// v0.5 PR B + v0.6 PR E — similar-mode lens. Four states:
+//   disabled (gray): no current song playable
+//   outline gray:    current song is NOT a seed; click to add
+//   filled pink:     current song IS a seed (one of possibly many)
+//   filled amber:    current song is a seed AND the last pick
+//                    cycle hit an error (lastError non-empty)
+//
+// The v0.5 "single seed, re-seed on click" model is gone: in
+// v0.6 clicking the lens on song B while song A is already a
+// seed ADDS B to the set rather than replacing A. Removing is
+// via the × on the Home-view pins or by clicking the lens
+// again on a song that IS a seed.
+const currentIsSeed = computed(() => {
+  const id = playerStore.currentSong?.id
+  return !!id && similarStore.hasSeed(id)
+})
 
 const similarTooltip = computed(() => {
   if (!playerStore.currentSong) return 'Play a song first'
-  if (similarFromCurrent.value && similarStore.hasError) {
-    // Surface the backend's reason in the tooltip — actionable
-    // info ("couldn't find this on Discogs") rather than a vague
-    // "something went wrong."
+  if (currentIsSeed.value && similarStore.hasError) {
     return `Similar mode: ${similarStore.lastError}`
   }
-  if (similarFromCurrent.value) return 'Stop similar mode'
-  if (similarStore.active) return 'Re-seed similar mode with this song'
-  return 'Fill queue with similar songs'
+  if (currentIsSeed.value) return 'Remove this song from similar seeds'
+  if (similarStore.active) return 'Add this song as another similar seed'
+  return 'Fill queue with songs similar to this one'
 })
 
 async function handleSimilarToggle() {
   const cs = playerStore.currentSong
   if (!cs?.id) return
-  // Forward title/artist so the Home-view chip renders instantly
+  // Forward title/artist so the Home-view pin renders instantly
   // without waiting for a hydrate round-trip.
-  await similarStore.toggleForSong(cs.id, {
+  await similarStore.toggleSeed(cs.id, {
     title: cs.title || '',
     artist: cs.artist || '',
   })

@@ -1,150 +1,160 @@
-// v0.5 PR B — per-session similar-mode state.
+// v0.5 PR B + v0.6 PR D — similar-mode state.
 //
-// Shadows the backend's user_similarity_settings row. Backend
-// is the source of truth; this store caches the active seed so
-// the PlayerBar lens icon doesn't have to hit /api/queue/similar-mode
-// on every frame, and so other components can react to changes
-// without polling.
+// The store caches the full seed set with metadata so the
+// PlayerBar lens and Home-view pins can render without re-
+// hitting the backend on every frame. Backend is the source of
+// truth; the store mirrors it with optimistic-update shape for
+// click responsiveness and rollback on error.
 //
 // Lifecycle:
-//   - app boot: hydrate() pulls the current state from the backend
-//     (the user might have left the mode on across a page reload)
-//   - lens click: toggleForCurrentSong() flips state and calls the
-//     backend; on error it rolls back so the icon doesn't lie
-//   - song deleted from queue: backend's ON DELETE SET NULL
-//     auto-clears server-side; the next hydrate() picks it up
+//   - boot: hydrate() pulls the current state (multi-seed)
+//   - per-song lens click: adds/removes THAT song to/from the
+//     seed set. Doesn't clear the set just because you tapped
+//     something else — the "+ another seed" UX.
+//   - Home pin × click: removes that specific seed; if it was
+//     the last, similar mode turns off automatically.
 //
-// Deliberately NOT in stores/player.js: the player store is the
-// hot path for audio + queue rendering and is already large.
-// One file per concern.
+// Deliberately NOT merged into stores/player.js: player is the
+// audio hot path and grows often; similar state is orthogonal.
 
 import { defineStore } from 'pinia'
 import { queueAPI } from '@/api/queue'
 
 export const useSimilarStore = defineStore('similar', {
   state: () => ({
-    seedSongId: null,
-    // 'unknown' = haven't called the API yet (skeleton state on
-    // first paint). 'on' / 'off' once we know.
+    // v0.6: full seed set. Each entry {id, title, artist}.
+    // Order matches the backend's stable ordering.
+    seeds: [],
+    // 'unknown' | 'on' | 'off'. 'on' iff seeds.length > 0.
     status: 'unknown',
-    // Set true on the lens icon while a toggle round-trip is in
-    // flight, so we can disable the button to prevent double-clicks.
+    // True while a mutation round-trip is in flight; disables the
+    // relevant buttons so double-clicks don't fire duplicate
+    // requests. Backend mutations are idempotent so double-
+    // firing would be correct, but we avoid the noise.
     pending: false,
-    // v0.5 PR E: when similar mode is on but the backend's last
-    // NextPick failed (seed unknown to Discogs, or every bucket
-    // came back empty), the server surfaces the reason here.
-    // Empty string = last cycle succeeded. The PlayerBar uses
-    // this to render the lens in an orange "active but not
-    // working" state, distinct from both off and healthy-active.
+    // Backend's most recent NextPick failure reason. Empty when
+    // the last cycle succeeded; drives the amber lens state.
     lastError: '',
-    // v0.5 PR F: (title, artist) of the active seed song — the
-    // backend sends these alongside seedSongId on GET so the
-    // Home-view chip renders without a second fetch. Empty
-    // when similar mode is off.
-    seedTitle: '',
-    seedArtist: '',
   }),
 
   getters: {
-    active: (state) => state.status === 'on' && !!state.seedSongId,
+    active: (state) => state.seeds.length > 0 && state.status === 'on',
     hasError: (state) =>
-      state.status === 'on' && !!state.seedSongId && state.lastError !== '',
+      state.seeds.length > 0 && state.status === 'on' && state.lastError !== '',
+
+    // True iff songId is currently in the seed set. Lens uses
+    // this to decide between "+ add" and "× remove" visuals.
+    hasSeed: (state) => (songId) =>
+      state.seeds.some((s) => s.id === songId),
   },
 
   actions: {
-    // hydrate is fire-and-forget; failures collapse to status='off'
-    // so the lens icon is always in a determinate visual state.
+    // hydrate is fire-and-forget; failures collapse to the empty-
+    // state so the UI always has a determinate set to render.
     async hydrate() {
       try {
         const r = await queueAPI.getSimilarMode()
-        this.seedSongId = r.seedSongId || null
-        this.status = r.active ? 'on' : 'off'
-        this.lastError = r.lastError || ''
-        this.seedTitle = r.seedTitle || ''
-        this.seedArtist = r.seedArtist || ''
+        this._applyServerState(r)
       } catch {
-        this.seedSongId = null
+        this.seeds = []
         this.status = 'off'
         this.lastError = ''
-        this.seedTitle = ''
-        this.seedArtist = ''
       }
     },
 
-    // toggleForSong is the click handler. If we're currently OFF
-    // (or seeded by a different song), turn ON with the given
-    // songId. If we're ON with this exact songId, turn OFF.
+    // toggleSeed is the lens click handler. If the given song
+    // is ALREADY a seed, remove it; otherwise add it. Single-
+    // round-trip per click.
     //
-    // The "different song" case is intentional: clicking the lens
-    // while playing track B when the seed is track A should
-    // RE-SEED to B, not toggle off. Matches the user's mental
-    // model — "make the queue follow this one."
-    //
-    // v0.5 PR F: callers can pass title/artist alongside the id
-    // so the Home-view chip renders immediately without waiting
-    // for a hydrate round-trip. Optional — hydrate() fills these
-    // in on next page load either way.
-    async toggleForSong(songId, { title = '', artist = '' } = {}) {
-      if (!songId) return
-      if (this.pending) return
+    // Optional {title, artist} args let the caller supply the
+    // metadata from the player store so the chip on Home pops
+    // in immediately — backend will echo the same values but
+    // with a round-trip of latency.
+    async toggleSeed(songId, { title = '', artist = '' } = {}) {
+      if (!songId || this.pending) return
       this.pending = true
-      const wasActive = this.active
-      const wasSameSeed = this.seedSongId === songId
-      // Optimistic local update so the lens icon flips immediately.
-      const nextSeed = wasActive && wasSameSeed ? null : songId
-      const prevSeed = this.seedSongId
-      const prevStatus = this.status
-      const prevError = this.lastError
-      const prevTitle = this.seedTitle
-      const prevArtist = this.seedArtist
-      this.seedSongId = nextSeed
-      this.status = nextSeed ? 'on' : 'off'
-      // Changing the seed invalidates any prior error — the backend
-      // clears it server-side too; mirror here for snappy UX.
+      const wasSeed = this.seeds.some((s) => s.id === songId)
+      // Optimistic local update.
+      const prev = this._snapshot()
+      if (wasSeed) {
+        this.seeds = this.seeds.filter((s) => s.id !== songId)
+      } else {
+        this.seeds = [...this.seeds, { id: songId, title, artist }]
+      }
+      this.status = this.seeds.length > 0 ? 'on' : 'off'
       this.lastError = ''
-      this.seedTitle = nextSeed ? title : ''
-      this.seedArtist = nextSeed ? artist : ''
       try {
-        await queueAPI.setSimilarMode(nextSeed)
+        const r = wasSeed
+          ? await queueAPI.removeSimilarSeed(songId)
+          : await queueAPI.addSimilarSeed(songId)
+        this._applyServerState(r)
       } catch {
-        // Roll back so we're not lying to the user.
-        this.seedSongId = prevSeed
-        this.status = prevStatus
-        this.lastError = prevError
-        this.seedTitle = prevTitle
-        this.seedArtist = prevArtist
+        this._restore(prev)
       } finally {
         this.pending = false
       }
     },
 
-    // clear() unconditionally turns the mode off. Useful when a
-    // future PR adds a "stop similar mode" affordance separate
-    // from the per-song toggle.
+    // removeSeed is the Home-pin × handler. Separate from
+    // toggleSeed so pin clicks don't accidentally re-add a song
+    // when its id happens to not be in the set (shouldn't happen,
+    // but the explicit path removes the branch entirely).
+    async removeSeed(songId) {
+      if (!songId || this.pending) return
+      this.pending = true
+      const prev = this._snapshot()
+      this.seeds = this.seeds.filter((s) => s.id !== songId)
+      this.status = this.seeds.length > 0 ? 'on' : 'off'
+      this.lastError = ''
+      try {
+        const r = await queueAPI.removeSimilarSeed(songId)
+        this._applyServerState(r)
+      } catch {
+        this._restore(prev)
+      } finally {
+        this.pending = false
+      }
+    },
+
+    // clear drops all seeds in one round-trip. Used by bulk
+    // "stop similar mode" affordances (future — not wired in
+    // v0.6 UI, but the API is here).
     async clear() {
       if (this.pending) return
       this.pending = true
-      const prevSeed = this.seedSongId
-      const prevStatus = this.status
-      const prevError = this.lastError
-      const prevTitle = this.seedTitle
-      const prevArtist = this.seedArtist
-      this.seedSongId = null
+      const prev = this._snapshot()
+      this.seeds = []
       this.status = 'off'
       this.lastError = ''
-      this.seedTitle = ''
-      this.seedArtist = ''
       try {
         await queueAPI.setSimilarMode(null)
       } catch {
-        this.seedSongId = prevSeed
-        this.status = prevStatus
-        this.lastError = prevError
-        this.seedTitle = prevTitle
-        this.seedArtist = prevArtist
+        this._restore(prev)
       } finally {
         this.pending = false
       }
+    },
+
+    // _applyServerState mirrors a fresh GET/mutation response
+    // into the store. Single place that knows the response
+    // shape, so a wire-format change lands here only.
+    _applyServerState(r) {
+      this.seeds = Array.isArray(r?.seeds) ? r.seeds : []
+      this.status = r?.active ? 'on' : 'off'
+      this.lastError = r?.lastError || ''
+    },
+
+    _snapshot() {
+      return {
+        seeds: [...this.seeds],
+        status: this.status,
+        lastError: this.lastError,
+      }
+    },
+    _restore(s) {
+      this.seeds = s.seeds
+      this.status = s.status
+      this.lastError = s.lastError
     },
   },
 })

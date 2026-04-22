@@ -94,10 +94,16 @@ type broadCacheEntry struct {
 }
 
 // broadCacheTTL is how long a cached broad-search result stays
-// fresh. 60 s is long enough for the typical "artist → album →
-// back" round trip but short enough that peer availability
-// updates propagate within a minute of a refresh.
-const broadCacheTTL = 60 * time.Second
+// fresh. 10 min gives a comfortable buffer over typical user
+// browsing sessions ("open Nujabes, queue a few things, go read
+// the wikipedia tab, come back") so they see the same hit rate
+// on re-visit as cold. Longer than that risks serving stale
+// peer-availability data; the observed churn on a popular
+// artist is in the 1-hour-plus range, so 10 minutes is a safe
+// spot. Combined with retry-on-zero in the miss path, a cached
+// result hides Soulseek session-degradation issues that would
+// otherwise show up as "0 hits after the first time".
+const broadCacheTTL = 10 * time.Minute
 
 // broadCacheMaxEntries caps the cache to bound memory. 64 artists
 // is plenty for interactive browsing; once hit, the whole cache
@@ -628,36 +634,33 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 	p.log.Debug("by-artist availability cache miss",
 		"artist", artist)
 
-	// Belt-and-suspenders: some Soulseek backends (notably gosk via
-	// the soul library) occasionally block past their window — the
-	// session gets into a state where a subsequent search doesn't
-	// drain on the advertised deadline. The handler-level deadline
-	// (r.Context + WithTimeout in the handler) still cancels the
-	// in-flight goroutine; in the meantime we select on ctx.Done
-	// so the handler returns on time instead of waiting on gosk.
-	type searchOutcome struct {
-		results []soulseek.SearchResult
-		err     error
-	}
-	done := make(chan searchOutcome, 1)
-	go func() {
-		res, err := p.gatedSearch(ctx, artist, artistBroadWindow)
-		done <- searchOutcome{res, err}
-	}()
-
-	var broad []soulseek.SearchResult
-	select {
-	case o := <-done:
-		if o.err != nil {
-			p.log.Debug("artist-broad availability search failed",
-				"artist", artist, "err", o.err)
+	// Do up to two broad attempts with a short reconnect pause
+	// between them. Soulseek's distributed-peer search routing is
+	// empirically flaky: a search that returned thousands of hits
+	// one moment can return zero the next because our distributed
+	// parent silently died (TCP half-open, peer quit). The first
+	// zero-result response TRIGGERS the patched parent-disconnect
+	// detection in soul (HaveNoParent=true sent to the server),
+	// which in a couple of seconds gives us a fresh parent. The
+	// retry then runs through that fresh parent and typically
+	// recovers.
+	//
+	// The handler-level deadline (22 s) caps total work: first try
+	// ~10 s + ~2 s reconnect pause + ~10 s retry = 22 s. If the
+	// first attempt happens to succeed, we skip the pause and
+	// retry entirely — healthy-session fast path.
+	broad := p.broadSearchOnce(ctx, artist)
+	if len(broad) == 0 {
+		// Give soul a moment to notice the dead parent and
+		// reconnect to a fresh one before retrying. 2 s is
+		// usually enough — the new-parent dial completes in
+		// <1 s when the server-supplied list has a live peer.
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
 			return results, nil
 		}
-		broad = o.results
-	case <-ctx.Done():
-		p.log.Debug("artist-broad availability search hit deadline",
-			"artist", artist)
-		return results, nil
+		broad = p.broadSearchOnce(ctx, artist)
 	}
 	if len(broad) == 0 {
 		return results, nil
@@ -769,6 +772,36 @@ func (p *Previewer) runPerTitleFallback(ctx context.Context, artist string, titl
 		}(i, title, variants)
 	}
 	wg.Wait()
+}
+
+// broadSearchOnce runs a single broad Soulseek search through the
+// global gate, with the belt-and-suspenders goroutine-select so a
+// stalled gosk.Search doesn't hold the handler past ctx.
+// Returns nil on error, ctx cancel, or zero results — callers
+// treat all three identically (no data, move on).
+func (p *Previewer) broadSearchOnce(ctx context.Context, artist string) []soulseek.SearchResult {
+	type outcome struct {
+		res []soulseek.SearchResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := p.gatedSearch(ctx, artist, artistBroadWindow)
+		done <- outcome{res, err}
+	}()
+	select {
+	case o := <-done:
+		if o.err != nil {
+			p.log.Debug("artist-broad availability search failed",
+				"artist", artist, "err", o.err)
+			return nil
+		}
+		return o.res
+	case <-ctx.Done():
+		p.log.Debug("artist-broad availability search hit deadline",
+			"artist", artist)
+		return nil
+	}
 }
 
 // applyBroad fills `results` in place: for each title, count how

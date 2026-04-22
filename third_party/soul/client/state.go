@@ -219,8 +219,55 @@ func (s *State) Login(ctx context.Context) error {
 
 	go s.peer(ctx)
 	go s.server(ctx)
+	go s.refreshParent(ctx)
 
 	return nil
+}
+
+// parentRefreshInterval is how often Login's post-start refreshParent
+// goroutine tells the server "I have no parent" to trigger a
+// PossibleParents response. Upstream sent HaveNoParent(true) once at
+// login and never again; if our parent distributed-peer connection
+// died silently (TCP half-open, peer quit, ISP blip), the session
+// ran without search distribution and every subsequent FileSearch
+// returned zero hits.
+//
+// 60 s is aggressive but worth it: a dead parent recovers quickly,
+// and a healthy parent just gets another PossibleParents list that
+// soul's dial logic skips (matching-username dedup in s.distributed).
+// The refresh message itself is ~a dozen bytes over the existing
+// server connection, trivial cost.
+const parentRefreshInterval = 60 * time.Second
+
+// refreshParent periodically asks the server for a fresh distributed
+// parent. Idempotent when the current parent is alive (server just
+// replies with another PossibleParents list; soul picks one and
+// skips connection if the username matches an existing peer). When
+// the parent has died, this is how we recover.
+func (s *State) refreshParent(ctx context.Context) {
+	t := time.NewTicker(parentRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			noParent := new(server.HaveNoParent)
+			msg, err := noParent.Serialize(true)
+			if err != nil {
+				s.Error().Err(err).Msg("refreshParent serialize")
+				continue
+			}
+			select {
+			case s.client.Writer <- msg:
+				s.Info().Msg("refreshParent: HaveNoParent sent")
+			case <-ctx.Done():
+				return
+			default:
+				s.Info().Msg("refreshParent: writer busy, skipping tick")
+			}
+		}
+	}
 }
 
 // searchBufferSize bounds how many in-flight peer FileSearchResponses
@@ -739,9 +786,34 @@ func (s *State) distributed(m *server.PossibleParents) {
 
 		pl.Info().Msg("parent connected")
 
+		// muzika patch: watch for parent disconnect and recover.
+		// Upstream's select had no ctxD case, so when the parent's
+		// distributed TCP died (silent TCP half-open, peer quit,
+		// peer read idle-timeout) this loop blocked forever and
+		// every subsequent FileSearch got zero responses because
+		// our search never reached the distributed network. Now
+		// we break out, log, and kick the server to give us a
+		// fresh parent list immediately instead of waiting for
+		// the 60 s refresh ticker.
+	parentLoop:
 		for {
 			pl.Debug().Msg("waiting for parent")
 			select {
+			case <-p.ctxD.Done():
+				pl.Info().Msg("parent disconnected — requesting fresh parents")
+				go func() {
+					noParent := new(server.HaveNoParent)
+					msg, err := noParent.Serialize(true)
+					if err != nil {
+						return
+					}
+					select {
+					case s.client.Writer <- msg:
+					case <-time.After(2 * time.Second):
+					}
+				}()
+				break parentLoop
+
 			case branch := <-p.initDistributedListeners.branchRoot:
 				pl.Debug().Any("branch", branch).Msg("branch")
 

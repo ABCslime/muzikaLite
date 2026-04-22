@@ -16,9 +16,15 @@ import (
 // can occupy a goroutine. The deadline lives on the handler (not
 // deeper in CheckByArtistAvailability) so it applies to every code
 // path — broad search, per-title fallback, and the in-flight gosk
-// goroutines we cancel via ctx. 15 s fits a 10 s broad window plus
-// a few seconds of trickle fallback without stretching the UX.
-const availabilityByArtistDeadline = 15 * time.Second
+// goroutines we cancel via ctx.
+//
+// 22 s budgets for two broad tries (each up to 10 s) with a couple
+// of seconds of slack. The retry is only paid when the first try
+// returned zero — in the healthy-session common case the second
+// try is skipped and the deadline is far from hit. Still under
+// the 30 s that most reverse proxies / browsers accept without
+// complaint.
+const availabilityByArtistDeadline = 22 * time.Second
 
 // Handler mounts GET /api/queue/search/preview.
 type Handler struct{ prev *Previewer }

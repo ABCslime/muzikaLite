@@ -34,6 +34,7 @@
                 :key="`bc-${t}`"
                 :label="t"
                 source="bandcamp"
+                :similar-active="similarStore.active"
                 @unpin="unpinBandcamp(t)"
               />
               <GenreChip
@@ -41,6 +42,7 @@
                 :key="`dg-${g}`"
                 :label="g"
                 source="discogs"
+                :similar-active="similarStore.active"
                 @unpin="unpinDiscogs(g)"
               />
               <router-link

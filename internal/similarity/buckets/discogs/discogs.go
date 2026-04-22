@@ -21,6 +21,12 @@ import (
 // carries the signal, individual confidence is uniform). Drops
 // rows with empty title/artist defensively.
 //
+// v0.6.1: preserves the Discogs release ID so the engine's
+// post-merge genre filter can look up the candidate's genres
+// via the cached /releases/{id} endpoint. Zero IDs (rare; only
+// /database/search rows that didn't surface an id) pass through
+// unchanged and become filter-exempt candidates.
+//
 // Edge metadata (the v0.7 graph view's tooltips) is added by the
 // caller — bucket-specific keys ("label","festival","year") don't
 // belong here.
@@ -33,9 +39,10 @@ func releasesToCandidates(rs []discogs.SearchResult) []similarity.Candidate {
 			continue
 		}
 		out = append(out, similarity.Candidate{
-			Title:    title,
-			Artist:   artist,
-			ImageURL: r.Thumb,
+			Title:            title,
+			Artist:           artist,
+			ImageURL:         r.Thumb,
+			DiscogsReleaseID: r.ID,
 		})
 	}
 	return out

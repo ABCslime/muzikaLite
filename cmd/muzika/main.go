@@ -174,7 +174,7 @@ func run() error {
 	// have nothing to query — and similar mode just returns no
 	// candidates, falling back to the genre path.
 	simRepo := similarity.NewRepo(database)
-	simAdapter := &simQueueAdapter{q: qSvc, dg: dgClient}
+	simAdapter := &simQueueAdapter{q: qSvc, dg: dgClient, prefs: prefSvc}
 	simSvc := similarity.NewService(similarity.Config{
 		SeedReader:   simAdapter,
 		SongAcquirer: simAdapter,
@@ -182,9 +182,16 @@ func run() error {
 		// v0.5 PR D: Repo satisfies WeightStore — per-user tuned
 		// weights flow in via the bucket_weights JSON column.
 		// Missing values fall through to bucket defaults.
-		Weights:   simRepo,
-		Bus:       b,
-		Discovery: logw,
+		Weights: simRepo,
+		// v0.6.1: genre-filter wiring. Half-wiring (filter OR
+		// enricher but not both) is treated as "off" by Service.
+		// Both rely on the Discogs client + prefs being configured,
+		// so the filter auto-disables in deployments without
+		// Discogs.
+		GenreFilter:       simAdapter,
+		CandidateEnricher: simAdapter,
+		Bus:               b,
+		Discovery:         logw,
 	})
 	if dgClient != nil {
 		simSvc.Register(discogsbuckets.NewSameArtist(dgClient))
@@ -475,15 +482,19 @@ func (a *albumExpander) ReprobeNotFoundTrack(ctx context.Context, userID uuid.UU
 	return a.q.ReprobeNotFoundTrack(ctx, userID, title, artist)
 }
 
-// simQueueAdapter implements similarity.SeedReader,
-// similarity.SongAcquirer, and similarity.QueueDeduper against
-// the existing queue.Service + queue.Repo + discogs.Client.
-// Mirrors the playlist.AlbumExpander pattern — keeps
-// internal/similarity free of internal/queue + internal/discogs
-// imports.
+// simQueueAdapter implements similarity's cross-domain ports
+// against queue.Service + queue.Repo + discogs.Client +
+// preferences.Service. Mirrors the playlist.AlbumExpander
+// pattern — keeps internal/similarity free of internal/queue,
+// internal/discogs, and internal/preferences imports.
+//
+// v0.5: SeedReader + SongAcquirer + QueueDeduper.
+// v0.6.1: + GenreFilter (pinned Discogs genres) + CandidateEnricher
+// (per-candidate genre lookup via Discogs /releases/{id} cache).
 type simQueueAdapter struct {
-	q  *queue.Service
-	dg *discogs.Client // nil → no hydration; buckets receive a partial Seed
+	q     *queue.Service
+	dg    *discogs.Client      // nil → no hydration; buckets receive a partial Seed
+	prefs *preferences.Service // nil → no genre filter
 }
 
 // ReadSeed pulls (title, artist) from queue_songs and, when
@@ -566,4 +577,45 @@ func (a *simQueueAdapter) HasEntry(ctx context.Context, userID uuid.UUID, title,
 		return false
 	}
 	return id != uuid.Nil
+}
+
+// PinnedGenresFor returns the user's pinned Discogs genres for
+// the v0.6.1 similar-mode filter. Bandcamp tags are NOT
+// returned — they're free-form strings that can't reliably be
+// matched against Discogs-side genre tags. Empty slice (no
+// prefs configured, errors, or user hasn't pinned anything) =
+// filter disabled.
+func (a *simQueueAdapter) PinnedGenresFor(ctx context.Context, userID uuid.UUID) []string {
+	if a.prefs == nil {
+		return nil
+	}
+	p, err := a.prefs.Get(ctx, userID)
+	if err != nil {
+		return nil
+	}
+	return p.DiscogsGenres
+}
+
+// GenresFor looks up the Discogs genres + styles for one
+// release id. The engine calls this once per survivor during
+// the filter step; the discogs cache (30-day TTL) absorbs the
+// repeated reads. Returns genres AND styles concatenated —
+// Discogs splits them into two fields but users pin either
+// vocabulary interchangeably ("Electronic" is a genre, "House"
+// is a style; both should match "House" candidates).
+//
+// Error = empty slice, not a propagated error: the filter
+// treats "no genre info" as pass-through.
+func (a *simQueueAdapter) GenresFor(ctx context.Context, discogsReleaseID int) ([]string, error) {
+	if a.dg == nil || discogsReleaseID <= 0 {
+		return nil, nil
+	}
+	rd, err := a.dg.Release(ctx, discogsReleaseID)
+	if err != nil {
+		return nil, nil
+	}
+	out := make([]string, 0, len(rd.Genres)+len(rd.Styles))
+	out = append(out, rd.Genres...)
+	out = append(out, rd.Styles...)
+	return out, nil
 }

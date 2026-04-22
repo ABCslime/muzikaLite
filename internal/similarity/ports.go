@@ -79,3 +79,44 @@ func NewNoopWeightStore() WeightStore { return noopWeightStore{} }
 func (noopWeightStore) WeightsFor(_ context.Context, _ uuid.UUID) (map[string]float64, error) {
 	return nil, nil
 }
+
+// GenreFilter is the v0.6.1 port into the preferences package:
+// returns the user's currently pinned Discogs genres/styles
+// that should filter similar-mode picks to. Empty slice = no
+// filter; the engine keeps every candidate. Bandcamp tags are
+// NOT returned here — only Discogs vocabulary participates in
+// the filter (Discogs candidates can only be reliably matched
+// against Discogs-side tags).
+//
+// Implemented in cmd/muzika/main.go by an adapter closing over
+// preferences.Service. Errors in the adapter collapse to empty
+// slice — better to queue unfiltered picks than to stall.
+type GenreFilter interface {
+	PinnedGenresFor(ctx context.Context, userID uuid.UUID) []string
+}
+
+// CandidateEnricher looks up the Discogs genres + styles for a
+// release id. Populated by the engine's filter step on every
+// candidate with a non-zero DiscogsReleaseID. Implementation
+// closes over the cached Discogs client in main.go, so a
+// stable seed + genre combo eventually runs entirely off the
+// 30-day cache.
+//
+// Returns (nil, nil) when the id is unknown or genres are
+// missing — the filter treats that as "unknown genre, let the
+// candidate through" rather than silently dropping.
+type CandidateEnricher interface {
+	GenresFor(ctx context.Context, discogsReleaseID int) ([]string, error)
+}
+
+// noopGenreFilter is the default when no filter is wired
+// (legacy callers; tests). Always returns empty.
+type noopGenreFilter struct{}
+
+// NewNoopGenreFilter returns a GenreFilter that always returns
+// empty. Engine skips filtering entirely with this.
+func NewNoopGenreFilter() GenreFilter { return noopGenreFilter{} }
+
+func (noopGenreFilter) PinnedGenresFor(_ context.Context, _ uuid.UUID) []string {
+	return nil
+}

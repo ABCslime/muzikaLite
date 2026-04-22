@@ -80,7 +80,7 @@ func (d *stubDeduper) HasEntry(_ context.Context, _ uuid.UUID, title, artist str
 // TestEngine_EmptyRegistry: zero buckets is a clean empty state,
 // not an error. Important so PR A ships before any buckets exist.
 func TestEngine_EmptyRegistry(t *testing.T) {
-	e := newEngine(nil, NewNoopWeightStore(), nil, nil)
+	e := newEngine(nil, NewNoopWeightStore(), nil, nil, nil, nil)
 	_, _, ok := e.pick(context.Background(), Seed{UserID: uuid.New(), SongID: uuid.New(),
 		Title: "X", Artist: "Y"})
 	if ok {
@@ -102,7 +102,7 @@ func TestEngine_MergeAcrossBuckets(t *testing.T) {
 
 	// Pin the RNG so the single-candidate weighted pick is deterministic.
 	rng := rand.New(rand.NewSource(42)) //nolint:gosec
-	e := newEngine([]Bucket{b1, b2}, NewNoopWeightStore(), nil, rng)
+	e := newEngine([]Bucket{b1, b2}, NewNoopWeightStore(), nil, nil, nil, rng)
 	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
 	if !ok {
 		t.Fatal("expected a pick")
@@ -126,7 +126,7 @@ func TestEngine_DropsSeedSelf(t *testing.T) {
 		}
 	}}
 	rng := rand.New(rand.NewSource(1)) //nolint:gosec
-	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), nil, rng)
+	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), nil, nil, nil, rng)
 	picked, _, ok := e.pick(context.Background(), seed("Discovery", "Daft Punk"))
 	if !ok {
 		t.Fatal("expected a pick")
@@ -145,7 +145,7 @@ func TestEngine_DedupeAgainstQueue(t *testing.T) {
 	dedup := &stubDeduper{dupes: map[string]bool{
 		"daft punk\x00homework": true,
 	}}
-	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), dedup, rand.New(rand.NewSource(1))) //nolint:gosec
+	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), dedup, nil, nil, rand.New(rand.NewSource(1))) //nolint:gosec
 	if _, _, ok := e.pick(context.Background(), seed("X", "Y")); ok {
 		t.Errorf("expected ok=false when every candidate is a dedup hit")
 	}
@@ -159,7 +159,7 @@ func TestEngine_BucketErrorIsSwallowed(t *testing.T) {
 	}}
 	bad := &erroringBucket{id: "bad"}
 	rng := rand.New(rand.NewSource(7)) //nolint:gosec
-	e := newEngine([]Bucket{good, bad}, NewNoopWeightStore(), nil, rng)
+	e := newEngine([]Bucket{good, bad}, NewNoopWeightStore(), nil, nil, nil, rng)
 	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
 	if !ok {
 		t.Fatal("expected a pick despite the erroring bucket")
@@ -180,7 +180,7 @@ func TestEngine_UserWeightOverridesDefault(t *testing.T) {
 	}}
 	weights := stubWeights{"muted": 0}
 	rng := rand.New(rand.NewSource(13)) //nolint:gosec
-	e := newEngine([]Bucket{loud, muted}, weights, nil, rng)
+	e := newEngine([]Bucket{loud, muted}, weights, nil, nil, nil, rng)
 	picked, _, ok := e.pick(context.Background(), seed("seed", "seed"))
 	if !ok {
 		t.Fatal("expected a pick")
@@ -195,6 +195,92 @@ type stubWeights map[string]float64
 
 func (w stubWeights) WeightsFor(_ context.Context, _ uuid.UUID) (map[string]float64, error) {
 	return map[string]float64(w), nil
+}
+
+// stubGenreFilter + stubEnricher are v0.6.1 fixtures for the
+// post-merge genre filter. filter returns a fixed pinned list;
+// enricher returns per-id canned genre slices.
+type stubGenreFilter struct{ pinned []string }
+
+func (f stubGenreFilter) PinnedGenresFor(_ context.Context, _ uuid.UUID) []string {
+	return f.pinned
+}
+
+type stubEnricher map[int][]string
+
+func (e stubEnricher) GenresFor(_ context.Context, id int) ([]string, error) {
+	return e[id], nil
+}
+
+// TestEngine_GenreFilter_KeepsOnlyMatching exercises the v0.6.1
+// post-merge filter: of three candidates with known genres, only
+// the one tagged "House" survives when "House" is pinned.
+func TestEngine_GenreFilter_KeepsOnlyMatching(t *testing.T) {
+	b := &fakeBucket{id: "b", weight: 5, emit: func(_ Seed) []Candidate {
+		return []Candidate{
+			{Title: "House1", Artist: "A", Confidence: 1, DiscogsReleaseID: 1},
+			{Title: "Rock1", Artist: "B", Confidence: 1, DiscogsReleaseID: 2},
+			{Title: "Trap1", Artist: "C", Confidence: 1, DiscogsReleaseID: 3},
+		}
+	}}
+	genres := stubEnricher{
+		1: {"House", "Electronic"},
+		2: {"Rock"},
+		3: {"Hip Hop", "Trap"},
+	}
+	rng := rand.New(rand.NewSource(7)) //nolint:gosec
+	e := newEngine([]Bucket{b}, NewNoopWeightStore(), nil,
+		stubGenreFilter{pinned: []string{"house"}}, genres, rng)
+	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
+	if !ok {
+		t.Fatal("expected a pick")
+	}
+	if picked.Title != "House1" {
+		t.Errorf("pick = %q, want House1 (only House-tagged candidate)", picked.Title)
+	}
+}
+
+// TestEngine_GenreFilter_EmptyResultFallsBack: when the pinned
+// genre matches nothing, we keep the unfiltered pool so the
+// queue doesn't stall.
+func TestEngine_GenreFilter_EmptyResultFallsBack(t *testing.T) {
+	b := &fakeBucket{id: "b", weight: 5, emit: func(_ Seed) []Candidate {
+		return []Candidate{
+			{Title: "Rock1", Artist: "B", Confidence: 1, DiscogsReleaseID: 2},
+			{Title: "Trap1", Artist: "C", Confidence: 1, DiscogsReleaseID: 3},
+		}
+	}}
+	genres := stubEnricher{
+		2: {"Rock"},
+		3: {"Hip Hop", "Trap"},
+	}
+	rng := rand.New(rand.NewSource(7)) //nolint:gosec
+	e := newEngine([]Bucket{b}, NewNoopWeightStore(), nil,
+		stubGenreFilter{pinned: []string{"Reggae"}}, genres, rng)
+	_, _, ok := e.pick(context.Background(), seed("X", "Y"))
+	if !ok {
+		t.Errorf("filter removed everything, fallback should have picked from the unfiltered pool")
+	}
+}
+
+// TestEngine_GenreFilter_MissingIDPassesThrough: a candidate
+// without a DiscogsReleaseID can't be filtered; the engine keeps
+// it rather than silently dropping. Plugin buckets are the
+// production shape of this path — v0.6 plugins aren't forced to
+// supply a Discogs id.
+func TestEngine_GenreFilter_MissingIDPassesThrough(t *testing.T) {
+	b := &fakeBucket{id: "b", weight: 5, emit: func(_ Seed) []Candidate {
+		return []Candidate{
+			{Title: "Unknown", Artist: "Plugin", Confidence: 1, DiscogsReleaseID: 0},
+		}
+	}}
+	rng := rand.New(rand.NewSource(7)) //nolint:gosec
+	e := newEngine([]Bucket{b}, NewNoopWeightStore(), nil,
+		stubGenreFilter{pinned: []string{"House"}}, stubEnricher{}, rng)
+	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
+	if !ok || picked.Title != "Unknown" {
+		t.Errorf("no-id candidate should pass through; got ok=%v pick=%+v", ok, picked)
+	}
 }
 
 // --- Service tests ---

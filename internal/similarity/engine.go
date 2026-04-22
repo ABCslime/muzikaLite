@@ -19,15 +19,20 @@ const engineTopK = 20
 // a hydrated seed, fan out to every registered bucket in parallel,
 // merge the candidates by (artist, title) summing weight ×
 // confidence, drop duplicates against the user's existing queue,
-// and pick one from the top K weighted-randomly.
+// apply the optional genre filter, and pick one from the top K
+// weighted-randomly.
 //
-// Pure means: no I/O of its own. Buckets do I/O via their own
-// Discogs client; the engine only orchestrates. Makes it cheap
-// to test with mock buckets.
+// Pure-ish means: buckets do their own I/O (Discogs calls) via
+// closures; the engine's only direct I/O is the optional genre-
+// filter step that looks up each candidate's genres via the
+// CandidateEnricher. Both are cheap enough against the 30-day
+// Discogs cache to stay within the per-cycle latency budget.
 type engine struct {
-	buckets []Bucket
-	weights WeightStore
-	deduper QueueDeduper
+	buckets     []Bucket
+	weights     WeightStore
+	deduper     QueueDeduper
+	genreFilter GenreFilter
+	enricher    CandidateEnricher
 
 	// rng is injectable so tests can pin the weighted pick to a
 	// deterministic order. Defaults to a per-instance source so
@@ -35,12 +40,17 @@ type engine struct {
 	rng *rand.Rand
 }
 
-func newEngine(buckets []Bucket, weights WeightStore, deduper QueueDeduper, rng *rand.Rand) *engine {
+func newEngine(buckets []Bucket, weights WeightStore, deduper QueueDeduper, genreFilter GenreFilter, enricher CandidateEnricher, rng *rand.Rand) *engine {
+	if genreFilter == nil {
+		genreFilter = NewNoopGenreFilter()
+	}
 	return &engine{
-		buckets: buckets,
-		weights: weights,
-		deduper: deduper,
-		rng:     rng,
+		buckets:     buckets,
+		weights:     weights,
+		deduper:     deduper,
+		genreFilter: genreFilter,
+		enricher:    enricher,
+		rng:         rng,
 	}
 }
 
@@ -65,6 +75,13 @@ type scoredCandidate struct {
 	Score    float64
 	Buckets  []bucketContribution
 	Edges    []map[string]any
+
+	// DiscogsReleaseID is the first non-zero id any contributing
+	// bucket supplied. Used by the v0.6.1 genre filter to look
+	// up this (artist, title)'s Discogs genres. Zero = at least
+	// one contributor without a Discogs id; filter lets the
+	// candidate through unchanged.
+	DiscogsReleaseID int
 }
 
 // pickStats gives the caller diagnostic visibility into a pick
@@ -124,9 +141,10 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, pickStat
 				existing, ok := merge[key]
 				if !ok {
 					existing = &scoredCandidate{
-						Title:    c.Title,
-						Artist:   c.Artist,
-						ImageURL: c.ImageURL,
+						Title:            c.Title,
+						Artist:           c.Artist,
+						ImageURL:         c.ImageURL,
+						DiscogsReleaseID: c.DiscogsReleaseID,
 					}
 					merge[key] = existing
 				}
@@ -144,6 +162,16 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, pickStat
 				// equivalent and re-overwriting just churns.
 				if existing.ImageURL == "" && c.ImageURL != "" {
 					existing.ImageURL = c.ImageURL
+				}
+				// Same single-write rule for the release id: the
+				// first bucket contributor sets it, subsequent
+				// buckets confirming the same (artist, title)
+				// don't overwrite. Buckets sourcing from non-
+				// Discogs data (future plugins) emit zero; the
+				// filter treats the merged candidate as filter-
+				// exempt if every contributor was zero.
+				if existing.DiscogsReleaseID == 0 && c.DiscogsReleaseID != 0 {
+					existing.DiscogsReleaseID = c.DiscogsReleaseID
 				}
 			}
 			mu.Unlock()
@@ -167,6 +195,25 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, pickStat
 	}
 	if len(survivors) == 0 {
 		return scoredCandidate{}, pickStats{}, false
+	}
+
+	// v0.6.1 — genre filter. When the user has pinned genres AND
+	// the engine has a CandidateEnricher wired, keep only
+	// candidates whose Discogs genres/styles intersect the pin
+	// set. Candidates without a DiscogsReleaseID pass through
+	// (we can't look them up; don't silently drop). Empty
+	// filter-result = fall back to unfiltered so the queue
+	// doesn't stall; the service logs a discovery_log degraded
+	// row for that case.
+	pinned := e.genreFilter.PinnedGenresFor(ctx, seed.UserID)
+	if len(pinned) > 0 && e.enricher != nil {
+		kept := filterByGenres(ctx, survivors, pinned, e.enricher)
+		if len(kept) > 0 {
+			survivors = kept
+		}
+		// else: keep the unfiltered survivors. The caller may
+		// choose to log this fallback — engine doesn't emit its
+		// own telemetry.
 	}
 	stats := pickStats{PoolSize: len(survivors)}
 
@@ -225,6 +272,62 @@ func candidateKey(artist, title string) string {
 // listening to.
 func isSeedSelf(seed Seed, c Candidate) bool {
 	return candidateKey(seed.Artist, seed.Title) == candidateKey(c.Artist, c.Title)
+}
+
+// filterByGenres is the v0.6.1 post-merge filter. Keeps a
+// candidate iff its Discogs genres/styles intersect the pinned
+// set case-insensitively. Candidates without a DiscogsReleaseID
+// (rare — plugin buckets, /database/search rows missing an id)
+// can't be looked up and pass through unchanged.
+//
+// Enricher errors per candidate are treated as "unknown genre,
+// pass through" rather than "drop": better to risk an off-genre
+// pick than to silently block similar mode when Discogs is
+// having a bad day.
+func filterByGenres(ctx context.Context, items []*scoredCandidate, pinned []string, enricher CandidateEnricher) []*scoredCandidate {
+	if len(items) == 0 || len(pinned) == 0 || enricher == nil {
+		return items
+	}
+	pinnedLower := make(map[string]struct{}, len(pinned))
+	for _, p := range pinned {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" {
+			pinnedLower[p] = struct{}{}
+		}
+	}
+	if len(pinnedLower) == 0 {
+		return items
+	}
+	kept := make([]*scoredCandidate, 0, len(items))
+	for _, c := range items {
+		// We don't currently carry DiscogsReleaseID on
+		// scoredCandidate — the engine merge loses it when
+		// multiple buckets contribute the same candidate.
+		// First contributor's id is fine; the genre is a
+		// property of the (artist, title), not the specific
+		// pressing. Store it in the merged form.
+		id := c.DiscogsReleaseID
+		if id == 0 {
+			kept = append(kept, c)
+			continue
+		}
+		genres, err := enricher.GenresFor(ctx, id)
+		if err != nil {
+			kept = append(kept, c) // enricher failure = let it through
+			continue
+		}
+		matched := false
+		for _, g := range genres {
+			if _, ok := pinnedLower[strings.ToLower(strings.TrimSpace(g))]; ok {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			kept = append(kept, c)
+		}
+	}
+	return kept
 }
 
 // weightedPick picks one entry from `items` proportional to Score.

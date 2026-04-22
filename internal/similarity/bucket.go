@@ -120,4 +120,11 @@ type Candidate struct {
 	// graph view ({"festival":"Sónar","year":2003}). Optional;
 	// nil is fine. Not used for ranking.
 	Edge map[string]any
+
+	// DiscogsReleaseID is the release id the candidate came from
+	// when known. Zero for plugin buckets or candidates sourced
+	// outside Discogs. v0.6.1 uses this to look up the candidate's
+	// Discogs genres during the genre-filter step — candidates
+	// without an id can't be filtered and pass through untouched.
+	DiscogsReleaseID int
 }

@@ -44,6 +44,8 @@ type Service struct {
 	songAcquirer SongAcquirer
 	weights      WeightStore
 	deduper      QueueDeduper
+	genreFilter  GenreFilter
+	enricher     CandidateEnricher
 	bus          *bus.Bus
 	logw         *discovery.Writer
 	log          *slog.Logger
@@ -74,6 +76,13 @@ type Config struct {
 	Deduper      QueueDeduper
 	Bus          *bus.Bus
 	Discovery    *discovery.Writer
+
+	// v0.6.1: optional genre-filter wiring. Both fields nil =
+	// no filter, engine never calls the enricher. Both non-nil
+	// = filter applies post-merge when the user has pinned
+	// genres. Half-wired (one nil) is treated as disabled.
+	GenreFilter       GenreFilter
+	CandidateEnricher CandidateEnricher
 }
 
 // NewService constructs a Service with no buckets registered.
@@ -89,11 +98,22 @@ func NewService(cfg Config) *Service {
 	if weights == nil {
 		weights = NewNoopWeightStore()
 	}
+	genreFilter := cfg.GenreFilter
+	// Half-wired is the same as unwired — filtering needs both
+	// the list of pinned genres AND a way to look up candidate
+	// genres. A future CandidateEnricher-less path would require
+	// buckets to self-tag candidates at emit time, which is a
+	// bigger contract change.
+	if genreFilter == nil || cfg.CandidateEnricher == nil {
+		genreFilter = NewNoopGenreFilter()
+	}
 	s := &Service{
 		seedReader:   cfg.SeedReader,
 		songAcquirer: cfg.SongAcquirer,
 		weights:      weights,
 		deduper:      cfg.Deduper,
+		genreFilter:  genreFilter,
+		enricher:     cfg.CandidateEnricher,
 		bus:          cfg.Bus,
 		logw:         cfg.Discovery,
 		log:          slog.Default().With("mod", "similarity"),
@@ -179,7 +199,7 @@ func (s *Service) Buckets() []Bucket {
 func (s *Service) rebuildEngine() {
 	bucketsCopy := make([]Bucket, len(s.buckets))
 	copy(bucketsCopy, s.buckets)
-	s.engine = newEngine(bucketsCopy, s.weights, s.deduper, s.rng)
+	s.engine = newEngine(bucketsCopy, s.weights, s.deduper, s.genreFilter, s.enricher, s.rng)
 }
 
 // StartWorkers subscribes the service to bus events. v0.5 PR A

@@ -46,6 +46,32 @@
           <span class="font-semibold">Your Library</span>
         </router-link>
 
+        <!-- v0.7: Discovery graph. Star-layout canvas showing
+             the currently-playing song in the center with up to
+             8 related songs around it. Between library + settings
+             so the navigation reads: "what I've saved, how to
+             explore out from here, how I've configured it." -->
+        <router-link
+          to="/graph"
+          class="flex items-center space-x-4 px-4 py-3 pixel-border transition-colors"
+          :class="[
+            $route.name === 'Graph'
+              ? 'bg-vibrant-pink text-white border-vibrant-pink'
+              : 'text-gray-700 hover:text-gray-900 hover:bg-vibrant-bg-hover border-transparent',
+          ]"
+        >
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <!-- Nodes + edges icon: three circles connected to a
+                 larger center. -->
+            <circle cx="12" cy="12" r="3" stroke-width="2" />
+            <circle cx="5" cy="6" r="1.75" stroke-width="2" />
+            <circle cx="19" cy="6" r="1.75" stroke-width="2" />
+            <circle cx="12" cy="20" r="1.75" stroke-width="2" />
+            <path stroke-linecap="round" stroke-width="2" d="M12 15v3M9.5 10.5L6.5 7.5M14.5 10.5l3-3" />
+          </svg>
+          <span class="font-semibold">Discovery graph</span>
+        </router-link>
+
         <router-link
           to="/settings"
           class="flex items-center space-x-4 px-4 py-3 pixel-border transition-colors"

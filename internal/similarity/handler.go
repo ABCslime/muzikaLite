@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 
@@ -295,6 +296,55 @@ func (h *Handler) GetWeights(w http.ResponseWriter, r *http.Request) {
 		weights = map[string]float64{}
 	}
 	httpx.WriteJSON(w, http.StatusOK, weights)
+}
+
+// Graph handles GET /api/similarity/graph?songId={uuid}&limit=8.
+// v0.7 — exploratory graph view. Returns Cytoscape-shaped JSON
+// with the center song + up to `limit` neighbor candidates drawn
+// from the same-label-era and collaborators buckets (equal
+// split, first-found, same-artist candidates dropped).
+//
+// songId is required. limit defaults to 8, clamped to [1, 30].
+// Missing/invalid songId → 400. Missing queue_songs row → 404.
+// Everything else (no Discogs match, empty bucket output, zero
+// connections) returns 200 with a possibly-empty graph so the
+// frontend can render its empty state rather than an error.
+func (h *Handler) Graph(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	q := r.URL.Query()
+	songIDRaw := q.Get("songId")
+	if songIDRaw == "" {
+		httpx.WriteError(w, http.StatusBadRequest, "songId is required")
+		return
+	}
+	songID, err := uuid.Parse(songIDRaw)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid songId")
+		return
+	}
+	limit := DefaultGraphLimit
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			httpx.WriteError(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		limit = n
+	}
+	if h.svc == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "similarity service not wired")
+		return
+	}
+	graph, err := h.svc.ExploreGraph(r.Context(), userID, songID, limit)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "graph failed: "+err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, graph)
 }
 
 // ListPresets returns the v0.6 weight presets ("Familiar",

@@ -366,6 +366,10 @@ func buildServer(
 	// v0.6 PR F: weight presets. Read-only, static; applying is
 	// the frontend's job (populate sliders then PUT /weights).
 	mux.Handle("GET /api/similarity/presets", withAuth(http.HandlerFunc(simH.ListPresets)))
+	// v0.7: graph view data. Exploratory, no persistence — the
+	// Discogs cache absorbs the cost of repeat calls on the same
+	// center.
+	mux.Handle("GET /api/similarity/graph", withAuth(http.HandlerFunc(simH.Graph)))
 
 	// --- User preferences (v0.4.1 PR A) ---
 	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))

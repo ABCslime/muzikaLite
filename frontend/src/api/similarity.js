@@ -43,4 +43,15 @@ export const similarityAPI = {
     const response = await client.get('/api/similarity/presets')
     return response.data
   },
+
+  // v0.7: exploratory graph. Returns {center, nodes, edges}
+  // Cytoscape-shaped with the center at Nodes[0]. Cheap per-
+  // call against the Discogs cache; safe to refetch on every
+  // currentSong change.
+  async getGraph(songId, limit = 8) {
+    const response = await client.get('/api/similarity/graph', {
+      params: { songId, limit },
+    })
+    return response.data
+  },
 }

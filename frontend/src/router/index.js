@@ -54,6 +54,14 @@ const router = createRouter({
       component: () => import('@/views/AlbumView.vue'),
       meta: { requiresAuth: true },
     },
+    // v0.7 — Discovery graph. Cytoscape.js is loaded lazily
+    // with the view so the base bundle stays small.
+    {
+      path: '/graph',
+      name: 'Graph',
+      component: () => import('@/views/GraphView.vue'),
+      meta: { requiresAuth: true },
+    },
   ],
 })
 

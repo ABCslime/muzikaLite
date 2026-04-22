@@ -29,6 +29,7 @@ import (
 	"github.com/macabc/muzika/internal/preferences"
 	"github.com/macabc/muzika/internal/queue"
 	"github.com/macabc/muzika/internal/search"
+	"github.com/macabc/muzika/internal/similarity"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
@@ -158,6 +159,26 @@ func run() error {
 		log.Info("discogs seeder enabled", "workers", cfg.DiscogsWorkers, "weight", cfg.DiscogsWeight)
 	}
 	previewer := search.NewPreviewer(dgClient).WithSoulseek(sk)
+
+	// ---- Similarity service (v0.5 PR A scaffolding) ----
+	//
+	// Empty bucket registry on PR A — Service.NextPick returns
+	// ErrNoCandidates and the refiller (when wired in PR B) will
+	// fall back to genre-random. PR B registers the first two
+	// Discogs buckets; PR C the remaining three.
+	//
+	// All cross-domain wiring goes through the small adapter types
+	// at the bottom of this file, mirroring the playlist.AlbumExpander
+	// pattern so internal/similarity stays free of queue imports.
+	simAdapter := &simQueueAdapter{q: qSvc}
+	simSvc := similarity.NewService(similarity.Config{
+		SeedReader:   simAdapter,
+		SongAcquirer: simAdapter,
+		Deduper:      simAdapter,
+		Bus:          b,
+		Discovery:    logw,
+	})
+	simSvc.StartWorkers(ctx)
 
 	// ---- HTTP ----
 	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer)
@@ -375,4 +396,69 @@ func (a *albumExpander) AcquireForUser(ctx context.Context, userID uuid.UUID, ti
 // of the release; returns true when a re-probe was scheduled.
 func (a *albumExpander) ReprobeNotFoundTrack(ctx context.Context, userID uuid.UUID, title, artist string) (bool, error) {
 	return a.q.ReprobeNotFoundTrack(ctx, userID, title, artist)
+}
+
+// simQueueAdapter implements similarity.SeedReader,
+// similarity.SongAcquirer, and similarity.QueueDeduper against
+// the existing queue.Service + queue.Repo. v0.5 PR A — same
+// adapter pattern as albumExpander, keeping internal/similarity
+// free of internal/queue imports.
+//
+// PR A wires the adapter and exercises the SongAcquirer +
+// QueueDeduper paths (zero callers today). PR B starts using
+// SeedReader to hydrate Discogs IDs from the seed song's
+// (title, artist).
+type simQueueAdapter struct {
+	q *queue.Service
+}
+
+// ReadSeed populates a similarity.Seed from queue_songs metadata.
+// PR A returns title + artist + image only; PR B will also resolve
+// the Discogs release ID + extract the similarity features
+// (artist ID, label ID, year, styles, genres, collaborators) so
+// buckets have something to work from.
+func (a *simQueueAdapter) ReadSeed(ctx context.Context, userID, songID uuid.UUID) (similarity.Seed, error) {
+	sg, err := a.q.Repo().GetSong(ctx, songID)
+	if err != nil {
+		return similarity.Seed{SongID: songID, UserID: userID}, err
+	}
+	return similarity.Seed{
+		SongID: songID,
+		UserID: userID,
+		Title:  sg.Title,
+		Artist: sg.Artist,
+	}, nil
+}
+
+// AcquireForUser routes a similarity pick through the existing
+// search-acquire path so it lands in queue_songs with the same
+// probe + ladder + image_url plumbing as any other queued release.
+// Identical body to albumExpander.AcquireForUser; kept distinct
+// so future similarity-specific tweaks (different correlation
+// query string, e.g.) don't bleed into the playlist module.
+func (a *simQueueAdapter) AcquireForUser(ctx context.Context, userID uuid.UUID, title, artist, imageURL string) (uuid.UUID, error) {
+	resp, err := a.q.Search(ctx, userID, queue.SearchRequest{
+		Title:    title,
+		Artist:   artist,
+		ImageURL: imageURL,
+		Query:    artist + " — " + title,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return resp.SongID, nil
+}
+
+// HasEntry reports whether the user already has a queue_entries
+// row for this (title, artist). Engine consults this after the
+// merge step to drop dupes — keeps similar mode from queuing the
+// same track twice. Errors collapse to false: better to risk a
+// duplicate than skip a real proposal because of a transient SQL
+// blip.
+func (a *simQueueAdapter) HasEntry(ctx context.Context, userID uuid.UUID, title, artist string) bool {
+	id, _, err := a.q.Repo().FindEntry(ctx, userID, title, artist)
+	if err != nil {
+		return false
+	}
+	return id != uuid.Nil
 }

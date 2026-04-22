@@ -199,7 +199,12 @@ func buildServer(
 	mux := http.NewServeMux()
 
 	authH := auth.NewHandler(a)
-	plH := playlist.NewHandler(p)
+	// v0.4.4: wire the cross-module album expander used by
+	// POST /api/playlist/{id}/album. The adapter is a thin closure
+	// over the existing previewer (Discogs tracklist fetch) and
+	// queue service (per-track acquire), so playlist doesn't import
+	// either module directly.
+	plH := playlist.NewHandler(p).WithAlbumExpander(&albumExpander{prev: previewer, q: q})
 	qH := queue.NewHandler(q)
 	prefH := preferences.NewHandler(pref)
 	searchH := search.NewHandler(previewer)
@@ -223,6 +228,7 @@ func buildServer(
 	mux.Handle("DELETE /api/playlist/{id}", withAuth(http.HandlerFunc(plH.Delete)))
 	mux.Handle("POST /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.AddSong)))
 	mux.Handle("DELETE /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.RemoveSong)))
+	mux.Handle("POST /api/playlist/{id}/album", withAuth(http.HandlerFunc(plH.AddAlbum)))
 
 	mux.Handle("GET /api/queue/queue", withAuth(http.HandlerFunc(qH.GetQueue)))
 	mux.Handle("POST /api/queue/queue", withAuth(http.HandlerFunc(qH.AddSong)))
@@ -297,4 +303,62 @@ func newLogger(level string) *slog.Logger {
 		lv = slog.LevelInfo
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv}))
+}
+
+// albumExpander adapts search.Previewer + queue.Service to the
+// playlist.AlbumExpander interface. v0.4.4. Lives here (not in
+// playlist or any other module) so neither side has to import the
+// other's concerns.
+type albumExpander struct {
+	prev *search.Previewer
+	q    *queue.Service
+}
+
+// Album fetches the Discogs release detail and packs it into the
+// playlist.Album shape: artist string, cover URL (prefer the
+// larger cover, fall back to the small thumb), and title-only
+// tracklist.
+func (a *albumExpander) Album(ctx context.Context, releaseID int) (playlist.Album, error) {
+	rd, err := a.prev.Release(ctx, releaseID)
+	if err != nil {
+		// Map "no such release" / "Discogs disabled" to playlist's
+		// own ErrNotFound so the handler returns 404 cleanly. Other
+		// upstream errors (rate limit, network) bubble as-is to a 502.
+		if errors.Is(err, search.ErrDiscogsDisabled) {
+			return playlist.Album{}, playlist.ErrNotFound
+		}
+		return playlist.Album{}, err
+	}
+	titles := make([]string, 0, len(rd.Tracks))
+	for _, t := range rd.Tracks {
+		if t.Title != "" {
+			titles = append(titles, t.Title)
+		}
+	}
+	imageURL := rd.Cover
+	if imageURL == "" {
+		imageURL = rd.Thumb
+	}
+	return playlist.Album{
+		Artist:   rd.Artist,
+		ImageURL: imageURL,
+		Tracks:   titles,
+	}, nil
+}
+
+// AcquireForUser triggers the existing search-acquire path for one
+// (title, artist, imageURL) triple. Returns the queue_songs UUID
+// the playlist handler appends to the chosen playlist. Equivalent
+// to a frontend click on a release tile in the preview dropdown.
+func (a *albumExpander) AcquireForUser(ctx context.Context, userID uuid.UUID, title, artist, imageURL string) (uuid.UUID, error) {
+	resp, err := a.q.Search(ctx, userID, queue.SearchRequest{
+		Title:    title,
+		Artist:   artist,
+		ImageURL: imageURL,
+		Query:    artist + " — " + title,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return resp.SongID, nil
 }

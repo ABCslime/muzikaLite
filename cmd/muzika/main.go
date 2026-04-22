@@ -178,8 +178,12 @@ func run() error {
 		SeedReader:   simAdapter,
 		SongAcquirer: simAdapter,
 		Deduper:      simAdapter,
-		Bus:          b,
-		Discovery:    logw,
+		// v0.5 PR D: Repo satisfies WeightStore — per-user tuned
+		// weights flow in via the bucket_weights JSON column.
+		// Missing values fall through to bucket defaults.
+		Weights:   simRepo,
+		Bus:       b,
+		Discovery: logw,
 	})
 	if dgClient != nil {
 		simSvc.Register(discogsbuckets.NewSameArtist(dgClient))
@@ -209,7 +213,7 @@ func run() error {
 	})
 
 	// ---- HTTP ----
-	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer, simRepo)
+	srv := buildServer(cfg, log, authSvc, plSvc, qSvc, prefSvc, previewer, simRepo, simSvc)
 	go func() {
 		log.Info("http listening", "addr", srv.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -245,6 +249,7 @@ func buildServer(
 	pref *preferences.Service,
 	previewer *search.Previewer,
 	simRepo *similarity.Repo,
+	simSvc *similarity.Service,
 ) *http.Server {
 	mux := http.NewServeMux()
 
@@ -316,9 +321,15 @@ func buildServer(
 	// GET returns the user's active seed (or null); POST sets it
 	// (or clears with seedSongId=null). Refiller reads the same
 	// state on each Trigger via the SimilarMode hook wired above.
-	simH := similarity.NewHandler(simRepo)
+	simH := similarity.NewHandler(simRepo, simSvc)
 	mux.Handle("GET /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Get)))
 	mux.Handle("POST /api/queue/similar-mode", withAuth(http.HandlerFunc(simH.Set)))
+	// v0.5 PR D: bucket registry + per-user weight tuning.
+	// Registry is read-only (code-owned); weights are per-user
+	// JSON merged with defaults at pick time.
+	mux.Handle("GET /api/similarity/buckets", withAuth(http.HandlerFunc(simH.ListBuckets)))
+	mux.Handle("GET /api/similarity/weights", withAuth(http.HandlerFunc(simH.GetWeights)))
+	mux.Handle("PUT /api/similarity/weights", withAuth(http.HandlerFunc(simH.PutWeights)))
 
 	// --- User preferences (v0.4.1 PR A) ---
 	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))

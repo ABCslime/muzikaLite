@@ -9,22 +9,27 @@ import (
 	"github.com/macabc/muzika/internal/httpx"
 )
 
-// Handler exposes the per-user similar-mode toggle:
+// Handler exposes the per-user similar-mode toggle + the bucket
+// weight settings surface:
 //
-//   GET  /api/queue/similar-mode → {"seedSongId": "..."} or null
-//   POST /api/queue/similar-mode → body {"seedSongId": "..." | null}
+//   GET  /api/queue/similar-mode  → {"seedSongId": "..."} or null
+//   POST /api/queue/similar-mode  → body {"seedSongId": "..."|null}
+//   GET  /api/similarity/buckets  → registered bucket metadata
+//   GET  /api/similarity/weights  → user's tuned weights (map)
+//   PUT  /api/similarity/weights  → replace user's weights
 //
-// Both routes are protected (httpx.WithAuth-wrapped at mount).
-// Setting an empty / null seedSongId clears the mode and the
-// refiller falls back to genre-random on the next Trigger.
+// All routes are protected (httpx.WithAuth-wrapped at mount).
 type Handler struct {
 	repo *Repo
+	svc  *Service // used for the bucket registry snapshot
 }
 
-// NewHandler constructs the HTTP handler over a Repo. Pass the
-// same Repo wired into the SimilarMode adapter on the refiller —
-// otherwise the GET state and the refiller's read can diverge.
-func NewHandler(r *Repo) *Handler { return &Handler{repo: r} }
+// NewHandler constructs the HTTP handler over a Repo and Service.
+// The Service reference gives the handler access to the bucket
+// registry for GET /api/similarity/buckets; passing the Repo
+// separately (even though Service.weights == Repo today) keeps
+// the seed-mode routes testable without constructing a Service.
+func NewHandler(r *Repo, s *Service) *Handler { return &Handler{repo: r, svc: s} }
 
 // SimilarModeResponse is the GET reply shape. seedSongId is the
 // JSON-stringified UUID, or null when similar mode is off.
@@ -93,4 +98,92 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 		resp.SeedSongID = &s
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
+}
+
+// BucketInfo is the JSON shape for one row in
+// GET /api/similarity/buckets. The frontend's settings UI uses
+// this to render one slider per bucket — label + description for
+// the label, defaultWeight for the slider's reset target, id as
+// the write key on PUT /api/similarity/weights.
+type BucketInfo struct {
+	ID            string  `json:"id"`
+	Label         string  `json:"label"`
+	Description   string  `json:"description"`
+	DefaultWeight float64 `json:"defaultWeight"`
+}
+
+// ListBuckets responds with the current bucket registry. Order
+// matches main.go's Register call order, which we use to group
+// related buckets in the UI (artist/label/style/collab/genre).
+//
+// Empty registry (Discogs disabled, plugins not loaded) returns
+// an empty array — the frontend renders "no buckets registered"
+// rather than pretending to have sliders.
+func (h *Handler) ListBuckets(w http.ResponseWriter, r *http.Request) {
+	if h.svc == nil {
+		httpx.WriteJSON(w, http.StatusOK, []BucketInfo{})
+		return
+	}
+	bs := h.svc.Buckets()
+	out := make([]BucketInfo, 0, len(bs))
+	for _, b := range bs {
+		out = append(out, BucketInfo{
+			ID:            b.ID(),
+			Label:         b.Label(),
+			Description:   b.Description(),
+			DefaultWeight: b.DefaultWeight(),
+		})
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
+}
+
+// GetWeights returns the user's tuned bucket weights. Missing
+// (no row / NULL / empty) returns an empty object, which the
+// frontend renders as "all sliders at their defaults."
+func (h *Handler) GetWeights(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	weights, err := h.repo.WeightsFor(r.Context(), userID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "read weights failed")
+		return
+	}
+	if weights == nil {
+		weights = map[string]float64{}
+	}
+	httpx.WriteJSON(w, http.StatusOK, weights)
+}
+
+// PutWeights replaces the user's bucket_weights JSON with the
+// body map. Empty/missing body = clear to defaults. We don't
+// partial-merge — a PUT is a full replace, consistent with the
+// user_preferences PUT semantics.
+//
+// No validation of bucket IDs against the registry: v0.6 plugins
+// may register new IDs after the user has set their weights, and
+// we want those weights to survive a plugin restart. Unknown IDs
+// in the stored map become inert (the engine only reads keys that
+// match a registered bucket).
+func (h *Handler) PutWeights(w http.ResponseWriter, r *http.Request) {
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	var body map[string]float64
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := h.repo.SetWeights(r.Context(), userID, body); err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "write weights failed")
+		return
+	}
+	if body == nil {
+		body = map[string]float64{}
+	}
+	httpx.WriteJSON(w, http.StatusOK, body)
 }

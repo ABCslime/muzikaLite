@@ -99,6 +99,13 @@
           </button>
         </div>
       </form>
+
+      <!-- v0.5 PR D: per-bucket weights for similar-mode
+           discovery. Self-contained component; loads its own
+           state from /api/similarity/buckets + weights. -->
+      <div class="mt-12 pt-8 border-t border-gray-300">
+        <BucketWeights />
+      </div>
         </div>
       </div>
       <PlayerBar />
@@ -112,6 +119,7 @@ import { usePreferencesStore } from '@/stores/preferences'
 import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
+import BucketWeights from '@/components/settings/BucketWeights.vue'
 
 // v0.4.2 PR B.1: the list covers Discogs' top-level genres PLUS the
 // styles people actually type (House, Techno, Trance, Ambient, …).

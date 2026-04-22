@@ -327,8 +327,14 @@ const similarTooltip = computed(() => {
 })
 
 async function handleSimilarToggle() {
-  if (!playerStore.currentSong?.id) return
-  await similarStore.toggleForSong(playerStore.currentSong.id)
+  const cs = playerStore.currentSong
+  if (!cs?.id) return
+  // Forward title/artist so the Home-view chip renders instantly
+  // without waiting for a hydrate round-trip.
+  await similarStore.toggleForSong(cs.id, {
+    title: cs.title || '',
+    artist: cs.artist || '',
+  })
 }
 
 onMounted(() => {

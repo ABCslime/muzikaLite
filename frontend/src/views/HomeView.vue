@@ -14,6 +14,18 @@
           <div class="flex items-center justify-between flex-wrap gap-4 mb-8">
             <h1 class="text-3xl font-bold text-gray-900">Home</h1>
             <div class="flex items-center gap-2 flex-wrap">
+              <!-- v0.5 PR F: similar-mode seed pin. Appears first
+                   so the user's eye reads "your queue is being
+                   seeded by THIS song" before the genre chips.
+                   When similar mode is on, the refiller ignores
+                   genre pins anyway; showing the similar pin
+                   first makes that ordering legible. -->
+              <SimilarPin
+                v-if="similarStore.active"
+                :title="similarStore.seedTitle"
+                :artist="similarStore.seedArtist"
+                @unpin="similarStore.clear()"
+              />
               <GenreChip
                 v-for="t in prefsStore.bandcampTags"
                 :key="`bc-${t}`"
@@ -29,7 +41,7 @@
                 @unpin="unpinDiscogs(g)"
               />
               <router-link
-                v-if="totalPinned === 0"
+                v-if="totalPinned === 0 && !similarStore.active"
                 to="/settings"
                 class="text-sm text-gray-600 hover:text-vibrant-pink underline"
               >
@@ -64,9 +76,12 @@ import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import QueueView from '@/components/queue/QueueView.vue'
 import GenreChip from '@/components/home/GenreChip.vue'
+import SimilarPin from '@/components/home/SimilarPin.vue'
 import { usePreferencesStore } from '@/stores/preferences'
+import { useSimilarStore } from '@/stores/similar'
 
 const prefsStore = usePreferencesStore()
+const similarStore = useSimilarStore()
 
 const totalPinned = computed(
   () => prefsStore.bandcampTags.length + prefsStore.discogsGenres.length,
@@ -75,6 +90,10 @@ const totalPinned = computed(
 onMounted(() => {
   // Idempotent; SettingsView also fetches.
   prefsStore.fetch()
+  // v0.5 PR F: hydrate similar-mode state so the pin renders on
+  // first paint if the user left similar mode on across a reload.
+  // Idempotent with PlayerBar's own hydrate call.
+  similarStore.hydrate()
 })
 
 async function unpinBandcamp(tag) {

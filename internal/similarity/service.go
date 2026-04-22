@@ -115,6 +115,21 @@ func (s *Service) LastError(userID uuid.UUID) string {
 	return s.lastErrs[userID]
 }
 
+// ReadSeedMetadata returns the (title, artist) of a seed song,
+// exposing the SeedReader adapter so the HTTP handler can render
+// the Home-view chip without a second DB round-trip and without
+// reaching into the adapter directly.
+//
+// Returns only the display-facing subset of Seed — we intentionally
+// don't leak the Discogs hydration fields (those are internal to
+// the engine). v0.5 PR F.
+func (s *Service) ReadSeedMetadata(ctx context.Context, userID, seedSongID uuid.UUID) (Seed, error) {
+	if s.seedReader == nil {
+		return Seed{}, fmt.Errorf("similarity: seed reader not wired")
+	}
+	return s.seedReader.ReadSeed(ctx, userID, seedSongID)
+}
+
 // ClearLastError drops the cached error for a user. Called by
 // the handler on SetSeed so a new seed starts with a clean slate
 // (stale error from the previous seed wouldn't be meaningful).

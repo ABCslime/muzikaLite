@@ -37,6 +37,12 @@ export const useSimilarStore = defineStore('similar', {
     // this to render the lens in an orange "active but not
     // working" state, distinct from both off and healthy-active.
     lastError: '',
+    // v0.5 PR F: (title, artist) of the active seed song — the
+    // backend sends these alongside seedSongId on GET so the
+    // Home-view chip renders without a second fetch. Empty
+    // when similar mode is off.
+    seedTitle: '',
+    seedArtist: '',
   }),
 
   getters: {
@@ -54,10 +60,14 @@ export const useSimilarStore = defineStore('similar', {
         this.seedSongId = r.seedSongId || null
         this.status = r.active ? 'on' : 'off'
         this.lastError = r.lastError || ''
+        this.seedTitle = r.seedTitle || ''
+        this.seedArtist = r.seedArtist || ''
       } catch {
         this.seedSongId = null
         this.status = 'off'
         this.lastError = ''
+        this.seedTitle = ''
+        this.seedArtist = ''
       }
     },
 
@@ -69,7 +79,12 @@ export const useSimilarStore = defineStore('similar', {
     // while playing track B when the seed is track A should
     // RE-SEED to B, not toggle off. Matches the user's mental
     // model — "make the queue follow this one."
-    async toggleForSong(songId) {
+    //
+    // v0.5 PR F: callers can pass title/artist alongside the id
+    // so the Home-view chip renders immediately without waiting
+    // for a hydrate round-trip. Optional — hydrate() fills these
+    // in on next page load either way.
+    async toggleForSong(songId, { title = '', artist = '' } = {}) {
       if (!songId) return
       if (this.pending) return
       this.pending = true
@@ -80,11 +95,15 @@ export const useSimilarStore = defineStore('similar', {
       const prevSeed = this.seedSongId
       const prevStatus = this.status
       const prevError = this.lastError
+      const prevTitle = this.seedTitle
+      const prevArtist = this.seedArtist
       this.seedSongId = nextSeed
       this.status = nextSeed ? 'on' : 'off'
       // Changing the seed invalidates any prior error — the backend
       // clears it server-side too; mirror here for snappy UX.
       this.lastError = ''
+      this.seedTitle = nextSeed ? title : ''
+      this.seedArtist = nextSeed ? artist : ''
       try {
         await queueAPI.setSimilarMode(nextSeed)
       } catch {
@@ -92,6 +111,8 @@ export const useSimilarStore = defineStore('similar', {
         this.seedSongId = prevSeed
         this.status = prevStatus
         this.lastError = prevError
+        this.seedTitle = prevTitle
+        this.seedArtist = prevArtist
       } finally {
         this.pending = false
       }
@@ -106,15 +127,21 @@ export const useSimilarStore = defineStore('similar', {
       const prevSeed = this.seedSongId
       const prevStatus = this.status
       const prevError = this.lastError
+      const prevTitle = this.seedTitle
+      const prevArtist = this.seedArtist
       this.seedSongId = null
       this.status = 'off'
       this.lastError = ''
+      this.seedTitle = ''
+      this.seedArtist = ''
       try {
         await queueAPI.setSimilarMode(null)
       } catch {
         this.seedSongId = prevSeed
         this.status = prevStatus
         this.lastError = prevError
+        this.seedTitle = prevTitle
+        this.seedArtist = prevArtist
       } finally {
         this.pending = false
       }

@@ -42,10 +42,18 @@ func NewHandler(r *Repo, s *Service) *Handler { return &Handler{repo: r, svc: s}
 // has no Discogs match or all buckets came back empty. Empty
 // string = last cycle succeeded (or no cycle has run yet, which
 // the frontend treats as "assume OK until proven otherwise").
+//
+// v0.5 PR F: SeedTitle + SeedArtist are populated when a seed is
+// active. Lets the Home view render a chip ("Similar: <artist> —
+// <title>") without a second round-trip to fetch the song. Empty
+// strings when similar mode is off; populated from queue_songs
+// via the same SeedReader adapter the engine uses.
 type SimilarModeResponse struct {
 	SeedSongID *string `json:"seedSongId"`
 	Active     bool    `json:"active"`
 	LastError  string  `json:"lastError,omitempty"`
+	SeedTitle  string  `json:"seedTitle,omitempty"`
+	SeedArtist string  `json:"seedArtist,omitempty"`
 }
 
 // SimilarModeRequest is the POST body. SeedSongID nil OR empty
@@ -72,6 +80,16 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		resp.SeedSongID = &s
 		if h.svc != nil {
 			resp.LastError = h.svc.LastError(userID)
+			// v0.5 PR F: hydrate the seed's (title, artist) for the
+			// Home-view chip. Same adapter the engine uses for the
+			// refill path — so an inconsistent "chip shows one thing
+			// but picks are made from another" is impossible.
+			// Hydration failure is silently tolerated: the chip just
+			// renders with the id as a fallback label.
+			if seedMeta, err := h.svc.ReadSeedMetadata(r.Context(), userID, seed); err == nil {
+				resp.SeedTitle = seedMeta.Title
+				resp.SeedArtist = seedMeta.Artist
+			}
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)

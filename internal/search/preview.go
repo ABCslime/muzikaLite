@@ -94,16 +94,16 @@ type broadCacheEntry struct {
 }
 
 // broadCacheTTL is how long a cached broad-search result stays
-// fresh. 10 min gives a comfortable buffer over typical user
-// browsing sessions ("open Nujabes, queue a few things, go read
-// the wikipedia tab, come back") so they see the same hit rate
-// on re-visit as cold. Longer than that risks serving stale
-// peer-availability data; the observed churn on a popular
-// artist is in the 1-hour-plus range, so 10 minutes is a safe
-// spot. Combined with retry-on-zero in the miss path, a cached
-// result hides Soulseek session-degradation issues that would
-// otherwise show up as "0 hits after the first time".
-const broadCacheTTL = 10 * time.Minute
+// fresh. 60 s is long enough for the typical "artist → album →
+// back" round trip but short enough that peer availability
+// updates propagate within a minute of a refresh. Previously
+// bumped to 10 min to paper over a session-lifetime bug in
+// the Soulseek client where the second search returned zero
+// because the TCP connection was tied to the first request's
+// context; that bug is fixed upstream in internal/soulseek/
+// native.go, so the cache can go back to its "speed up common
+// back-and-forth nav, not hide broken-ness" role.
+const broadCacheTTL = 60 * time.Second
 
 // broadCacheMaxEntries caps the cache to bound memory. 64 artists
 // is plenty for interactive browsing; once hit, the whole cache
@@ -634,34 +634,7 @@ func (p *Previewer) CheckByArtistAvailability(ctx context.Context, artist string
 	p.log.Debug("by-artist availability cache miss",
 		"artist", artist)
 
-	// Do up to two broad attempts with a short reconnect pause
-	// between them. Soulseek's distributed-peer search routing is
-	// empirically flaky: a search that returned thousands of hits
-	// one moment can return zero the next because our distributed
-	// parent silently died (TCP half-open, peer quit). The first
-	// zero-result response TRIGGERS the patched parent-disconnect
-	// detection in soul (HaveNoParent=true sent to the server),
-	// which in a couple of seconds gives us a fresh parent. The
-	// retry then runs through that fresh parent and typically
-	// recovers.
-	//
-	// The handler-level deadline (22 s) caps total work: first try
-	// ~10 s + ~2 s reconnect pause + ~10 s retry = 22 s. If the
-	// first attempt happens to succeed, we skip the pause and
-	// retry entirely — healthy-session fast path.
 	broad := p.broadSearchOnce(ctx, artist)
-	if len(broad) == 0 {
-		// Give soul a moment to notice the dead parent and
-		// reconnect to a fresh one before retrying. 2 s is
-		// usually enough — the new-parent dial completes in
-		// <1 s when the server-supplied list has a live peer.
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return results, nil
-		}
-		broad = p.broadSearchOnce(ctx, artist)
-	}
 	if len(broad) == 0 {
 		return results, nil
 	}

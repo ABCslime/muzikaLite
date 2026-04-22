@@ -13,18 +13,12 @@ import (
 )
 
 // availabilityByArtistDeadline caps how long one by-artist request
-// can occupy a goroutine. The deadline lives on the handler (not
-// deeper in CheckByArtistAvailability) so it applies to every code
-// path — broad search, per-title fallback, and the in-flight gosk
-// goroutines we cancel via ctx.
-//
-// 22 s budgets for two broad tries (each up to 10 s) with a couple
-// of seconds of slack. The retry is only paid when the first try
-// returned zero — in the healthy-session common case the second
-// try is skipped and the deadline is far from hit. Still under
-// the 30 s that most reverse proxies / browsers accept without
-// complaint.
-const availabilityByArtistDeadline = 22 * time.Second
+// can occupy a goroutine. 15 s fits the 10 s broad window plus a
+// few seconds of fallback probing, with slack for variants in
+// network latency. No retry-on-zero anymore — the session-ctx
+// fix in internal/soulseek/native.go means the second search
+// actually reaches the server instead of being silently dropped.
+const availabilityByArtistDeadline = 15 * time.Second
 
 // Handler mounts GET /api/queue/search/preview.
 type Handler struct{ prev *Previewer }

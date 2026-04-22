@@ -16,8 +16,6 @@ import (
 	"syscall"
 	"time"
 
-	_ "net/http/pprof"
-
 	"github.com/macabc/muzika/internal/auth"
 	"github.com/macabc/muzika/internal/bandcamp"
 	"github.com/macabc/muzika/internal/bus"
@@ -214,13 +212,6 @@ func buildServer(
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-
-	// Debug/diagnostic: pprof for goroutine leak diagnosis during QA.
-	// Not wrapped in auth — dev-only. Safe to expose on localhost only.
-	// Remove or auth-gate before production.
-	mux.Handle("GET /debug/pprof/", http.DefaultServeMux)
-	mux.Handle("GET /debug/pprof/goroutine", http.DefaultServeMux)
-	mux.Handle("GET /debug/pprof/heap", http.DefaultServeMux)
 
 	// --- Protected — each wrapped explicitly ---
 	mux.Handle("DELETE /api/auth/user/{id}", withAuth(http.HandlerFunc(authH.Delete)))

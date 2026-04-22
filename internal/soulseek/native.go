@@ -24,6 +24,25 @@ import (
 type NativeClient struct {
 	g *gosk.Client
 
+	// sessionCtx scopes the lifetime of the Soulseek session (the TCP
+	// connection to the Soulseek server, plus the read/write/listen/
+	// deserialize goroutines inside soul that depend on it).
+	//
+	// CRITICAL: this MUST NOT be the ctx of any individual caller
+	// (HTTP request, background worker). If Login were given a
+	// request ctx via sync.Once, the first request to arrive would
+	// have its ctx bound to the session for the rest of the process.
+	// When that request completes, its ctx cancels, soul's Dial
+	// cleanup goroutine fires c.close(), the TCP socket closes, and
+	// every search from then on silently fails because the write
+	// goroutine is gone and the Writer channel reader is dead.
+	//
+	// Separate context, cancelled only in Close(), keeps the session
+	// alive across every request that comes through the single
+	// shared NativeClient instance.
+	sessionCtx    context.Context
+	sessionCancel context.CancelFunc
+
 	loginOnce sync.Once
 	loginErr  error
 
@@ -42,22 +61,36 @@ func NewNativeClient(cfg *gosk.Config) (*NativeClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
 	return &NativeClient{
 		g:               g,
+		sessionCtx:      sessionCtx,
+		sessionCancel:   sessionCancel,
 		handleFilenames: make(map[string]string),
 	}, nil
 }
 
 // ensureLogin triggers the one-shot login on first use.
-func (n *NativeClient) ensureLogin(ctx context.Context) error {
+//
+// The caller's ctx is IGNORED for the Login call itself — we use the
+// long-lived sessionCtx so the session outlives any individual request.
+// If the caller's ctx cancels mid-login (user closes the tab while a
+// search is waiting for first-boot), Login continues to completion in
+// the background; the caller sees the normal search-timeout path but
+// the next request finds a ready session.
+func (n *NativeClient) ensureLogin(_ context.Context) error {
 	n.loginOnce.Do(func() {
-		n.loginErr = n.g.Login(ctx)
+		n.loginErr = n.g.Login(n.sessionCtx)
 	})
 	return n.loginErr
 }
 
-// Close tears down the underlying client.
-func (n *NativeClient) Close() error { return n.g.Close() }
+// Close tears down the underlying client and the session context. Safe
+// to call once, at process shutdown.
+func (n *NativeClient) Close() error {
+	n.sessionCancel()
+	return n.g.Close()
+}
 
 // Inner exposes the wrapped *gosk.Client for callers that want direct access
 // (e.g. for Resume on startup).

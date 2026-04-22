@@ -341,11 +341,40 @@ func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
 	if p.client == nil {
 		return ArtistDetail{}, ErrDiscogsDisabled
 	}
-	releases, err := p.client.ArtistReleases(ctx, id, 50)
-	if err != nil {
-		return ArtistDetail{}, err
+	// Two parallel fetches — releases list + entity detail (image,
+	// canonical name). Both are cached on the Discogs side so a
+	// repeat visit pays nothing; the parallelism only matters for
+	// cold loads.
+	var (
+		wg          sync.WaitGroup
+		releases    []discogs.SearchResult
+		releasesErr error
+		entity      discogs.EntityDetail
+		entityErr   error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		releases, releasesErr = p.client.ArtistReleases(ctx, id, 50)
+	}()
+	go func() {
+		defer wg.Done()
+		entity, entityErr = p.client.Artist(ctx, id)
+	}()
+	wg.Wait()
+
+	if releasesErr != nil {
+		return ArtistDetail{}, releasesErr
 	}
 	out := ArtistDetail{ID: id, Releases: make([]Candidate, 0, len(releases))}
+	if entityErr == nil {
+		// Canonical name + real press image when Discogs returned them.
+		out.Name = entity.Name
+		out.Image = entity.Image
+	} else {
+		p.log.Debug("artist entity fetch failed (using release-derived fallbacks)",
+			"id", id, "err", entityErr)
+	}
 	for _, r := range releases {
 		out.Releases = append(out.Releases, Candidate{
 			Title:         r.Title,
@@ -354,6 +383,8 @@ func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
 			Year:          r.Year,
 			Thumb:         r.Thumb,
 		})
+		// Fallbacks if /artists/{id} didn't return a name/image —
+		// e.g. transient Discogs error, brand new artist record.
 		if out.Name == "" && r.Artist != "" {
 			out.Name = r.Artist
 		}
@@ -369,11 +400,36 @@ func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
 	if p.client == nil {
 		return LabelDetail{}, ErrDiscogsDisabled
 	}
-	releases, err := p.client.LabelReleases(ctx, id, 50)
-	if err != nil {
-		return LabelDetail{}, err
+	// Same parallel pattern as Artist — releases + entity detail.
+	var (
+		wg          sync.WaitGroup
+		releases    []discogs.SearchResult
+		releasesErr error
+		entity      discogs.EntityDetail
+		entityErr   error
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		releases, releasesErr = p.client.LabelReleases(ctx, id, 50)
+	}()
+	go func() {
+		defer wg.Done()
+		entity, entityErr = p.client.Label(ctx, id)
+	}()
+	wg.Wait()
+
+	if releasesErr != nil {
+		return LabelDetail{}, releasesErr
 	}
 	out := LabelDetail{ID: id, Releases: make([]Candidate, 0, len(releases))}
+	if entityErr == nil {
+		out.Name = entity.Name
+		out.Image = entity.Image
+	} else {
+		p.log.Debug("label entity fetch failed (using release-derived fallbacks)",
+			"id", id, "err", entityErr)
+	}
 	for _, r := range releases {
 		out.Releases = append(out.Releases, Candidate{
 			Title:         r.Title,

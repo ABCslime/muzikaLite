@@ -490,6 +490,87 @@ type Track struct {
 	Duration string // "3:45" or "" when unknown
 }
 
+// EntityDetail is the payload for /artists/{id} or /labels/{id} —
+// the entity's name plus a hero image. Used by ArtistView and
+// LabelView to render the actual press photo / label logo Discogs
+// has on file, instead of falling back to a member release's thumb.
+//
+// v0.4.4: introduced. Image is the URI of the first primary image
+// from Discogs' images[]; empty when the entity has no linked
+// artwork. Profile is left out — we only need the image for the
+// hero, and adding profile would push us toward a richer
+// "About this artist" view that's a separate scope.
+type EntityDetail struct {
+	ID    int
+	Name  string
+	Image string
+}
+
+// Artist fetches /artists/{id} for the entity's name + image. Cached
+// alongside other Discogs responses under `artist:<id>` with the
+// 30-day TTL. Returns ErrNoResults when Discogs returns 404 (the
+// id is bogus or the artist was removed from the database).
+func (c *Client) Artist(ctx context.Context, artistID int) (EntityDetail, error) {
+	if artistID <= 0 {
+		return EntityDetail{}, fmt.Errorf("discogs: artistID must be positive")
+	}
+	key := fmt.Sprintf("artist:%d", artistID)
+	path := fmt.Sprintf("/artists/%d", artistID)
+	payload, err := c.fetchRaw(ctx, key, path, nil)
+	if err != nil {
+		return EntityDetail{}, err
+	}
+	return parseEntityDetail(payload)
+}
+
+// Label is the label analog of Artist. Same response shape on the
+// Discogs side (id, name, images[]).
+func (c *Client) Label(ctx context.Context, labelID int) (EntityDetail, error) {
+	if labelID <= 0 {
+		return EntityDetail{}, fmt.Errorf("discogs: labelID must be positive")
+	}
+	key := fmt.Sprintf("label:%d", labelID)
+	path := fmt.Sprintf("/labels/%d", labelID)
+	payload, err := c.fetchRaw(ctx, key, path, nil)
+	if err != nil {
+		return EntityDetail{}, err
+	}
+	return parseEntityDetail(payload)
+}
+
+// parseEntityDetail decodes /artists/{id} or /labels/{id}. Both
+// endpoints share the relevant fields (id, name, images[]).
+// The first primary image wins; if no image is type=="primary",
+// fall back to images[0]. Empty when no images are present.
+func parseEntityDetail(payload []byte) (EntityDetail, error) {
+	var resp struct {
+		ID     int    `json:"id"`
+		Name   string `json:"name"`
+		Images []struct {
+			Type string `json:"type"`
+			URI  string `json:"uri"`
+		} `json:"images"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
+		return EntityDetail{}, fmt.Errorf("discogs: unmarshal entity: %w", err)
+	}
+	image := ""
+	for _, img := range resp.Images {
+		if img.Type == "primary" && img.URI != "" {
+			image = img.URI
+			break
+		}
+	}
+	if image == "" && len(resp.Images) > 0 {
+		image = resp.Images[0].URI
+	}
+	return EntityDetail{
+		ID:    resp.ID,
+		Name:  strings.TrimSpace(resp.Name),
+		Image: image,
+	}, nil
+}
+
 // ArtistReleases returns up to `limit` releases credited to artistID,
 // preserving Discogs' ordering (most-recent-first by default). Cached
 // under `artist:<id>:releases` with the standard 30-day TTL.

@@ -31,5 +31,19 @@ export const playlistAPI = {
   async removeSongFromPlaylist(playlistId, songId) {
     await client.delete(`${API_URLS.PLAYLIST}/${playlistId}/song/${songId}`)
   },
+
+  // v0.4.4: expand a Discogs album into individual tracks and add
+  // each to the playlist. The backend fetches the tracklist, runs
+  // the search-acquire flow per track, and returns a {added, total}
+  // summary so the UI can toast progress. Tracks that probe
+  // not_found stay in the playlist; AlbumView re-probes them on
+  // mount.
+  async addAlbumToPlaylist(playlistId, releaseId) {
+    const response = await client.post(
+      `${API_URLS.PLAYLIST}/${playlistId}/album`,
+      { releaseId },
+    )
+    return response.data
+  },
 }
 

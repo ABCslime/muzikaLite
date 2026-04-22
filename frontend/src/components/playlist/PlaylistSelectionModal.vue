@@ -1,7 +1,7 @@
 <template>
-  <Modal :show="show" title="Add to Playlist" @close="handleClose">
+  <Modal :show="show" :title="album ? 'Add Album to Playlist' : 'Add to Playlist'" @close="handleClose">
     <div v-if="addingSongId" class="text-center py-4">
-      <p class="text-gray-600">Adding song to playlist...</p>
+      <p class="text-gray-600">{{ album ? 'Adding album tracks to playlist…' : 'Adding song to playlist…' }}</p>
     </div>
 
     <div v-else-if="successMessage" class="text-center py-4">
@@ -91,6 +91,14 @@ const props = defineProps({
     type: Object,
     default: null,
   },
+  // v0.4.4: when album is set instead of song, the modal acts on
+  // a Discogs album release. Selecting a playlist calls the
+  // addAlbumToPlaylist store action which expands the album server-
+  // side into all its tracks. Shape: { id, title, artist }.
+  album: {
+    type: Object,
+    default: null,
+  },
 })
 
 const emit = defineEmits(['close'])
@@ -112,18 +120,34 @@ const fetchPlaylists = async () => {
 }
 
 const handleSelectPlaylist = async (playlistId) => {
+  // Album branch (v0.4.4): expand the Discogs release server-side.
+  if (props.album?.id) {
+    addingSongId.value = playlistId
+    const result = await playlistStore.addAlbumToPlaylist(playlistId, props.album.id)
+    if (result.success) {
+      const playlist = playlistStore.playlists.find(p => p.id === playlistId)
+      const albumTitle = props.album.title || 'album'
+      successMessage.value = `Added ${result.added}/${result.total} tracks of "${albumTitle}" to "${playlist?.name || 'playlist'}"`
+      setTimeout(() => { handleClose() }, 2500)
+    } else {
+      addingSongId.value = null
+    }
+    return
+  }
+
+  // Song branch (existing).
   if (!props.song?.id) {
     return
   }
 
   addingSongId.value = playlistId
   const result = await playlistStore.addSongToPlaylist(playlistId, props.song.id)
-  
+
   if (result.success) {
     const playlist = playlistStore.playlists.find(p => p.id === playlistId)
     const songTitle = getSongTitle(props.song)
     successMessage.value = `"${songTitle}" added to "${playlist?.name || 'playlist'}"`
-    
+
     // Auto-close after 2 seconds
     setTimeout(() => {
       handleClose()

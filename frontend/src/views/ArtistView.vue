@@ -66,14 +66,38 @@
             </div>
           </div>
 
-          <div class="px-8 py-4">
+          <!-- v0.4.4: split. Albums section first (no Soulseek
+               probe — the per-track probe runs only when the user
+               actually adds the album to a playlist). Then singles,
+               which keep the existing per-row Soulseek availability
+               check + Queue button. -->
+          <div v-if="albums.length" class="px-8 py-4">
+            <h2 class="text-xl font-bold text-gray-900 mb-4">
+              Albums <span class="text-gray-500 font-normal text-sm">({{ albums.length }})</span>
+            </h2>
+            <AlbumList
+              :releases="albums"
+              @add-album="handleAddAlbum"
+            />
+          </div>
+
+          <div v-if="singles.length" class="px-8 py-4">
+            <h2 class="text-xl font-bold text-gray-900 mb-4">
+              Singles <span class="text-gray-500 font-normal text-sm">({{ singles.length }})</span>
+            </h2>
             <ReleaseGrid
-              :releases="detail.releases"
+              :releases="singles"
               :availability="availability"
               :availability-checking="availabilityChecking"
             />
           </div>
         </template>
+
+        <PlaylistSelectionModal
+          :show="showAlbumModal"
+          :album="selectedAlbum"
+          @close="showAlbumModal = false"
+        />
       </div>
       <PlayerBar />
     </div>
@@ -87,6 +111,8 @@ import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import ReleaseGrid from '@/components/discogs/ReleaseGrid.vue'
+import AlbumList from '@/components/discogs/AlbumList.vue'
+import PlaylistSelectionModal from '@/components/playlist/PlaylistSelectionModal.vue'
 import { discogsAPI } from '@/api/discogs'
 
 const route = useRoute()
@@ -104,6 +130,25 @@ const availableCount = computed(() => {
   if (availability.value.length === 0) return null
   return availability.value.filter(a => a?.available).length
 })
+
+// v0.4.4: partition releases into Albums (LP/Album/EP/Mini-Album)
+// vs Singles. Backend tags each release with isAlbum. The probe
+// only runs over singles — albums defer their per-track probes
+// until the user actually adds the album to a playlist.
+const albums = computed(() => detail.value.releases.filter(r => r.isAlbum))
+const singles = computed(() => detail.value.releases.filter(r => !r.isAlbum))
+
+// "Add full album to playlist" modal state — opened from AlbumList.
+const showAlbumModal = ref(false)
+const selectedAlbum = ref(null)
+function handleAddAlbum(release) {
+  selectedAlbum.value = {
+    id: release.id,
+    title: release.title,
+    artist: release.artist,
+  }
+  showAlbumModal.value = true
+}
 
 async function load(id) {
   loading.value = true
@@ -124,26 +169,22 @@ async function load(id) {
 }
 
 async function runAvailability() {
-  if (!detail.value.releases?.length) return
+  // v0.4.4: probe only the singles. Album rows defer their per-track
+  // probes until the user adds the album to a playlist (PR C). This
+  // keeps the artist-page Soulseek query small AND defensible — even
+  // a 50-release discography rarely has more than 5-15 singles.
+  const singlesList = singles.value
+  if (!singlesList.length) return
   availabilityChecking.value = true
   try {
-    // v0.4.2 PR E: artist-broad probe. ONE Soulseek search for
-    // detail.name, then backend filters the filename list against
-    // each release title. Replaces the PR-D per-release fan-out,
-    // which was slower (N peer calls) and more prone to false
-    // negatives from filename variance.
-    //
-    // detail.name comes from the first release's artist field —
-    // should be the same for every row on a real artist page, but
-    // fall back to the per-item path if name is somehow missing.
     if (detail.value.name) {
       availability.value = await discogsAPI.checkAvailabilityByArtist(
         detail.value.name,
-        detail.value.releases.map(r => r.title),
+        singlesList.map(r => r.title),
       )
     } else {
       availability.value = await discogsAPI.checkAvailability(
-        detail.value.releases.map(r => ({
+        singlesList.map(r => ({
           title: r.title,
           artist: r.artist,
           catalogNumber: r.catalogNumber || '',

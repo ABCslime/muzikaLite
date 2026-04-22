@@ -108,6 +108,27 @@ export const usePlaylistStore = defineStore('playlist', {
       }
     },
 
+    // v0.4.4: expand a Discogs album (releaseId) into individual
+    // tracks and add each to the playlist. Returns the {added,
+    // total} summary the backend produces so the modal can show
+    // "12 of 14 tracks added" feedback.
+    async addAlbumToPlaylist(playlistId, releaseId) {
+      this.loading = true
+      this.error = null
+      try {
+        const summary = await playlistAPI.addAlbumToPlaylist(playlistId, releaseId)
+        if (this.currentPlaylist?.playlist?.id === playlistId) {
+          await this.fetchPlaylist(playlistId)
+        }
+        return { success: true, added: summary.added, total: summary.total }
+      } catch (error) {
+        this.error = error.response?.data?.error || error.message || 'Failed to add album to playlist'
+        return { success: false, error: this.error }
+      } finally {
+        this.loading = false
+      }
+    },
+
     async removeSongFromPlaylist(playlistId, songId) {
       this.loading = true
       this.error = null

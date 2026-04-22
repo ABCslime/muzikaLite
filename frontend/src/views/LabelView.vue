@@ -61,14 +61,34 @@
             </div>
           </div>
 
-          <div class="px-8 py-4">
+          <!-- v0.4.4: same Album / Single split as ArtistView. -->
+          <div v-if="albums.length" class="px-8 py-4">
+            <h2 class="text-xl font-bold text-gray-900 mb-4">
+              Albums <span class="text-gray-500 font-normal text-sm">({{ albums.length }})</span>
+            </h2>
+            <AlbumList
+              :releases="albums"
+              @add-album="handleAddAlbum"
+            />
+          </div>
+
+          <div v-if="singles.length" class="px-8 py-4">
+            <h2 class="text-xl font-bold text-gray-900 mb-4">
+              Singles <span class="text-gray-500 font-normal text-sm">({{ singles.length }})</span>
+            </h2>
             <ReleaseGrid
-              :releases="detail.releases"
+              :releases="singles"
               :availability="availability"
               :availability-checking="availabilityChecking"
             />
           </div>
         </template>
+
+        <PlaylistSelectionModal
+          :show="showAlbumModal"
+          :album="selectedAlbum"
+          @close="showAlbumModal = false"
+        />
       </div>
       <PlayerBar />
     </div>
@@ -82,6 +102,8 @@ import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import ReleaseGrid from '@/components/discogs/ReleaseGrid.vue'
+import AlbumList from '@/components/discogs/AlbumList.vue'
+import PlaylistSelectionModal from '@/components/playlist/PlaylistSelectionModal.vue'
 import { discogsAPI } from '@/api/discogs'
 
 const route = useRoute()
@@ -96,6 +118,21 @@ const availableCount = computed(() => {
   if (availability.value.length === 0) return null
   return availability.value.filter(a => a?.available).length
 })
+
+// v0.4.4: same Album/Single bucketing as ArtistView.
+const albums = computed(() => detail.value.releases.filter(r => r.isAlbum))
+const singles = computed(() => detail.value.releases.filter(r => !r.isAlbum))
+
+const showAlbumModal = ref(false)
+const selectedAlbum = ref(null)
+function handleAddAlbum(release) {
+  selectedAlbum.value = {
+    id: release.id,
+    title: release.title,
+    artist: release.artist,
+  }
+  showAlbumModal.value = true
+}
 
 async function load(id) {
   loading.value = true
@@ -116,11 +153,14 @@ async function load(id) {
 }
 
 async function runAvailability() {
-  if (!detail.value.releases?.length) return
+  // v0.4.4: probe singles only — albums defer per-track probes
+  // until the user adds one to a playlist.
+  const singlesList = singles.value
+  if (!singlesList.length) return
   availabilityChecking.value = true
   try {
     availability.value = await discogsAPI.checkAvailability(
-      detail.value.releases.map(r => ({
+      singlesList.map(r => ({
         title: r.title,
         artist: r.artist,
         catalogNumber: r.catalogNumber || '',

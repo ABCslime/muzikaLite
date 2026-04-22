@@ -35,9 +35,17 @@ func NewHandler(r *Repo, s *Service) *Handler { return &Handler{repo: r, svc: s}
 // JSON-stringified UUID, or null when similar mode is off.
 // Frontend reads the "active" boolean as the visual indicator
 // for the lens icon.
+//
+// v0.5 PR E: LastError surfaces the most recent NextPick failure
+// reason from the similarity service so the lens icon can render
+// a third "active but not working" state (orange) when the seed
+// has no Discogs match or all buckets came back empty. Empty
+// string = last cycle succeeded (or no cycle has run yet, which
+// the frontend treats as "assume OK until proven otherwise").
 type SimilarModeResponse struct {
 	SeedSongID *string `json:"seedSongId"`
 	Active     bool    `json:"active"`
+	LastError  string  `json:"lastError,omitempty"`
 }
 
 // SimilarModeRequest is the POST body. SeedSongID nil OR empty
@@ -62,6 +70,9 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	if seed != uuid.Nil {
 		s := seed.String()
 		resp.SeedSongID = &s
+		if h.svc != nil {
+			resp.LastError = h.svc.LastError(userID)
+		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, resp)
 }
@@ -91,6 +102,13 @@ func (h *Handler) Set(w http.ResponseWriter, r *http.Request) {
 	if err := h.repo.SetSeed(r.Context(), userID, seed); err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, "set similar mode failed")
 		return
+	}
+	// v0.5 PR E: changing the seed invalidates any prior error —
+	// the new seed hasn't been tried yet. Clear so the lens flips
+	// out of orange immediately rather than waiting for a fresh
+	// successful cycle.
+	if h.svc != nil {
+		h.svc.ClearLastError(userID)
 	}
 	resp := SimilarModeResponse{Active: seed != uuid.Nil}
 	if seed != uuid.Nil {

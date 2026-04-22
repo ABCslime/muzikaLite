@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,15 @@ type Service struct {
 	engine  *engine // rebuilt when buckets change (rare; startup-only today)
 
 	rng *rand.Rand
+
+	// v0.5 PR E: per-user last-error message so the frontend can
+	// render a "similar mode is on but not working" state on the
+	// lens icon (orange instead of pink). In-memory; lost across
+	// restarts, which is fine — the next refill cycle re-discovers
+	// the state in ~seconds. Cleared on successful NextPick or
+	// on SetSeed (user explicitly changing the seed).
+	muErrs   sync.RWMutex
+	lastErrs map[uuid.UUID]string
 }
 
 // Config wires Service dependencies. logw may be nil to skip
@@ -88,9 +98,43 @@ func NewService(cfg Config) *Service {
 		logw:         cfg.Discovery,
 		log:          slog.Default().With("mod", "similarity"),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec
+		lastErrs:     make(map[uuid.UUID]string),
 	}
 	s.rebuildEngine()
 	return s
+}
+
+// LastError returns the most recent NextPick failure reason for
+// this user, or "" if the last cycle succeeded (or no cycle has
+// run yet). The handler exposes this via GET /api/queue/similar-
+// mode so the frontend can render the lens in its "active but
+// couldn't resolve" orange state.
+func (s *Service) LastError(userID uuid.UUID) string {
+	s.muErrs.RLock()
+	defer s.muErrs.RUnlock()
+	return s.lastErrs[userID]
+}
+
+// ClearLastError drops the cached error for a user. Called by
+// the handler on SetSeed so a new seed starts with a clean slate
+// (stale error from the previous seed wouldn't be meaningful).
+func (s *Service) ClearLastError(userID uuid.UUID) {
+	s.muErrs.Lock()
+	defer s.muErrs.Unlock()
+	delete(s.lastErrs, userID)
+}
+
+// setLastError is the internal write path used by NextPick. "" msg
+// clears the entry. Keeping the API surface narrow (no public
+// SetLastError) so only the engine's own result path updates it.
+func (s *Service) setLastError(userID uuid.UUID, msg string) {
+	s.muErrs.Lock()
+	defer s.muErrs.Unlock()
+	if msg == "" {
+		delete(s.lastErrs, userID)
+		return
+	}
+	s.lastErrs[userID] = msg
 }
 
 // Register adds a bucket to the registry. Safe to call before
@@ -237,10 +281,12 @@ func (s *Service) NextPick(ctx context.Context, userID, seedSongID uuid.UUID) (C
 	}
 	seed, err := s.seedReader.ReadSeed(ctx, userID, seedSongID)
 	if err != nil {
+		s.setLastError(userID, "couldn't read seed song")
 		return Candidate{}, fmt.Errorf("similarity: read seed: %w", err)
 	}
 	if seed.Title == "" || seed.Artist == "" {
 		s.recordSeedUnknown(ctx, seed)
+		s.setLastError(userID, "seed has no Discogs match")
 		return Candidate{}, ErrSeedUnknown
 	}
 
@@ -248,13 +294,15 @@ func (s *Service) NextPick(ctx context.Context, userID, seedSongID uuid.UUID) (C
 	eng := s.engine
 	s.mu.RUnlock()
 
-	picked, ok := eng.pick(ctx, seed)
+	picked, stats, ok := eng.pick(ctx, seed)
 	if !ok {
 		s.recordNoCandidates(ctx, seed)
+		s.setLastError(userID, "no candidates after bucket merge + queue dedup")
 		return Candidate{}, ErrNoCandidates
 	}
 
-	s.recordPicked(ctx, seed, picked)
+	s.recordPicked(ctx, seed, picked, stats)
+	s.setLastError(userID, "") // clear on success
 	return Candidate{
 		Title:        picked.Title,
 		Artist:       picked.Artist,
@@ -264,26 +312,20 @@ func (s *Service) NextPick(ctx context.Context, userID, seedSongID uuid.UUID) (C
 	}, nil
 }
 
-// pickedTopBucket returns the highest-frequency contributing
-// bucket — used as SourceBucket on the returned Candidate.
-// Ties broken by which bucket appeared first.
+// pickedTopBucket returns the highest-contributing bucket — used
+// as SourceBucket on the returned Candidate. Highest score wins;
+// ties broken by first-seen order.
 func pickedTopBucket(c scoredCandidate) string {
 	if len(c.Buckets) == 0 {
 		return ""
 	}
-	counts := make(map[string]int, len(c.Buckets))
-	for _, b := range c.Buckets {
-		counts[b]++
-	}
 	best := c.Buckets[0]
-	bestN := counts[best]
 	for _, b := range c.Buckets[1:] {
-		if counts[b] > bestN {
+		if b.Score > best.Score {
 			best = b
-			bestN = counts[b]
 		}
 	}
-	return best
+	return best.ID
 }
 
 // --- discovery_log helpers ---
@@ -320,19 +362,29 @@ func (s *Service) recordNoCandidates(ctx context.Context, seed Seed) {
 	})
 }
 
-func (s *Service) recordPicked(ctx context.Context, seed Seed, picked scoredCandidate) {
+func (s *Service) recordPicked(ctx context.Context, seed Seed, picked scoredCandidate, stats pickStats) {
 	if s.logw == nil {
 		return
 	}
+	// Breakdown: "same_artist:5.00, same_label_era:3.00". Lets a
+	// later analytics query answer "per user, which bucket is
+	// actually earning its configured weight?" — the full
+	// contribution table, not just the winner.
+	parts := make([]string, 0, len(picked.Buckets))
+	for _, b := range picked.Buckets {
+		parts = append(parts, fmt.Sprintf("%s:%.2f", b.ID, b.Score))
+	}
 	s.logw.Record(ctx, discovery.Record{
-		SongID:   seed.SongID,
-		UserID:   seed.UserID,
-		Source:   discovery.SourceDiscogs,
-		Strategy: string(bus.StrategySimilarSong),
-		Stage:    discovery.StageSeed,
-		Outcome:  discovery.OutcomeOK,
-		Rung:     -1,
-		Reason: fmt.Sprintf("picked %s — %s (score=%.2f, buckets=%v)",
-			picked.Artist, picked.Title, picked.Score, picked.Buckets),
+		SongID:      seed.SongID,
+		UserID:      seed.UserID,
+		Source:      discovery.SourceDiscogs,
+		Strategy:    string(bus.StrategySimilarSong),
+		Stage:       discovery.StageSeed,
+		Outcome:     discovery.OutcomeOK,
+		Rung:        -1,
+		ResultCount: stats.PoolSize,
+		Reason: fmt.Sprintf("picked %s — %s (score=%.2f, buckets=[%s])",
+			picked.Artist, picked.Title, picked.Score,
+			strings.Join(parts, ", ")),
 	})
 }

@@ -30,10 +30,19 @@ export const useSimilarStore = defineStore('similar', {
     // Set true on the lens icon while a toggle round-trip is in
     // flight, so we can disable the button to prevent double-clicks.
     pending: false,
+    // v0.5 PR E: when similar mode is on but the backend's last
+    // NextPick failed (seed unknown to Discogs, or every bucket
+    // came back empty), the server surfaces the reason here.
+    // Empty string = last cycle succeeded. The PlayerBar uses
+    // this to render the lens in an orange "active but not
+    // working" state, distinct from both off and healthy-active.
+    lastError: '',
   }),
 
   getters: {
     active: (state) => state.status === 'on' && !!state.seedSongId,
+    hasError: (state) =>
+      state.status === 'on' && !!state.seedSongId && state.lastError !== '',
   },
 
   actions: {
@@ -44,9 +53,11 @@ export const useSimilarStore = defineStore('similar', {
         const r = await queueAPI.getSimilarMode()
         this.seedSongId = r.seedSongId || null
         this.status = r.active ? 'on' : 'off'
+        this.lastError = r.lastError || ''
       } catch {
         this.seedSongId = null
         this.status = 'off'
+        this.lastError = ''
       }
     },
 
@@ -68,14 +79,19 @@ export const useSimilarStore = defineStore('similar', {
       const nextSeed = wasActive && wasSameSeed ? null : songId
       const prevSeed = this.seedSongId
       const prevStatus = this.status
+      const prevError = this.lastError
       this.seedSongId = nextSeed
       this.status = nextSeed ? 'on' : 'off'
+      // Changing the seed invalidates any prior error — the backend
+      // clears it server-side too; mirror here for snappy UX.
+      this.lastError = ''
       try {
         await queueAPI.setSimilarMode(nextSeed)
       } catch {
         // Roll back so we're not lying to the user.
         this.seedSongId = prevSeed
         this.status = prevStatus
+        this.lastError = prevError
       } finally {
         this.pending = false
       }
@@ -89,13 +105,16 @@ export const useSimilarStore = defineStore('similar', {
       this.pending = true
       const prevSeed = this.seedSongId
       const prevStatus = this.status
+      const prevError = this.lastError
       this.seedSongId = null
       this.status = 'off'
+      this.lastError = ''
       try {
         await queueAPI.setSimilarMode(null)
       } catch {
         this.seedSongId = prevSeed
         this.status = prevStatus
+        this.lastError = prevError
       } finally {
         this.pending = false
       }

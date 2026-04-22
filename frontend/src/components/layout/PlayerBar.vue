@@ -151,17 +151,24 @@
             </svg>
           </button>
 
-          <!-- v0.5 PR B: similar-mode toggle. Lens icon next to
-               like, peer in shape: outline=off, filled=on. Click
-               re-seeds to whatever's playing right now. Disabled
-               while there's no current song or a request is in
-               flight. -->
+          <!-- v0.5 PR B + PR E: similar-mode toggle. Lens icon
+               next to the heart. Four visual states:
+                 - disabled gray: no currentSong (can't seed)
+                 - outline gray: off, or active but seeded by a
+                   different song (click to re-seed)
+                 - filled pink: active AND seeded by current song
+                   AND last pick cycle succeeded
+                 - filled amber: active AND seeded by current song
+                   BUT last cycle returned ErrSeedUnknown /
+                   ErrNoCandidates — refiller is falling back to
+                   genre until the user re-seeds -->
           <button
             @click="handleSimilarToggle"
             :disabled="!playerStore.currentSong || similarStore.pending"
             class="transition-colors"
             :class="{
-              'text-vibrant-pink hover:text-vibrant-pink-light': similarFromCurrent,
+              'text-amber-500 hover:text-amber-400': similarFromCurrent && similarStore.hasError,
+              'text-vibrant-pink hover:text-vibrant-pink-light': similarFromCurrent && !similarStore.hasError,
               'text-gray-400 hover:text-white': !similarFromCurrent && playerStore.currentSong,
               'text-gray-700 cursor-not-allowed': !playerStore.currentSong,
             }"
@@ -174,7 +181,8 @@
               viewBox="0 0 20 20"
             >
               <!-- filled magnifying glass = similar mode is on
-                   for the currently playing song. -->
+                   for the currently playing song. Color depends
+                   on whether the last pick cycle succeeded. -->
               <path
                 fill-rule="evenodd"
                 d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z"
@@ -307,6 +315,12 @@ const similarFromCurrent = computed(() =>
 
 const similarTooltip = computed(() => {
   if (!playerStore.currentSong) return 'Play a song first'
+  if (similarFromCurrent.value && similarStore.hasError) {
+    // Surface the backend's reason in the tooltip — actionable
+    // info ("couldn't find this on Discogs") rather than a vague
+    // "something went wrong."
+    return `Similar mode: ${similarStore.lastError}`
+  }
   if (similarFromCurrent.value) return 'Stop similar mode'
   if (similarStore.active) return 'Re-seed similar mode with this song'
   return 'Fill queue with similar songs'

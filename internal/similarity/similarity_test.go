@@ -81,7 +81,7 @@ func (d *stubDeduper) HasEntry(_ context.Context, _ uuid.UUID, title, artist str
 // not an error. Important so PR A ships before any buckets exist.
 func TestEngine_EmptyRegistry(t *testing.T) {
 	e := newEngine(nil, NewNoopWeightStore(), nil, nil)
-	_, ok := e.pick(context.Background(), Seed{UserID: uuid.New(), SongID: uuid.New(),
+	_, _, ok := e.pick(context.Background(), Seed{UserID: uuid.New(), SongID: uuid.New(),
 		Title: "X", Artist: "Y"})
 	if ok {
 		t.Errorf("empty registry must return ok=false")
@@ -103,7 +103,7 @@ func TestEngine_MergeAcrossBuckets(t *testing.T) {
 	// Pin the RNG so the single-candidate weighted pick is deterministic.
 	rng := rand.New(rand.NewSource(42)) //nolint:gosec
 	e := newEngine([]Bucket{b1, b2}, NewNoopWeightStore(), nil, rng)
-	picked, ok := e.pick(context.Background(), seed("X", "Y"))
+	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
 	if !ok {
 		t.Fatal("expected a pick")
 	}
@@ -127,7 +127,7 @@ func TestEngine_DropsSeedSelf(t *testing.T) {
 	}}
 	rng := rand.New(rand.NewSource(1)) //nolint:gosec
 	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), nil, rng)
-	picked, ok := e.pick(context.Background(), seed("Discovery", "Daft Punk"))
+	picked, _, ok := e.pick(context.Background(), seed("Discovery", "Daft Punk"))
 	if !ok {
 		t.Fatal("expected a pick")
 	}
@@ -146,7 +146,7 @@ func TestEngine_DedupeAgainstQueue(t *testing.T) {
 		"daft punk\x00homework": true,
 	}}
 	e := newEngine([]Bucket{b1}, NewNoopWeightStore(), dedup, rand.New(rand.NewSource(1))) //nolint:gosec
-	if _, ok := e.pick(context.Background(), seed("X", "Y")); ok {
+	if _, _, ok := e.pick(context.Background(), seed("X", "Y")); ok {
 		t.Errorf("expected ok=false when every candidate is a dedup hit")
 	}
 }
@@ -160,7 +160,7 @@ func TestEngine_BucketErrorIsSwallowed(t *testing.T) {
 	bad := &erroringBucket{id: "bad"}
 	rng := rand.New(rand.NewSource(7)) //nolint:gosec
 	e := newEngine([]Bucket{good, bad}, NewNoopWeightStore(), nil, rng)
-	picked, ok := e.pick(context.Background(), seed("X", "Y"))
+	picked, _, ok := e.pick(context.Background(), seed("X", "Y"))
 	if !ok {
 		t.Fatal("expected a pick despite the erroring bucket")
 	}
@@ -181,7 +181,7 @@ func TestEngine_UserWeightOverridesDefault(t *testing.T) {
 	weights := stubWeights{"muted": 0}
 	rng := rand.New(rand.NewSource(13)) //nolint:gosec
 	e := newEngine([]Bucket{loud, muted}, weights, nil, rng)
-	picked, ok := e.pick(context.Background(), seed("seed", "seed"))
+	picked, _, ok := e.pick(context.Background(), seed("seed", "seed"))
 	if !ok {
 		t.Fatal("expected a pick")
 	}

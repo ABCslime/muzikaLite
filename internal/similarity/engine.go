@@ -44,26 +44,45 @@ func newEngine(buckets []Bucket, weights WeightStore, deduper QueueDeduper, rng 
 	}
 }
 
+// bucketContribution pairs a bucket id with the score weight it
+// added to a candidate. The list on scoredCandidate preserves
+// insertion order so the first bucket that surfaced a candidate
+// is traceable (useful for v0.7 graph view edge ordering and for
+// discovery_log forensics).
+type bucketContribution struct {
+	ID    string  `json:"id"`
+	Score float64 `json:"score"`
+}
+
 // scoredCandidate is the engine's internal aggregate: one
 // (artist, title) row with the summed score across all buckets
-// that proposed it, plus the list of contributing bucket IDs
-// for the v0.7 graph view (and today's discovery_log).
+// that proposed it, plus the per-bucket contributions and the
+// edge metadata each bucket attached.
 type scoredCandidate struct {
 	Title    string
 	Artist   string
 	ImageURL string
 	Score    float64
-	Buckets  []string
+	Buckets  []bucketContribution
 	Edges    []map[string]any
 }
 
+// pickStats gives the caller diagnostic visibility into a pick
+// cycle without forcing every test to inspect internals. poolSize
+// is the post-merge, pre-top-K candidate count AFTER the dedup
+// filter — the meaningful "how many choices did we have?"
+// number for the discovery_log's ResultCount column.
+type pickStats struct {
+	PoolSize int
+}
+
 // pick fans out to all buckets, merges, dedupes, and returns one
-// candidate. Returns (zero, false) when no bucket produced
+// candidate. Returns (zero, stats, false) when no bucket produced
 // anything usable for this seed — caller may fall back to the
 // genre-random refill path.
-func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, bool) {
+func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, pickStats, bool) {
 	if len(e.buckets) == 0 {
-		return scoredCandidate{}, false
+		return scoredCandidate{}, pickStats{}, false
 	}
 
 	weightMap, _ := e.weights.WeightsFor(ctx, seed.UserID)
@@ -111,8 +130,12 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, bool) {
 					}
 					merge[key] = existing
 				}
-				existing.Score += w * candidateConfidence(c)
-				existing.Buckets = append(existing.Buckets, b.ID())
+				contribution := w * candidateConfidence(c)
+				existing.Score += contribution
+				existing.Buckets = append(existing.Buckets, bucketContribution{
+					ID:    b.ID(),
+					Score: contribution,
+				})
 				if c.Edge != nil {
 					existing.Edges = append(existing.Edges, c.Edge)
 				}
@@ -129,7 +152,7 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, bool) {
 	wg.Wait()
 
 	if len(merge) == 0 {
-		return scoredCandidate{}, false
+		return scoredCandidate{}, pickStats{}, false
 	}
 
 	// Drop dupes already in the user's queue. We do this AFTER
@@ -143,8 +166,9 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, bool) {
 		survivors = append(survivors, c)
 	}
 	if len(survivors) == 0 {
-		return scoredCandidate{}, false
+		return scoredCandidate{}, pickStats{}, false
 	}
+	stats := pickStats{PoolSize: len(survivors)}
 
 	// Sort by score desc; tie-break on artist+title for
 	// deterministic ordering (matters for tests).
@@ -161,7 +185,7 @@ func (e *engine) pick(ctx context.Context, seed Seed) (scoredCandidate, bool) {
 		top = top[:engineTopK]
 	}
 	picked := weightedPick(top, e.rng)
-	return *picked, true
+	return *picked, stats, true
 }
 
 // bucketWeight resolves the user weight for a bucket: explicit

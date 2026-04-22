@@ -287,15 +287,15 @@ func removeEntryExec(ctx context.Context, e execer, userID, songID uuid.UUID) er
 // GetSong loads a song by ID.
 func (r *Repo) GetSong(ctx context.Context, id uuid.UUID) (Song, error) {
 	var (
-		idStr                 string
-		title, artist, album  sql.NullString
-		genre, url            sql.NullString
-		duration              sql.NullInt64
+		idStr                string
+		title, artist, album sql.NullString
+		genre, url, imageURL sql.NullString
+		duration             sql.NullInt64
 	)
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, title, artist, album, genre, duration, url
+		`SELECT id, title, artist, album, genre, duration, url, image_url
 		 FROM queue_songs WHERE id = ?`, id.String()).Scan(
-		&idStr, &title, &artist, &album, &genre, &duration, &url)
+		&idStr, &title, &artist, &album, &genre, &duration, &url, &imageURL)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Song{}, ErrNotFound
 	}
@@ -321,6 +321,9 @@ func (r *Repo) GetSong(ctx context.Context, id uuid.UUID) (Song, error) {
 	}
 	if url.Valid {
 		s.URL = url.String
+	}
+	if imageURL.Valid {
+		s.ImageURL = imageURL.String
 	}
 	return s, nil
 }
@@ -367,6 +370,22 @@ func (r *Repo) GetSongRequester(ctx context.Context, songID uuid.UUID) (uuid.UUI
 		return uuid.Nil, false, fmt.Errorf("parse requester: %w", err)
 	}
 	return uid, true, nil
+}
+
+// UpdateSongImage sets queue_songs.image_url. v0.4.3 — populated from
+// the Discogs cover-art URL the frontend already had in the preview
+// response, so the queue row paints with art on first render without
+// re-querying Discogs. Empty imageURL writes NULL (clears any prior).
+// Only the search-acquire path calls this; passive-refill paths leave
+// image_url NULL and the frontend falls back to its gradient.
+func (r *Repo) UpdateSongImage(ctx context.Context, id uuid.UUID, imageURL string) error {
+	_, err := r.db.ExecContext(ctx,
+		`UPDATE queue_songs SET image_url = ? WHERE id = ?`,
+		nullString(imageURL), id.String())
+	if err != nil {
+		return fmt.Errorf("update image_url: %w", err)
+	}
+	return nil
 }
 
 // UpdateSongMetadata updates title/artist. Called from onRequestDownload.

@@ -348,8 +348,9 @@ func (s *Service) GetQueue(ctx context.Context, userID uuid.UUID) (QueueResponse
 		out.Songs = append(out.Songs, SongDTO{
 			ID: sg.ID, Title: sg.Title, Artist: sg.Artist,
 			Album: sg.Album, Genre: sg.Genre, Duration: sg.Duration,
-			Relaxed: e.Relaxed,
-			Status:  status,
+			Relaxed:  e.Relaxed,
+			Status:   status,
+			ImageURL: sg.ImageURL,
 		})
 	}
 	// Fire-and-forget refill — don't block the response. svcCtx outlives the
@@ -441,6 +442,11 @@ func (s *Service) searchAcquire(ctx context.Context, userID uuid.UUID, req Searc
 		if err := s.repo.UpdateSongMetadata(ctx, reuse.SongID, req.Title, req.Artist); err != nil {
 			return SearchResponse{}, fmt.Errorf("update metadata on reuse: %w", err)
 		}
+		if req.ImageURL != "" {
+			if err := s.repo.UpdateSongImage(ctx, reuse.SongID, req.ImageURL); err != nil {
+				return SearchResponse{}, fmt.Errorf("update image on reuse: %w", err)
+			}
+		}
 		s.log.Info("search-acquire: reusing existing song id",
 			"user_id", userID, "song_id", reuse.SongID,
 			"had_url", reuse.URL != "")
@@ -455,6 +461,11 @@ func (s *Service) searchAcquire(ctx context.Context, userID uuid.UUID, req Searc
 	}
 	if err := s.repo.UpdateSongMetadata(ctx, stubID, req.Title, req.Artist); err != nil {
 		return SearchResponse{}, fmt.Errorf("update metadata: %w", err)
+	}
+	if req.ImageURL != "" {
+		if err := s.repo.UpdateSongImage(ctx, stubID, req.ImageURL); err != nil {
+			return SearchResponse{}, fmt.Errorf("update image: %w", err)
+		}
 	}
 	s.publishRequestDownload(ctx, userID, stubID, req)
 	return SearchResponse{SongID: stubID, Query: normalizedQuery}, nil

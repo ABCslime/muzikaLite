@@ -19,6 +19,11 @@ type Song struct {
 	Genre    string
 	Duration int // seconds
 	URL      string
+	// ImageURL is a Discogs (or equivalent) cover-art URL that the
+	// frontend can <img src=…> directly. Empty for songs added via
+	// a path that can't infer cover art (Bandcamp tag refills,
+	// manual stubs). v0.4.3.
+	ImageURL string
 }
 
 type QueueEntry struct {
@@ -68,6 +73,10 @@ type SongDTO struct {
 	Duration int       `json:"duration,omitempty"`
 	Relaxed  bool      `json:"relaxed,omitempty"`
 	Status   string    `json:"status,omitempty"`
+	// ImageURL is the Discogs cover-art URL populated at acquire
+	// time (v0.4.3). Empty for songs without linked artwork; the
+	// frontend falls back to a gradient placeholder.
+	ImageURL string `json:"imageUrl,omitempty"`
 }
 
 type QueueResponse struct {
@@ -111,6 +120,11 @@ type SearchRequest struct {
 	Title         string `json:"title,omitempty"`
 	Artist        string `json:"artist,omitempty"`
 	CatalogNumber string `json:"catalogNumber,omitempty"`
+	// ImageURL is the cover-art URL the frontend already knows from
+	// its preview response. Plumbed through to queue_songs so the
+	// first paint of the queue row has artwork without re-querying
+	// Discogs. v0.4.3.
+	ImageURL string `json:"imageUrl,omitempty"`
 }
 
 // PrePicked is true when the request carries enough metadata to skip

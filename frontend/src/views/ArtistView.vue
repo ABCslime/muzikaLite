@@ -17,11 +17,24 @@
           <div class="bg-gradient-to-b from-vibrant-purple to-vibrant-bg px-8 pt-16 pb-8">
             <div class="flex items-end space-x-6">
               <div
-                class="w-48 h-48 bg-gradient-to-br from-vibrant-pink to-vibrant-purple pixel-border border-vibrant-pink flex items-center justify-center flex-shrink-0 shadow-2xl"
+                class="relative w-48 h-48 bg-gradient-to-br from-vibrant-pink to-vibrant-purple pixel-border border-vibrant-pink flex items-center justify-center flex-shrink-0 shadow-2xl overflow-hidden"
               >
                 <svg class="w-24 h-24 text-white opacity-80" fill="currentColor" viewBox="0 0 20 20">
                   <path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd" />
                 </svg>
+                <!-- v0.4.3: show first-release thumbnail as the
+                     artist-hero image. Cheaper than a dedicated
+                     /artists/{id} Discogs lookup AND more visually
+                     relevant (an album cover beats a press photo). -->
+                <img
+                  v-if="detail.image"
+                  :src="detail.image"
+                  :alt="detail.name"
+                  class="absolute inset-0 w-full h-full object-cover"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="(e) => e.target.style.display='none'"
+                />
               </div>
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-semibold text-gray-900 uppercase mb-2">Artist</p>

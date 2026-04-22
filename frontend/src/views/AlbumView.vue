@@ -22,12 +22,26 @@
           >
             <div class="flex items-end space-x-6">
               <div
-                class="w-48 h-48 pixel-border flex items-center justify-center flex-shrink-0 shadow-2xl"
+                class="relative w-48 h-48 pixel-border flex items-center justify-center flex-shrink-0 shadow-2xl overflow-hidden"
                 :class="placeholderBgClass"
               >
                 <svg class="w-24 h-24 text-white opacity-80" fill="currentColor" viewBox="0 0 20 20">
                   <path d="M18 3a1 1 0 00-1.196-.98l-10 2A1 1 0 006 5v9.114A4.369 4.369 0 005 14c-1.657 0-3 .895-3 2s1.343 2 3 2 3-.895 3-2V7.82l8-1.6v5.894A4.37 4.37 0 0015 12c-1.657 0-3 .895-3 2s1.343 2 3 2 3-.895 3-2V3z" />
                 </svg>
+                <!-- v0.4.3: prefer the larger `cover` (primary image
+                     from Discogs' release.images[]) for the hero;
+                     fall back to `thumb` when Discogs only has the
+                     small size; gradient + svg shows through on
+                     404 via onerror hide. -->
+                <img
+                  v-if="detail.cover || detail.thumb"
+                  :src="detail.cover || detail.thumb"
+                  :alt="detail.title"
+                  class="absolute inset-0 w-full h-full object-cover"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="(e) => e.target.style.display='none'"
+                />
               </div>
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-semibold text-gray-900 uppercase mb-2">Album</p>
@@ -212,6 +226,11 @@ async function handleQueueAlbum() {
       title: detail.value.title,
       artist: detail.value.artist,
       catalogNumber: detail.value.catalogNumber || '',
+      // v0.4.3: persist cover art for every queue row that came
+      // from this album. Prefer the hero-sized `cover` since the
+      // queue row uses whatever URL as a <img src>; both Discogs
+      // sizes render fine at the SongItem's 48 px square.
+      imageUrl: detail.value.cover || detail.value.thumb || '',
       query: `${detail.value.artist} — ${detail.value.title}`,
     })
     if (r.success) await queueStore.fetchQueue(true)

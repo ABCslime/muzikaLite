@@ -16,11 +16,22 @@
           <div class="bg-gradient-to-b from-vibrant-sky to-vibrant-bg px-8 pt-16 pb-8">
             <div class="flex items-end space-x-6">
               <div
-                class="w-48 h-48 bg-gradient-to-br from-vibrant-sky to-vibrant-purple pixel-border border-vibrant-sky flex items-center justify-center flex-shrink-0 shadow-2xl"
+                class="relative w-48 h-48 bg-gradient-to-br from-vibrant-sky to-vibrant-purple pixel-border border-vibrant-sky flex items-center justify-center flex-shrink-0 shadow-2xl overflow-hidden"
               >
                 <svg class="w-24 h-24 text-white opacity-80" fill="currentColor" viewBox="0 0 20 20">
                   <path fill-rule="evenodd" d="M5 5a2 2 0 012-2h6a2 2 0 012 2v11a1 1 0 01-1.707.707L10 13.414l-3.293 3.293A1 1 0 015 16V5z" clip-rule="evenodd" />
                 </svg>
+                <!-- v0.4.3: first-release thumbnail as a label-hero
+                     visual. Same pattern as ArtistView. -->
+                <img
+                  v-if="detail.image"
+                  :src="detail.image"
+                  :alt="detail.name || `Label #${detail.id}`"
+                  class="absolute inset-0 w-full h-full object-cover"
+                  loading="lazy"
+                  referrerpolicy="no-referrer"
+                  @error="(e) => e.target.style.display='none'"
+                />
               </div>
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-semibold text-gray-900 uppercase mb-2">Label</p>

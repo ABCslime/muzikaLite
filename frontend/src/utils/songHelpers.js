@@ -35,7 +35,11 @@ export function getSongArtist(song) {
  */
 export function getSongImage(song) {
   if (!song) return DEFAULT_SONG_IMAGE
-  const image = song.image || song.albumArt || song.cover
+  // v0.4.3: imageUrl is the canonical field the backend sends in
+  // SongDTO. image/albumArt/cover retained as aliases for legacy
+  // call sites (player store sometimes constructs songs from
+  // search results where only the Discogs field name was kept).
+  const image = song.imageUrl || song.image || song.albumArt || song.cover
   if (!image || image.trim() === '') return DEFAULT_SONG_IMAGE
   return image
 }

@@ -18,10 +18,13 @@
       class="flex items-center gap-4 px-4 py-2 pixel-texture transition-colors"
       :class="rowClass(r)"
     >
-      <!-- Art placeholder. Album art arrives in v0.4.3; for now a
-           subtle gradient block that matches SongItem's visual weight. -->
+      <!-- Art. v0.4.3 — real cover if the release has Thumb from
+           Discogs, else the gradient placeholder underneath. The
+           <img> is absolutely positioned on top of the same
+           gradient block so an onerror fallback has something to
+           reveal if the URL 404s without Vue having to swap nodes. -->
       <div
-        class="w-12 h-12 flex-shrink-0 pixel-border flex items-center justify-center"
+        class="relative w-12 h-12 flex-shrink-0 pixel-border overflow-hidden flex items-center justify-center"
         :class="placeholderClass(r)"
       >
         <svg class="w-6 h-6 opacity-70" fill="currentColor" viewBox="0 0 20 20">
@@ -29,6 +32,15 @@
             d="M18 3a1 1 0 00-1.196-.98l-10 2A1 1 0 006 5v9.114A4.369 4.369 0 005 14c-1.657 0-3 .895-3 2s1.343 2 3 2 3-.895 3-2V7.82l8-1.6v5.894A4.37 4.37 0 0015 12c-1.657 0-3 .895-3 2s1.343 2 3 2 3-.895 3-2V3z"
           />
         </svg>
+        <img
+          v-if="r.thumb"
+          :src="r.thumb"
+          :alt="r.title"
+          class="absolute inset-0 w-full h-full object-cover"
+          loading="lazy"
+          referrerpolicy="no-referrer"
+          @error="(e) => e.target.style.display='none'"
+        />
       </div>
 
       <div class="flex-1 min-w-0">
@@ -149,6 +161,10 @@ async function handleQueue(r) {
       title: r.title,
       artist: r.artist,
       catalogNumber: r.catalogNumber || '',
+      // v0.4.3: ship the thumbnail URL along with the pick so the
+      // queue row paints with art on first render — no wait for a
+      // second Discogs round-trip.
+      imageUrl: r.thumb || '',
       query: `${r.artist} — ${r.title}`,
     })
     await queueStore.fetchQueue(true)

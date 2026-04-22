@@ -30,7 +30,38 @@
       in the server config.
     </div>
 
-    <div v-else class="space-y-4">
+    <!-- v0.6 PR F: preset picker. Sits above the sliders —
+         clicking Apply updates the local draft, user fine-tunes
+         from there, Save persists. Presets themselves are
+         read-only, defined server-side. -->
+    <div
+      v-if="!loading && !error && buckets.length && presets.length"
+      class="pixel-border border-gray-400 bg-white p-3 pixel-texture mb-4 flex items-center gap-3 flex-wrap"
+    >
+      <label class="text-sm font-semibold text-gray-900">Start from preset:</label>
+      <select
+        v-model="selectedPresetId"
+        class="px-2 py-1 pixel-border border-gray-500 bg-white text-sm text-gray-900"
+      >
+        <option value="">— pick a preset —</option>
+        <option v-for="p in presets" :key="p.id" :value="p.id">
+          {{ p.label }}
+        </option>
+      </select>
+      <button
+        type="button"
+        :disabled="!selectedPresetId"
+        @click="applyPreset"
+        class="px-3 py-1 pixel-border text-xs font-semibold bg-vibrant-purple-light border-vibrant-purple text-gray-900 hover:bg-vibrant-purple hover:text-white disabled:opacity-50"
+      >
+        Apply
+      </button>
+      <p v-if="selectedPresetDescription" class="w-full text-xs text-gray-600 italic">
+        {{ selectedPresetDescription }}
+      </p>
+    </div>
+
+    <div v-if="!loading && !error && buckets.length" class="space-y-4">
       <div
         v-for="b in buckets"
         :key="b.id"
@@ -111,6 +142,10 @@ const loaded = ref({})
 const saving = ref(false)
 const savedNotice = ref('')
 
+// v0.6 PR F — preset state.
+const presets = ref([])             // [{id,label,description,weights}, ...]
+const selectedPresetId = ref('')    // empty = "no preset picked yet"
+
 // ----- derived -----
 function effectiveWeight(b) {
   const v = draft.value[b.id]
@@ -129,6 +164,11 @@ const noChanges = computed(() => {
   return true
 })
 
+const selectedPresetDescription = computed(() => {
+  const p = presets.value.find((x) => x.id === selectedPresetId.value)
+  return p?.description || ''
+})
+
 // ----- actions -----
 function setWeight(id, value) {
   if (!Number.isFinite(value) || value < 0) value = 0
@@ -145,6 +185,24 @@ function resetOne(b) {
 
 function resetAll() {
   draft.value = {}
+  savedNotice.value = ''
+}
+
+// applyPreset loads the selected preset's weights into the
+// draft (not the backend — save still requires an explicit
+// click). Only copies keys for buckets that are currently
+// registered: a preset that references a plugin bucket that
+// hasn't loaded silently ignores those keys, so the user
+// doesn't end up with "phantom" entries in their tuned map.
+function applyPreset() {
+  const p = presets.value.find((x) => x.id === selectedPresetId.value)
+  if (!p) return
+  const registered = new Set(buckets.value.map((b) => b.id))
+  const next = {}
+  for (const [k, v] of Object.entries(p.weights || {})) {
+    if (registered.has(k)) next[k] = Number(v)
+  }
+  draft.value = next
   savedNotice.value = ''
 }
 
@@ -170,13 +228,15 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [bs, w] = await Promise.all([
+    const [bs, w, ps] = await Promise.all([
       similarityAPI.listBuckets(),
       similarityAPI.getWeights(),
+      similarityAPI.listPresets(),
     ])
     buckets.value = bs || []
     loaded.value = w || {}
     draft.value = { ...(w || {}) }
+    presets.value = ps || []
   } catch (e) {
     error.value = e.response?.data?.message || e.message || 'Failed to load bucket settings.'
   } finally {

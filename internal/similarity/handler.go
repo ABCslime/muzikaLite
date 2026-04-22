@@ -297,6 +297,18 @@ func (h *Handler) GetWeights(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, weights)
 }
 
+// ListPresets returns the v0.6 weight presets ("Familiar",
+// "Discovery", "Obscure"). The frontend renders these as a
+// dropdown in Settings; applying a preset populates the
+// weight sliders locally, user saves via the existing PUT
+// /weights route.
+//
+// Read-only, static — presets are code-defined for v0.6. A
+// future v0.7+ could add user-defined presets stored per-user.
+func (h *Handler) ListPresets(w http.ResponseWriter, _ *http.Request) {
+	httpx.WriteJSON(w, http.StatusOK, Presets())
+}
+
 // PutWeights replaces the user's bucket_weights JSON with the
 // body map. Empty/missing body = clear to defaults. We don't
 // partial-merge — a PUT is a full replace, consistent with the

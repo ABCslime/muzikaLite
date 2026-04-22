@@ -356,6 +356,9 @@ func buildServer(
 	mux.Handle("GET /api/similarity/buckets", withAuth(http.HandlerFunc(simH.ListBuckets)))
 	mux.Handle("GET /api/similarity/weights", withAuth(http.HandlerFunc(simH.GetWeights)))
 	mux.Handle("PUT /api/similarity/weights", withAuth(http.HandlerFunc(simH.PutWeights)))
+	// v0.6 PR F: weight presets. Read-only, static; applying is
+	// the frontend's job (populate sliders then PUT /weights).
+	mux.Handle("GET /api/similarity/presets", withAuth(http.HandlerFunc(simH.ListPresets)))
 
 	// --- User preferences (v0.4.1 PR A) ---
 	mux.Handle("GET /api/user/preferences", withAuth(http.HandlerFunc(prefH.Get)))

@@ -34,4 +34,13 @@ export const similarityAPI = {
     const response = await client.put('/api/similarity/weights', weights || {})
     return response.data
   },
+
+  // v0.6 PR F: fetch the code-defined weight presets. Each
+  // entry is {id, label, description, weights}. Applying is a
+  // frontend-only mutation of the draft slider state; Save
+  // persists via setWeights.
+  async listPresets() {
+    const response = await client.get('/api/similarity/presets')
+    return response.data
+  },
 }

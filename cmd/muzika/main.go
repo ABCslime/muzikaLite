@@ -31,6 +31,7 @@ import (
 	"github.com/macabc/muzika/internal/search"
 	"github.com/macabc/muzika/internal/similarity"
 	discogsbuckets "github.com/macabc/muzika/internal/similarity/buckets/discogs"
+	similarityplugin "github.com/macabc/muzika/internal/similarity/plugin"
 	"github.com/macabc/muzika/internal/soulseek"
 	"github.com/macabc/muzika/internal/web"
 
@@ -196,6 +197,18 @@ func run() error {
 	} else {
 		log.Info("similarity: no Discogs client; running with empty bucket registry")
 	}
+	// v0.6 PR A: filesystem-discovered plugin buckets. MUZIKA_
+	// BUCKET_PLUGIN_DIR points at a directory whose subdirs each
+	// contain an executable named "bucket". One child process
+	// per plugin, registered on simSvc alongside the built-ins.
+	// Lifecycle is owned by the Manager; Close on shutdown.
+	pluginMgr := similarityplugin.NewManager("v0.6-dev", log)
+	if err := pluginMgr.Load(ctx, cfg.BucketPluginDir); err != nil {
+		log.Warn("similarity: plugin scan failed", "err", err)
+	}
+	for _, pb := range pluginMgr.Buckets() {
+		simSvc.Register(pb)
+	}
 	simSvc.StartWorkers(ctx)
 
 	// Wire the refiller's similar-mode hook so each user's active
@@ -232,6 +245,13 @@ func run() error {
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown", "err", err)
+	}
+	// v0.6 PR A: terminate spawned plugin children before we
+	// unwind the bus, so a plugin mid-response doesn't see a
+	// vanished subscriber. Idempotent; safe to call even if no
+	// plugins were loaded.
+	if err := pluginMgr.Close(); err != nil {
+		log.Warn("plugin manager shutdown", "err", err)
 	}
 	dispatcher.Stop()
 	b.Close()

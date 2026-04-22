@@ -74,6 +74,16 @@ type Config struct {
 	DownloadLadderRungWindow    time.Duration `envconfig:"DOWNLOAD_LADDER_RUNG_WINDOW"    default:"5s"`
 
 	LogLevel string `envconfig:"LOG_LEVEL" default:"info"`
+
+	// --- v0.6: local similarity-bucket plugins ---
+	// Directory muzika scans at startup for plugin buckets.
+	// Each subdirectory containing an executable named "bucket"
+	// is spawned as a long-lived child process and registered
+	// on the similarity engine alongside built-in buckets.
+	// Missing dir = no plugins (not an error). Empty string
+	// disables the scan entirely. See
+	// internal/similarity/plugin/ for the wire protocol.
+	BucketPluginDir string `envconfig:"BUCKET_PLUGIN_DIR" default:""`
 }
 
 // Load reads environment variables (prefix MUZIKA_) into a Config and validates it.

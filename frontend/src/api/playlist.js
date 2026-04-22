@@ -45,5 +45,20 @@ export const playlistAPI = {
     )
     return response.data
   },
+
+  // v0.4.4: AlbumView on-mount reprobe. For each track on the
+  // release, the backend looks up the caller's queue_entry and — if
+  // status='not_found' — flips it back to 'probing' and republishes
+  // RequestDownload. No-op for tracks the user hasn't added to any
+  // playlist. Returns { reprobed, total }.
+  async reprobeAlbum(releaseId) {
+    // Route lives at /api/album/{releaseId}/reprobe, NOT under
+    // /api/playlist/ — Go 1.22's mux conflict prevents nesting
+    // /api/playlist/album/{…} alongside /api/playlist/{id}/song/{…}.
+    const response = await client.post(
+      `/api/album/${releaseId}/reprobe`,
+    )
+    return response.data
+  },
 }
 

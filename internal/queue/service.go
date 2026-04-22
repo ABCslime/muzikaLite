@@ -491,6 +491,42 @@ func (s *Service) fileExistsAtStoredURL(url string) bool {
 	return !info.IsDir()
 }
 
+// ReprobeNotFoundTrack flips a queue_entry from status='not_found'
+// back to 'probing' and republishes a RequestDownload event for
+// the same (title, artist) pair, so the download worker can take
+// another swing at finding it on Soulseek.
+//
+// v0.4.4. Called by the AlbumView re-probe path: when the user
+// navigates to an album whose tracks landed not_found from a
+// prior playlist add, we get one more chance to acquire them.
+//
+// Returns true when a re-probe was actually scheduled (entry
+// existed AND was in not_found state), false otherwise. Errors
+// only on actual lookup or publish failure — a healthy entry
+// with a different status is a no-op.
+func (s *Service) ReprobeNotFoundTrack(ctx context.Context, userID uuid.UUID, title, artist string) (bool, error) {
+	songID, status, err := s.repo.FindEntry(ctx, userID, title, artist)
+	if err != nil {
+		return false, err
+	}
+	if songID == uuid.Nil || status != "not_found" {
+		return false, nil
+	}
+	if err := s.repo.SetEntryStatus(ctx, userID, songID, "probing"); err != nil {
+		// Race: entry was deleted between FindEntry and SetEntryStatus.
+		// Tolerate — nothing to re-probe.
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	s.publishRequestDownload(ctx, userID, songID, SearchRequest{
+		Title:  title,
+		Artist: artist,
+	})
+	return true, nil
+}
+
 // publishRequestDownload wraps the no-timeout Publish used by both the
 // reuse-existing and fresh-stub branches of searchAcquire, so the two
 // paths can't drift in their event payload shape.

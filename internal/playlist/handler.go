@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 
@@ -54,6 +55,12 @@ type AlbumExpander interface {
 	// not_found stay in queue_entries with status='not_found' and
 	// in the playlist regardless.
 	AcquireForUser(ctx context.Context, userID uuid.UUID, title, artist, imageURL string) (uuid.UUID, error)
+	// ReprobeNotFoundTrack finds a (title, artist) entry in the
+	// user's queue and, if it's status='not_found', flips it back
+	// to 'probing' and re-publishes RequestDownload. Returns true
+	// when a re-probe was actually scheduled. v0.4.4 — used by the
+	// AlbumView re-probe-on-mount path.
+	ReprobeNotFoundTrack(ctx context.Context, userID uuid.UUID, title, artist string) (bool, error)
 }
 
 // List handles GET /api/playlist/ (protected).
@@ -228,6 +235,67 @@ func (h *Handler) AddAlbum(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ReprobeAlbum handles POST /api/playlist/album/{releaseId}/reprobe (protected).
+//
+// v0.4.4. Called by the AlbumView on mount. For each track of the
+// Discogs release, looks up the caller's queue_entry (if any) and —
+// only when its status is 'not_found' — flips it back to 'probing'
+// and republishes RequestDownload so the download worker takes
+// another swing at Soulseek.
+//
+// Tracks the user doesn't have in any playlist (no entry) are a
+// no-op; tracks in 'ready' / 'probing' / other states are a no-op
+// too — we don't want to interrupt a song that's already in flight.
+//
+// Returns { reprobed, total }. 503 if the album expander isn't
+// wired; 404 if the release id is bogus.
+func (h *Handler) ReprobeAlbum(w http.ResponseWriter, r *http.Request) {
+	if h.expander == nil {
+		httpx.WriteError(w, http.StatusServiceUnavailable,
+			"album expansion unavailable — Discogs not configured")
+		return
+	}
+	userID, ok := httpx.GetUserID(r.Context())
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "not authenticated")
+		return
+	}
+	releaseID, err := parseIntPathValue(r, "releaseId")
+	if err != nil || releaseID <= 0 {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid releaseId")
+		return
+	}
+
+	album, err := h.expander.Album(r.Context(), releaseID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			httpx.WriteError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		httpx.WriteError(w, http.StatusBadGateway, "album lookup failed")
+		return
+	}
+
+	reprobed := 0
+	for _, title := range album.Tracks {
+		did, err := h.expander.ReprobeNotFoundTrack(
+			r.Context(), userID, title, album.Artist)
+		if err != nil {
+			// Per-track failure — skip and keep going; the next mount
+			// will try again. We don't want to 500 the whole call for
+			// one bad row.
+			continue
+		}
+		if did {
+			reprobed++
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"reprobed": reprobed,
+		"total":    len(album.Tracks),
+	})
+}
+
 // RemoveSong handles DELETE /api/playlist/{id}/song/{songId} (protected).
 func (h *Handler) RemoveSong(w http.ResponseWriter, r *http.Request) {
 	userID, pid, sid, ok := requireUserAndTwoIDs(w, r)
@@ -268,6 +336,17 @@ func requireUserAndTwoIDs(w http.ResponseWriter, r *http.Request) (uuid.UUID, uu
 		return uuid.Nil, uuid.Nil, uuid.Nil, false
 	}
 	return userID, pid, sid, true
+}
+
+// parseIntPathValue pulls a positive int path parameter from the
+// request URL. Returns 0 + non-nil error on missing or malformed
+// input — callers map that to 400.
+func parseIntPathValue(r *http.Request, name string) (int, error) {
+	raw := r.PathValue(name)
+	if raw == "" {
+		return 0, errors.New("missing path value " + name)
+	}
+	return strconv.Atoi(raw)
 }
 
 func writeDomainErr(w http.ResponseWriter, err error, fallback string) {

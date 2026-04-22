@@ -110,6 +110,54 @@ func (r *Repo) PromoteToReady(ctx context.Context, userID, songID uuid.UUID, rel
 	return nil
 }
 
+// SetEntryStatus updates queue_entries.status for one (user, song)
+// pair. Returns ErrNotFound when no entry matches. v0.4.4 — used
+// by the AlbumView re-probe path that flips status='not_found'
+// rows back to 'probing' before re-publishing RequestDownload.
+func (r *Repo) SetEntryStatus(ctx context.Context, userID, songID uuid.UUID, status string) error {
+	res, err := r.db.ExecContext(ctx,
+		`UPDATE queue_entries
+		 SET status = ?
+		 WHERE user_id = ? AND song_id = ?`,
+		status, userID.String(), songID.String())
+	if err != nil {
+		return fmt.Errorf("set entry status: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// FindNotFoundEntry returns the song id and entry status for one
+// (user, title, artist) tuple. The match on title+artist is
+// case-insensitive — same convention as FindSongForReuse — so it
+// tolerates Discogs casing drift. Returns (uuid.Nil, "", nil) when
+// no entry exists yet (the user hasn't added this album to a
+// playlist). v0.4.4.
+func (r *Repo) FindEntry(ctx context.Context, userID uuid.UUID, title, artist string) (uuid.UUID, string, error) {
+	var idStr, status string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT qs.id, qe.status
+		FROM   queue_songs   qs
+		JOIN   queue_entries qe ON qe.song_id = qs.id
+		WHERE  qe.user_id  = ?
+		  AND  LOWER(qs.title)  = LOWER(?)
+		  AND  LOWER(qs.artist) = LOWER(?)
+		LIMIT  1`,
+		userID.String(), title, artist,
+	).Scan(&idStr, &status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, "", nil
+	}
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("find entry: %w", err)
+	}
+	id, _ := uuid.Parse(idStr)
+	return id, status, nil
+}
+
 // SongForReuse describes an existing catalog entry that a new search
 // should reuse rather than creating a duplicate stub. v0.4.2 PR A.1.
 //

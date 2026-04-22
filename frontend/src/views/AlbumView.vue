@@ -137,6 +137,7 @@ import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import { discogsAPI } from '@/api/discogs'
+import { playlistAPI } from '@/api/playlist'
 import { useQueueStore } from '@/stores/queue'
 
 const route = useRoute()
@@ -187,6 +188,13 @@ async function load(id) {
   try {
     detail.value = await discogsAPI.getRelease(id)
     runAvailability()
+    // v0.4.4: fire-and-forget re-probe of any not_found tracks the
+    // user has from a prior album-to-playlist add. Backend no-ops
+    // tracks that aren't in any of the user's playlists, so we can
+    // call this for every album view without worrying about it.
+    // Deliberately NOT awaited — render path doesn't depend on it,
+    // and the download worker takes over async anyway.
+    reprobeNotFound(id)
   } catch (e) {
     const status = e.response?.status
     if (status === 404) error.value = 'Release not found on Discogs.'
@@ -194,6 +202,15 @@ async function load(id) {
     else error.value = e.response?.data?.message || e.message || 'Failed to load album.'
   } finally {
     loading.value = false
+  }
+}
+
+async function reprobeNotFound(id) {
+  try {
+    await playlistAPI.reprobeAlbum(id)
+  } catch {
+    // Silent — worst case user sees the same not_found states they
+    // had before. The next AlbumView mount will try again.
   }
 }
 

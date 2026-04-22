@@ -229,6 +229,13 @@ func buildServer(
 	mux.Handle("POST /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.AddSong)))
 	mux.Handle("DELETE /api/playlist/{id}/song/{songId}", withAuth(http.HandlerFunc(plH.RemoveSong)))
 	mux.Handle("POST /api/playlist/{id}/album", withAuth(http.HandlerFunc(plH.AddAlbum)))
+	// v0.4.4: AlbumView on-mount re-probe hook. Not scoped to a
+	// particular playlist — we re-probe every not_found entry the
+	// user has for the release, regardless of which playlist holds it.
+	// Mounted outside /api/playlist/ because /api/playlist/album/{…}
+	// would conflict with /api/playlist/{id}/song/{…} in Go 1.22's
+	// pattern matcher.
+	mux.Handle("POST /api/album/{releaseId}/reprobe", withAuth(http.HandlerFunc(plH.ReprobeAlbum)))
 
 	mux.Handle("GET /api/queue/queue", withAuth(http.HandlerFunc(qH.GetQueue)))
 	mux.Handle("POST /api/queue/queue", withAuth(http.HandlerFunc(qH.AddSong)))
@@ -361,4 +368,11 @@ func (a *albumExpander) AcquireForUser(ctx context.Context, userID uuid.UUID, ti
 		return uuid.Nil, err
 	}
 	return resp.SongID, nil
+}
+
+// ReprobeNotFoundTrack forwards to queue.Service.ReprobeNotFoundTrack.
+// v0.4.4 — the AlbumView on-mount hook fans this out for each track
+// of the release; returns true when a re-probe was scheduled.
+func (a *albumExpander) ReprobeNotFoundTrack(ctx context.Context, userID uuid.UUID, title, artist string) (bool, error) {
+	return a.q.ReprobeNotFoundTrack(ctx, userID, title, artist)
 }

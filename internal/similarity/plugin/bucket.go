@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 
 	"github.com/macabc/muzika/internal/similarity"
 )
@@ -14,20 +15,41 @@ import (
 // wrapper's cached metadata (static after hello) or the
 // Process's JSON-RPC client (dynamic per-cycle).
 //
-// v0.6 PR A: scaffolds the wrapper; Candidates() returns empty
-// with no API call, because wiring the candidates RPC is PR B's
-// scope. This keeps PR A shippable on its own — plugin discovery
-// + handshake + registration all work; plugins just don't
-// contribute candidates yet.
+// v0.6 PR B: the proc pointer is swappable. When the Manager's
+// supervisor detects a child crash and respawns successfully,
+// it atomically replaces the pluginBucket's proc — the engine's
+// in-flight refill cycles (if any) see ErrPluginClosed on the
+// old proc's Call, return empty for that bucket, and the next
+// cycle routes through the fresh proc transparently.
 type pluginBucket struct {
-	proc *Process
-	meta HelloResult
+	meta   HelloResult
+	muProc sync.RWMutex
+	proc   *Process // may be nil during respawn backoff or after mark-dead
 }
 
 // newPluginBucket pairs a spawned Process with its hello result.
 // Not exported; the Manager owns construction.
 func newPluginBucket(proc *Process, meta HelloResult) *pluginBucket {
 	return &pluginBucket{proc: proc, meta: meta}
+}
+
+// setProc atomically swaps the underlying Process. Called by the
+// Manager supervisor when a respawn succeeds (non-nil) or when
+// the plugin is marked dead after repeated crashes (nil).
+func (b *pluginBucket) setProc(p *Process) {
+	b.muProc.Lock()
+	defer b.muProc.Unlock()
+	b.proc = p
+}
+
+// currentProc snapshots the current Process. Callers use the
+// returned pointer for the duration of one Call; another
+// respawn happening during that Call just means the caller sees
+// ErrPluginClosed and returns empty — the engine tolerates this.
+func (b *pluginBucket) currentProc() *Process {
+	b.muProc.RLock()
+	defer b.muProc.RUnlock()
+	return b.proc
 }
 
 // ID — the plugin self-assigns this at hello time. Plugin
@@ -61,7 +83,8 @@ func (b *pluginBucket) DefaultWeight() float64 {
 //     least record the degradation. Engine still treats as
 //     empty for merging purposes.
 func (b *pluginBucket) Candidates(ctx context.Context, seed similarity.Seed) ([]similarity.Candidate, error) {
-	if b.proc == nil {
+	proc := b.currentProc()
+	if proc == nil {
 		return nil, nil
 	}
 	params := CandidatesParams{Seed: SeedWire{
@@ -75,7 +98,7 @@ func (b *pluginBucket) Candidates(ctx context.Context, seed similarity.Seed) ([]
 		Genres:           seed.Genres,
 		Collaborators:    seed.Collaborators,
 	}}
-	resp, err := b.proc.Call(ctx, "candidates", params, callTimeout)
+	resp, err := proc.Call(ctx, "candidates", params, callTimeout)
 	if err != nil {
 		// Close vs timeout vs write error: caller differentiates
 		// via errors.Is only when it needs to; for the engine

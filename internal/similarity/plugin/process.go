@@ -106,9 +106,13 @@ func spawnProcess(ctx context.Context, dir, name string, log *slog.Logger) (*Pro
 //
 // Exits when stdout closes (child exited or pipe broken).
 // Signals all waiting Calls by closing their response channels
-// so they return ErrPluginClosed rather than blocking forever.
+// so they return ErrPluginClosed rather than blocking forever,
+// AND closes the Process's `closed` channel so supervisors can
+// react to an unexpected child death without an explicit Close
+// call.
 func (p *Process) readLoop() {
 	defer p.drainInflight()
+	defer p.markClosed()
 	scanner := bufio.NewScanner(p.stdout)
 	// Plugin responses can include full artist discographies as
 	// candidate lists. 1MB is generous but bounded; plugins that
@@ -226,6 +230,21 @@ func (p *Process) Call(ctx context.Context, method string, params any, timeout t
 	case <-callCtx.Done():
 		return Response{}, callCtx.Err()
 	}
+}
+
+// WaitClosed returns a channel that fires once the process is
+// no longer usable — either because Close was called or because
+// the child exited and readLoop noticed stdout dropping.
+// Supervisors block on this to decide when to respawn.
+func (p *Process) WaitClosed() <-chan struct{} { return p.closed }
+
+// markClosed is the common "this Process is dead" signal, shared
+// by Close (explicit shutdown) and readLoop (child crash).
+// Idempotent via closeOnce — double-firing is harmless.
+func (p *Process) markClosed() {
+	p.closeOnce.Do(func() {
+		close(p.closed)
+	})
 }
 
 // Close terminates the child process. Idempotent. Sends SIGTERM

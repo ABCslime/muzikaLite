@@ -135,6 +135,10 @@ func (s *Service) onDiscoveryIntent(ctx context.Context, ev bus.DiscoveryIntent)
 		Artist:        result.Artist,
 		CatalogNumber: result.CatalogNumber,
 		Strategy:      ev.Strategy,
+		// v0.4.4: pass Discogs thumb through so queue.onRequestDownload
+		// can persist queue_songs.image_url on passive-refill stubs.
+		// Empty for rare pressings without artwork — consumer tolerates.
+		ImageURL: result.Thumb,
 	}
 	// RequestDownload has no SendTimeout — v0.4.1 PR C (option D2). Same
 	// reasoning as internal/bandcamp/worker.go: a Discogs pick cost one API

@@ -349,6 +349,11 @@ async function pickRelease(candidate) {
     title: candidate.title,
     artist: candidate.artist,
     catalogNumber: candidate.catalogNumber || '',
+    // v0.4.4 bugfix: forward the Discogs thumb so the queue row and
+    // PlayerBar paint with artwork on first render. Without this the
+    // queue entry lands with empty imageUrl and the UI falls back to
+    // the placeholder.
+    imageUrl: candidate.thumb || '',
     query: `${candidate.artist} — ${candidate.title}`,
   })
   if (result.success) {

@@ -301,6 +301,18 @@ func (s *Service) onRequestDownload(ctx context.Context, ev bus.RequestDownload)
 	if err := s.repo.UpdateSongMetadata(ctx, ev.SongID, ev.Title, ev.Artist); err != nil {
 		return err
 	}
+	// v0.4.4: passive-refill path. Search-acquire already wrote the
+	// image_url at stub-insert time (searchAcquire in this file); for
+	// random refill we're writing it here because the seeder only
+	// now knows what release was picked. Empty string left alone —
+	// don't overwrite a search-acquire URL with empty.
+	if ev.ImageURL != "" {
+		if err := s.repo.UpdateSongImage(ctx, ev.SongID, ev.ImageURL); err != nil {
+			// Non-fatal: stub may have been deleted concurrently.
+			s.log.Debug("queue: update image on RequestDownload failed",
+				"song_id", ev.SongID, "err", err)
+		}
+	}
 
 	// v0.4.1 PR B: user-initiated search gets an early queue entry with
 	// status='probing'. Immediate UI feedback — the user sees the artist/

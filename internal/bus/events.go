@@ -180,4 +180,11 @@ type RequestDownload struct {
 	Artist        string    `json:"artist"`
 	CatalogNumber string    `json:"catalog_number,omitempty"`
 	Strategy      Strategy  `json:"strategy,omitempty"`
+	// ImageURL is the cover-art URL the seeder already fetched from
+	// its upstream (Discogs thumb, Bandcamp art). When set, queue's
+	// onRequestDownload plumbs it into queue_songs.image_url so the
+	// row renders with artwork on first paint without a second
+	// Discogs round-trip. Empty when the seeder couldn't obtain one
+	// (Bandcamp today; rare-pressing Discogs rows). v0.4.4.
+	ImageURL string `json:"image_url,omitempty"`
 }

@@ -35,3 +35,6 @@ coverage.txt
 
 # macOS
 .DS_Store
+
+# Claude Code preview launch config (developer-local).
+.claude/

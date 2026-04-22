@@ -20,7 +20,9 @@
     <li
       v-for="r in releases"
       :key="keyFor(r)"
-      class="flex items-center gap-4 px-4 py-2 pixel-texture transition-colors bg-pinkish-white hover:bg-pinkish-white-hover"
+      class="flex items-center gap-4 px-4 py-2 pixel-texture transition-colors bg-pinkish-white hover:bg-pinkish-white-hover cursor-pointer"
+      :title="`Open ${r.title}`"
+      @click="goToAlbum(router, r.id)"
     >
       <!-- Cover. Same overlay-on-gradient pattern as ReleaseGrid. -->
       <div
@@ -45,7 +47,13 @@
       <div class="flex-1 min-w-0">
         <p class="font-medium text-gray-900 truncate">{{ r.title }}</p>
         <p class="text-xs text-gray-600 truncate">
-          <span>{{ r.artist }}</span>
+          <!-- v0.4.4 QoL: artist name navigates to /artist/{id} via
+               Discogs lookup. stop.prevent so we don't also fire the
+               row click (which would open the album). -->
+          <span
+            class="hover:underline cursor-pointer"
+            @click.stop.prevent="goToArtistByName(router, r.artist)"
+          >{{ r.artist }}</span>
           <span v-if="r.year"> · {{ r.year }}</span>
           <span v-if="r.catalogNumber"> · {{ r.catalogNumber }}</span>
         </p>
@@ -55,7 +63,7 @@
         type="button"
         class="px-3 py-1 pixel-border text-xs font-semibold transition-colors bg-vibrant-purple-light border-vibrant-purple text-gray-900 hover:bg-vibrant-purple hover:text-white"
         title="Add full album to playlist"
-        @click="emit('add-album', r)"
+        @click.stop="emit('add-album', r)"
       >
         + Album
       </button>
@@ -64,10 +72,15 @@
 </template>
 
 <script setup>
+import { useRouter } from 'vue-router'
+import { goToAlbum, goToArtistByName } from '@/utils/navigation'
+
 defineProps({
   releases: { type: Array, required: true },
 })
 const emit = defineEmits(['add-album'])
+
+const router = useRouter()
 
 function keyFor(r) {
   return `${r.artist}|${r.title}|${r.catalogNumber}|${r.year}`

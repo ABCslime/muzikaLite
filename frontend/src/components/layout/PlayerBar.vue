@@ -18,8 +18,13 @@
           <p class="text-gray-900 font-medium text-sm truncate">
             {{ currentSongTitle }}
           </p>
+          <!-- v0.4.4 QoL: clicking the artist navigates to /artist/{id}
+               via Discogs lookup. -->
           <p class="text-gray-600 text-xs truncate">
-            {{ currentSongArtist }}
+            <span
+              class="hover:underline cursor-pointer"
+              @click="goToArtistByName(router, currentSongArtist)"
+            >{{ currentSongArtist }}</span>
           </p>
         </div>
       </div>
@@ -202,9 +207,13 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { usePlayerStore } from '@/stores/player'
 import { formatTime } from '@/utils/formatTime'
 import { getSongTitle, getSongArtist, getSongImage } from '@/utils/songHelpers'
+import { goToArtistByName } from '@/utils/navigation'
+
+const router = useRouter()
 
 const playerStore = usePlayerStore()
 const audioElement = ref(null)

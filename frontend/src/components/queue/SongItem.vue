@@ -56,7 +56,15 @@
       >
         {{ songTitle }}
       </p>
-      <p class="text-gray-600 text-xs truncate">{{ songArtist }}</p>
+      <!-- v0.4.4 QoL: artist name navigates to /artist/{id} via Discogs
+           lookup. stop.prevent so we don't also trigger the row's
+           handlePlay click. -->
+      <p class="text-gray-600 text-xs truncate">
+        <span
+          class="hover:underline cursor-pointer"
+          @click.stop.prevent="goToArtistByName(router, songArtist)"
+        >{{ songArtist }}</span>
+      </p>
       <!-- v0.4.1 PR B — search availability status pill -->
       <p
         v-if="isProbing"
@@ -119,10 +127,14 @@
 
 <script setup>
 import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { usePlayerStore } from '@/stores/player'
 import { useQueueStore } from '@/stores/queue'
 import { formatTime } from '@/utils/formatTime'
 import { getSongTitle, getSongArtist, getSongImage } from '@/utils/songHelpers'
+import { goToArtistByName } from '@/utils/navigation'
+
+const router = useRouter()
 
 const props = defineProps({
   song: {

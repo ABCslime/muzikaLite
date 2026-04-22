@@ -16,7 +16,9 @@
       v-for="(r, idx) in releases"
       :key="keyFor(r)"
       class="flex items-center gap-4 px-4 py-2 pixel-texture transition-colors"
-      :class="rowClass(r)"
+      :class="[rowClass(r), r.id ? 'cursor-pointer' : '']"
+      :title="r.id ? `Open ${r.title}` : ''"
+      @click="r.id && goToAlbum(router, r.id)"
     >
       <!-- Art. v0.4.3 — real cover if the release has Thumb from
            Discogs, else the gradient placeholder underneath. The
@@ -46,7 +48,12 @@
       <div class="flex-1 min-w-0">
         <p class="font-medium text-gray-900 truncate">{{ r.title }}</p>
         <p class="text-xs text-gray-600 truncate">
-          <span>{{ r.artist }}</span>
+          <!-- v0.4.4 QoL: artist name navigates to /artist/{id}.
+               stop.prevent so we don't fire the row click. -->
+          <span
+            class="hover:underline cursor-pointer"
+            @click.stop.prevent="goToArtistByName(router, r.artist)"
+          >{{ r.artist }}</span>
           <span v-if="r.year"> · {{ r.year }}</span>
           <span v-if="r.catalogNumber"> · {{ r.catalogNumber }}</span>
         </p>
@@ -79,7 +86,7 @@
         :disabled="queuingId === keyFor(r) || availabilityOf(r) === 'checking'"
         class="px-3 py-1 pixel-border text-xs font-semibold transition-colors"
         :class="queueBtnClass(r)"
-        @click="handleQueue(r)"
+        @click.stop="handleQueue(r)"
       >
         {{ queuingId === keyFor(r) ? 'Queued' : 'Queue' }}
       </button>
@@ -89,7 +96,11 @@
 
 <script setup>
 import { ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { useQueueStore } from '@/stores/queue'
+import { goToAlbum, goToArtistByName } from '@/utils/navigation'
+
+const router = useRouter()
 
 const props = defineProps({
   releases: { type: Array, required: true },

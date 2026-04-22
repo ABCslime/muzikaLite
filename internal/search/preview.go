@@ -40,11 +40,17 @@ const defaultPerCategoryLimit = 5
 
 // Candidate is a release row — kept for backward compatibility with the
 // (now-legacy) shape the client used before PR B.
+//
+// v0.4.3: Thumb carries Discogs' small cover-art URL so the frontend
+// can render album thumbnails in ReleaseGrid, ArtistView, LabelView.
+// Often empty for rare pressings; frontend falls back to a gradient
+// placeholder.
 type Candidate struct {
 	Title         string `json:"title"`
 	Artist        string `json:"artist"`
 	CatalogNumber string `json:"catalogNumber,omitempty"`
 	Year          int    `json:"year,omitempty"`
+	Thumb         string `json:"thumb,omitempty"`
 }
 
 // Entity is the JSON payload for an artist or label hit.
@@ -222,6 +228,7 @@ func (p *Previewer) Preview(ctx context.Context, query string) (Preview, error) 
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
+			Thumb:         r.Thumb,
 		})
 	}
 	for _, a := range artists {
@@ -274,9 +281,16 @@ func emptyPreview() Preview {
 // ArtistDetail is the payload for /api/discogs/artist/{id}. The UI
 // renders Name at the top, Releases as a grid with a "Queue" button
 // that routes through the normal search-acquire path.
+//
+// v0.4.3: Image is a representative cover-art URL for the hero
+// block. Picked from the first release with non-empty Thumb —
+// cheaper than a dedicated /artists/{id} lookup AND more visually
+// relevant (an album cover beats a press photo). Empty when the
+// artist has zero releases with artwork.
 type ArtistDetail struct {
 	ID       int         `json:"id"`
 	Name     string      `json:"name"`
+	Image    string      `json:"image,omitempty"`
 	Releases []Candidate `json:"releases"`
 }
 
@@ -284,6 +298,7 @@ type ArtistDetail struct {
 type LabelDetail struct {
 	ID       int         `json:"id"`
 	Name     string      `json:"name"`
+	Image    string      `json:"image,omitempty"`
 	Releases []Candidate `json:"releases"`
 }
 
@@ -291,6 +306,12 @@ type LabelDetail struct {
 // enough metadata to re-acquire the release plus a tracklist for
 // display. "Add album to queue" on the frontend calls the existing
 // search-acquire path with {title, artist, catalogNumber}.
+//
+// v0.4.3: Thumb / Cover carry the Discogs cover-art URLs. Thumb is
+// the small (~150 px) version used in lists; Cover is the first
+// full-size image from the release's images array, rendered in the
+// AlbumView hero. Either can be empty (rare pressings without
+// artwork uploaded); frontend falls back to a gradient.
 type ReleaseDetail struct {
 	ID            int     `json:"id"`
 	Title         string  `json:"title"`
@@ -298,6 +319,8 @@ type ReleaseDetail struct {
 	Year          int     `json:"year,omitempty"`
 	CatalogNumber string  `json:"catalogNumber,omitempty"`
 	Label         string  `json:"label,omitempty"`
+	Thumb         string  `json:"thumb,omitempty"`
+	Cover         string  `json:"cover,omitempty"`
 	Tracks        []Track `json:"tracks"`
 }
 
@@ -329,9 +352,13 @@ func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
+			Thumb:         r.Thumb,
 		})
 		if out.Name == "" && r.Artist != "" {
 			out.Name = r.Artist
+		}
+		if out.Image == "" && r.Thumb != "" {
+			out.Image = r.Thumb
 		}
 	}
 	return out, nil
@@ -353,7 +380,11 @@ func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
+			Thumb:         r.Thumb,
 		})
+		if out.Image == "" && r.Thumb != "" {
+			out.Image = r.Thumb
+		}
 	}
 	// Label Name isn't on per-release rows. Leave blank; the frontend
 	// either shows the ID or falls back to a search/suggestion. A
@@ -899,6 +930,8 @@ func (p *Previewer) Release(ctx context.Context, id int) (ReleaseDetail, error) 
 		Year:          r.Year,
 		CatalogNumber: r.CatalogNumber,
 		Label:         r.Label,
+		Thumb:         r.Thumb,
+		Cover:         r.Cover,
 		Tracks:        make([]Track, 0, len(r.Tracks)),
 	}
 	for _, t := range r.Tracks {

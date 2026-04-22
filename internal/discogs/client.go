@@ -122,6 +122,13 @@ type SearchResult struct {
 	Artist        string
 	CatalogNumber string // "" if the release has no catno
 	Year          int    // 0 if unknown
+
+	// Thumb is Discogs' small cover-art URL for this release. Often
+	// empty when the release hasn't been linked to artwork in
+	// Discogs (common for old catalog, rare pressings). Consumers
+	// must tolerate empty — the frontend renders a gradient
+	// placeholder in that case. v0.4.3.
+	Thumb string
 }
 
 // Search picks one random release from the top page of /database/search
@@ -257,6 +264,7 @@ func buildResult(r releaseResult) (SearchResult, bool) {
 		Artist:        artist,
 		CatalogNumber: firstCatno(r.CatalogNumber),
 		Year:          parseYear(r.Year),
+		Thumb:         r.Thumb,
 	}, true
 }
 
@@ -456,6 +464,13 @@ type entityResult struct {
 
 // ReleaseDetail is the payload for a full release lookup — metadata +
 // tracklist. Used by the /album/:id frontend view.
+//
+// v0.4.3: Thumb and Cover carry cover-art URLs at two sizes. Thumb
+// is Discogs' listing thumbnail (~150 px, used in row views when
+// we have a release id). Cover is the first primary image from the
+// release's `images` array — typically ~600 px, used for the
+// AlbumView hero. Either can be empty for releases without linked
+// artwork; callers render a gradient placeholder in that case.
 type ReleaseDetail struct {
 	ID            int
 	Title         string
@@ -464,6 +479,7 @@ type ReleaseDetail struct {
 	CatalogNumber string
 	Label         string
 	Thumb         string
+	Cover         string
 	Tracks        []Track
 }
 
@@ -575,6 +591,7 @@ func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path strin
 			Artist:        artist,
 			CatalogNumber: firstCatno(r.Catno),
 			Year:          r.Year,
+			Thumb:         r.Thumb,
 		})
 		if len(out) >= limit {
 			break
@@ -643,7 +660,7 @@ func (c *Client) fetchRaw(ctx context.Context, key, path string, params url.Valu
 // names with " & " to produce a human-readable string.
 func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 	var resp struct {
-		ID      int `json:"id"`
+		ID      int    `json:"id"`
 		Title   string `json:"title"`
 		Year    int    `json:"year"`
 		Thumb   string `json:"thumb"`
@@ -651,7 +668,7 @@ func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 			Name string `json:"name"`
 		} `json:"artists"`
 		Labels []struct {
-			Name string `json:"name"`
+			Name  string `json:"name"`
 			Catno string `json:"catno"`
 		} `json:"labels"`
 		Tracklist []struct {
@@ -659,15 +676,36 @@ func parseReleaseDetail(payload []byte) (ReleaseDetail, error) {
 			Title    string `json:"title"`
 			Duration string `json:"duration"`
 		} `json:"tracklist"`
+		// Discogs release responses include an "images" array where
+		// one entry has type=="primary" (front cover) and the rest
+		// are type=="secondary" (back, inner, etc). Each has
+		// resource_url (full size), uri (same), and uri150 (thumb).
+		// We pick the primary for the hero; fall back to first image.
+		Images []struct {
+			Type        string `json:"type"`
+			URI         string `json:"uri"`
+			ResourceURL string `json:"resource_url"`
+		} `json:"images"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		return ReleaseDetail{}, fmt.Errorf("discogs: unmarshal release: %w", err)
+	}
+	cover := ""
+	for _, img := range resp.Images {
+		if img.Type == "primary" && img.URI != "" {
+			cover = img.URI
+			break
+		}
+	}
+	if cover == "" && len(resp.Images) > 0 {
+		cover = resp.Images[0].URI
 	}
 	out := ReleaseDetail{
 		ID:    resp.ID,
 		Title: strings.TrimSpace(resp.Title),
 		Year:  resp.Year,
 		Thumb: resp.Thumb,
+		Cover: cover,
 	}
 	names := make([]string, 0, len(resp.Artists))
 	for _, a := range resp.Artists {
@@ -726,6 +764,9 @@ type releaseResult struct {
 	// Year is a string in Discogs' JSON (occasionally "" or "0000" for
 	// unknown). We parse to int and treat anything non-positive as unknown.
 	Year string `json:"year"`
+	// Thumb is Discogs' small cover-art URL. "" on releases without
+	// linked artwork. v0.4.3.
+	Thumb string `json:"thumb"`
 }
 
 // parseYear turns Discogs' year string into a non-negative int.

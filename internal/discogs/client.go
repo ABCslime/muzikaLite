@@ -129,6 +129,18 @@ type SearchResult struct {
 	// must tolerate empty — the frontend renders a gradient
 	// placeholder in that case. v0.4.3.
 	Thumb string
+
+	// ID is the Discogs release ID for this row. Populated when the
+	// source endpoint returns it (artist/label releases lists do;
+	// /database/search does too). Required by callers that want to
+	// route to /album/<id> or expand a release into its tracklist.
+	// v0.4.4.
+	ID int
+
+	// Format is the comma-separated Discogs format string for this
+	// release: "CD, Album", "12\", EP", "7\", Single", etc. Used
+	// downstream to classify Album vs Single. v0.4.4.
+	Format string
 }
 
 // Search picks one random release from the top page of /database/search
@@ -644,6 +656,13 @@ func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path strin
 			Year   int    `json:"year"`
 			Catno  string `json:"catno"`
 			Thumb  string `json:"thumb"`
+			// Discogs returns format on the artist/label releases
+			// endpoint as a comma-separated STRING (not the array
+			// form you get on /releases/{id}). Examples: "CD, Album",
+			// "12\", EP", "7\", Single". We parse it into IsAlbum
+			// downstream by checking for "Album", "LP", or "EP"
+			// tokens. v0.4.4.
+			Format string `json:"format"`
 		} `json:"releases"`
 	}
 	if err := json.Unmarshal(payload, &resp); err != nil {
@@ -673,6 +692,8 @@ func (c *Client) fetchArtistOrLabelReleases(ctx context.Context, key, path strin
 			CatalogNumber: firstCatno(r.Catno),
 			Year:          r.Year,
 			Thumb:         r.Thumb,
+			ID:            r.ID,
+			Format:        r.Format,
 		})
 		if len(out) >= limit {
 			break

@@ -45,12 +45,45 @@ const defaultPerCategoryLimit = 5
 // can render album thumbnails in ReleaseGrid, ArtistView, LabelView.
 // Often empty for rare pressings; frontend falls back to a gradient
 // placeholder.
+//
+// v0.4.4: ID + IsAlbum populated from Discogs' release id and format
+// string. The frontend uses ID to route to /album/{id} and the
+// "Add album to playlist" endpoint; IsAlbum to bucket releases
+// into the Album section (multi-track LP/EP/Album) versus the
+// Single section (1-2 track single/EP).
 type Candidate struct {
+	ID            int    `json:"id,omitempty"`
 	Title         string `json:"title"`
 	Artist        string `json:"artist"`
 	CatalogNumber string `json:"catalogNumber,omitempty"`
 	Year          int    `json:"year,omitempty"`
 	Thumb         string `json:"thumb,omitempty"`
+	IsAlbum       bool   `json:"isAlbum,omitempty"`
+}
+
+// isAlbumFormat reports whether a Discogs release `format` string
+// describes a multi-track album. Discogs returns this as a comma-
+// separated string of free-form tokens like "CD, Album, Compilation"
+// or "12\", EP" or "7\", Single". We bucket "Album", "LP", "EP",
+// and "Mini-Album" as Album; everything else (Single, etc.) as
+// Single. Empty format → not an album (defensive: classify as
+// single so the user can still queue without "Add to playlist"
+// expanding into nothing).
+//
+// Match is case-insensitive but boundary-aware so "EPK" doesn't
+// trigger on "EP". v0.4.4.
+func isAlbumFormat(format string) bool {
+	if format == "" {
+		return false
+	}
+	for _, tok := range strings.Split(format, ",") {
+		tok = strings.TrimSpace(strings.ToLower(tok))
+		switch tok {
+		case "album", "lp", "ep", "mini-album":
+			return true
+		}
+	}
+	return false
 }
 
 // Entity is the JSON payload for an artist or label hit.
@@ -224,11 +257,13 @@ func (p *Previewer) Preview(ctx context.Context, query string) (Preview, error) 
 
 	for _, r := range releases {
 		out.Releases = append(out.Releases, Candidate{
+			ID:            r.ID,
 			Title:         r.Title,
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
+			IsAlbum:       isAlbumFormat(r.Format),
 		})
 	}
 	for _, a := range artists {
@@ -377,11 +412,13 @@ func (p *Previewer) Artist(ctx context.Context, id int) (ArtistDetail, error) {
 	}
 	for _, r := range releases {
 		out.Releases = append(out.Releases, Candidate{
+			ID:            r.ID,
 			Title:         r.Title,
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
+			IsAlbum:       isAlbumFormat(r.Format),
 		})
 		// Fallbacks if /artists/{id} didn't return a name/image —
 		// e.g. transient Discogs error, brand new artist record.
@@ -432,11 +469,13 @@ func (p *Previewer) Label(ctx context.Context, id int) (LabelDetail, error) {
 	}
 	for _, r := range releases {
 		out.Releases = append(out.Releases, Candidate{
+			ID:            r.ID,
 			Title:         r.Title,
 			Artist:        r.Artist,
 			CatalogNumber: r.CatalogNumber,
 			Year:          r.Year,
 			Thumb:         r.Thumb,
+			IsAlbum:       isAlbumFormat(r.Format),
 		})
 		if out.Image == "" && r.Thumb != "" {
 			out.Image = r.Thumb

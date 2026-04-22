@@ -184,6 +184,9 @@ func run() error {
 	if dgClient != nil {
 		simSvc.Register(discogsbuckets.NewSameArtist(dgClient))
 		simSvc.Register(discogsbuckets.NewSameLabelEra(dgClient))
+		simSvc.Register(discogsbuckets.NewSameStyleEra(dgClient))
+		simSvc.Register(discogsbuckets.NewCollaborators(dgClient))
+		simSvc.Register(discogsbuckets.NewSameGenreEra(dgClient))
 		log.Info("similarity: registered Discogs buckets",
 			"buckets", len(simSvc.Buckets()))
 	} else {

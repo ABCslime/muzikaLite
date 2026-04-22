@@ -3,10 +3,12 @@ package discogs_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/macabc/muzika/internal/discogs"
@@ -120,6 +122,183 @@ func TestSameLabelEra_BailsWithoutLabelOrYear(t *testing.T) {
 				t.Errorf("got (%v, %v), want (nil, nil)", got, err)
 			}
 		})
+	}
+}
+
+// TestSameStyleEra_FansOutByStyle_AndYearFilters: seed has two
+// styles; the bucket fires one search per style and filters each
+// by the seed's year window. Verifies both the fan-out and the
+// year-window math on style-based candidates.
+func TestSameStyleEra_FansOutByStyle_AndYearFilters(t *testing.T) {
+	// One mock responds to /database/search, branching on style.
+	mock := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/database/search" {
+			http.NotFound(w, r)
+			return
+		}
+		style := r.URL.Query().Get("style")
+		var rows []map[string]any
+		switch style {
+		case "House":
+			rows = []map[string]any{
+				{"id": 100, "title": "A1 - HouseHit", "year": "2000"}, // in
+				{"id": 101, "title": "A2 - HouseOld", "year": "1990"}, // out
+			}
+		case "Disco":
+			rows = []map[string]any{
+				{"id": 200, "title": "B1 - DiscoHit", "year": "2001"}, // in
+				{"id": 201, "title": "B2 - DiscoFuture", "year": "2010"}, // out
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"results": rows})
+	}
+	b := discogsbuckets.NewSameStyleEra(testClient(t, mock))
+	got, err := b.Candidates(context.Background(), similarity.Seed{
+		Title: "X", Artist: "Y",
+		Year: 2000, Styles: []string{"House", "Disco"},
+	})
+	if err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d candidates, want 2 (HouseHit + DiscoHit)", len(got))
+		for _, c := range got {
+			t.Logf("  %s - %s", c.Artist, c.Title)
+		}
+	}
+	// Edge metadata must carry the style that sourced the candidate,
+	// so the v0.7 graph view can color edges accordingly.
+	for _, c := range got {
+		if c.Edge["discogs_style"] == nil {
+			t.Errorf("missing discogs_style edge on %+v", c)
+		}
+	}
+}
+
+// TestSameStyleEra_BailsWithoutStylesOrYear: either missing
+// attribute is a no-op, same bail-out pattern as same_label_era.
+func TestSameStyleEra_BailsWithoutStylesOrYear(t *testing.T) {
+	cases := []struct {
+		name string
+		seed similarity.Seed
+	}{
+		{"no styles", similarity.Seed{Year: 2000}},
+		{"no year", similarity.Seed{Styles: []string{"House"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := discogsbuckets.NewSameStyleEra(testClient(t, nil))
+			got, err := b.Candidates(context.Background(), tc.seed)
+			if err != nil || len(got) != 0 {
+				t.Errorf("got (%v, %v), want (nil, nil)", got, err)
+			}
+		})
+	}
+}
+
+// TestCollaborators_CapsAt3_AndTagsEdge: seed has 5 collaborator
+// IDs; bucket only fires /artists/{id}/releases for the first 3
+// (collaboratorsCap). Each candidate's Edge must carry the
+// specific collaborator id that sourced it.
+func TestCollaborators_CapsAt3_AndTagsEdge(t *testing.T) {
+	var calls []int
+	var mu sync.Mutex
+	mock := func(w http.ResponseWriter, r *http.Request) {
+		// Path shape: /artists/{id}/releases
+		var aid int
+		if _, err := fmt.Sscanf(r.URL.Path, "/artists/%d/releases", &aid); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		calls = append(calls, aid)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"releases": []map[string]any{
+				{"id": aid * 10, "type": "release",
+					"title": fmt.Sprintf("Release%d", aid),
+					"artist": fmt.Sprintf("Artist%d", aid),
+					"year":  2000},
+			},
+		})
+	}
+	b := discogsbuckets.NewCollaborators(testClient(t, mock))
+	got, err := b.Candidates(context.Background(), similarity.Seed{
+		Title:         "X",
+		Artist:        "Y",
+		Collaborators: []int{1, 2, 3, 4, 5},
+	})
+	if err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d candidates, want 3 (cap)", len(got))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 3 {
+		t.Errorf("got %d /artists calls, want 3 (cap honored)", len(calls))
+	}
+	// Verify each candidate carries the right collaborator id.
+	for _, c := range got {
+		if _, ok := c.Edge["collaborator_discogs_id"].(int); !ok {
+			t.Errorf("missing collaborator_discogs_id on %+v", c)
+		}
+	}
+}
+
+// TestCollaborators_BailsEmpty: common path — seed has no extra
+// artists, bucket is a clean no-op without hitting Discogs.
+func TestCollaborators_BailsEmpty(t *testing.T) {
+	// Fail-loud handler — if bucket accidentally calls the API,
+	// test reports which path was hit.
+	mock := func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("should not have hit Discogs: %s", r.URL.Path)
+		http.NotFound(w, r)
+	}
+	b := discogsbuckets.NewCollaborators(testClient(t, mock))
+	got, err := b.Candidates(context.Background(), similarity.Seed{
+		Title: "X", Artist: "Y", Collaborators: nil,
+	})
+	if err != nil || len(got) != 0 {
+		t.Errorf("got (%v, %v), want (nil, nil)", got, err)
+	}
+}
+
+// TestSameGenreEra_Works: genre-based fan-out mirrors style's
+// logic; one genre, filter by year. Tests the whole wiring rather
+// than re-verifying year math (covered by same_label_era).
+func TestSameGenreEra_Works(t *testing.T) {
+	mock := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/database/search" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("genre") != "Electronic" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"id": 300, "title": "A - E1", "year": "2000"},
+				{"id": 301, "title": "B - E2", "year": "2001"},
+				{"id": 302, "title": "C - E3", "year": "1990"}, // out of window
+			},
+		})
+	}
+	b := discogsbuckets.NewSameGenreEra(testClient(t, mock))
+	got, err := b.Candidates(context.Background(), similarity.Seed{
+		Title: "X", Artist: "Y",
+		Year: 2000, Genres: []string{"Electronic"},
+	})
+	if err != nil {
+		t.Fatalf("Candidates: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d, want 2 (E1 + E2; E3 out of ±3y window)", len(got))
 	}
 }
 

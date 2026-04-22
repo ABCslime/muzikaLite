@@ -391,6 +391,60 @@ func (c *Client) Preview(ctx context.Context, query string, limit int) ([]Search
 	return parsePickAll(payload, limit)
 }
 
+// SearchByStyle returns up to `limit` releases tagged with a given
+// Discogs style ("House", "Detroit Techno", "Vaporwave"). Cached
+// by style name under "search:style=...". Used by the v0.5
+// same-style-era similarity bucket — the year-window filter runs
+// client-side against the returned Year field (Discogs' `year`
+// query param doesn't support ranges cleanly).
+//
+// Empty style → empty result (not an error). Style matching is
+// case-sensitive on Discogs' side; the caller should pass styles
+// verbatim as they appeared on /releases/{id}.Styles.
+func (c *Client) SearchByStyle(ctx context.Context, style string, limit int) ([]SearchResult, error) {
+	style = strings.TrimSpace(style)
+	if style == "" {
+		return nil, nil
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	key := fmt.Sprintf("search:style=%s:limit=%d", strings.ToLower(style), limit)
+	params := url.Values{}
+	params.Set("type", "release")
+	params.Set("style", style)
+	params.Set("per_page", strconv.Itoa(limit))
+	payload, err := c.fetchSearch(ctx, key, params)
+	if err != nil {
+		return nil, err
+	}
+	return parsePickAll(payload, limit)
+}
+
+// SearchByGenre is the broad-vocabulary analog of SearchByStyle
+// ("Electronic", "Rock"). Different cache key so the two don't
+// collide on labels like "Pop" that can be either. v0.5 same-
+// genre-era bucket.
+func (c *Client) SearchByGenre(ctx context.Context, genre string, limit int) ([]SearchResult, error) {
+	genre = strings.TrimSpace(genre)
+	if genre == "" {
+		return nil, nil
+	}
+	if limit < 1 || limit > 100 {
+		limit = 50
+	}
+	key := fmt.Sprintf("search:genre=%s:limit=%d", strings.ToLower(genre), limit)
+	params := url.Values{}
+	params.Set("type", "release")
+	params.Set("genre", genre)
+	params.Set("per_page", strconv.Itoa(limit))
+	payload, err := c.fetchSearch(ctx, key, params)
+	if err != nil {
+		return nil, err
+	}
+	return parsePickAll(payload, limit)
+}
+
 // Entity is the JSON shape for artist + label search hits. ID lets the
 // frontend (v0.4.2 PR C) link to a detail view; Name is the display text;
 // Thumb is an optional thumbnail URL from Discogs that the UI can render

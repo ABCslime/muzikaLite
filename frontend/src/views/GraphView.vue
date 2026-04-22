@@ -56,12 +56,36 @@
 
         <!-- Canvas. Explicitly sized so Cytoscape can compute its
              layout — the library requires a non-zero-bounding
-             parent at mount time. flex-1 handles the rest. -->
+             parent at mount time. flex-1 handles the rest.
+             Positioned relative so the tooltip overlay can
+             anchor absolutely inside it. -->
         <div
           v-show="graph && graph.edges.length > 0"
           ref="canvasEl"
           class="flex-1 pixel-border border-gray-400 bg-white relative"
-        ></div>
+        >
+          <!-- Hover tooltip: bucket label on edges, full
+               artist/title on nodes. Positioned manually from
+               Cytoscape's renderedPosition + the canvas bounding
+               box — Cytoscape doesn't ship a built-in tooltip. -->
+          <div
+            v-show="tooltip.visible"
+            class="absolute z-50 pointer-events-none pixel-border border-gray-700 bg-white text-xs text-gray-900 px-2 py-1 shadow-md"
+            :style="{ left: tooltip.x + 'px', top: tooltip.y + 'px' }"
+          >
+            {{ tooltip.text }}
+          </div>
+          <!-- Queueing feedback: when user clicks a neighbor we
+               may wait a few seconds for the new song to
+               download. A non-blocking banner beats a frozen
+               click. -->
+          <div
+            v-if="queueingMessage"
+            class="absolute bottom-3 left-3 pixel-border border-vibrant-pink bg-pinkish-white px-3 py-2 text-xs text-gray-900 pixel-texture"
+          >
+            {{ queueingMessage }}
+          </div>
+        </div>
       </div>
       <PlayerBar />
     </div>
@@ -69,14 +93,30 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, watch, onMounted, onUnmounted, nextTick, reactive } from 'vue'
 import Sidebar from '@/components/layout/Sidebar.vue'
 import TopBar from '@/components/layout/TopBar.vue'
 import PlayerBar from '@/components/layout/PlayerBar.vue'
 import { similarityAPI } from '@/api/similarity'
 import { usePlayerStore } from '@/stores/player'
+import { useQueueStore } from '@/stores/queue'
 
 const playerStore = usePlayerStore()
+const queueStore = useQueueStore()
+
+// v0.7 PR B: bucket-id → human-readable label for the hover
+// tooltip. Kept here rather than in the backend response so
+// the frontend can rename without a wire change.
+const bucketLabels = {
+  'discogs.same_label_era': 'Same label, similar era',
+  'discogs.collaborators': 'Featured collaborator',
+  // Future buckets (events, plugins) get their labels added
+  // here as they ship.
+}
+
+// Tooltip + queueing state for hover + click UX.
+const tooltip = reactive({ visible: false, x: 0, y: 0, text: '' })
+const queueingMessage = ref('')
 
 // Canvas element + Cytoscape instance. We import cytoscape
 // lazily (onMounted) so the ~300 kb bundle stays out of the
@@ -236,6 +276,45 @@ onMounted(async () => {
     ],
   })
 
+  // Node click: play the clicked song + recenter the graph.
+  // Pure exploration. Center node click is a no-op.
+  cy.on('tap', 'node', async (evt) => {
+    const node = evt.target
+    if (node.data('isCenter')) return
+    await handleCandidateClick({
+      title: node.data('title'),
+      artist: node.data('artist'),
+      imageUrl: node.data('imageUrl'),
+    })
+  })
+
+  // Hover tooltips — nodes show "artist — title", edges show
+  // the bucket's human label. We position the tooltip in
+  // container-relative coords by subtracting the canvas bbox
+  // from the screen-space mouse event.
+  cy.on('mouseover', 'node', (evt) => {
+    const n = evt.target
+    const artist = n.data('artist') || ''
+    const title = n.data('title') || ''
+    tooltip.text = (artist && title) ? `${artist} — ${title}` : (title || artist || '')
+    positionTooltip(evt.originalEvent)
+    tooltip.visible = true
+  })
+  cy.on('mouseover', 'edge', (evt) => {
+    const bucket = evt.target.data('bucket') || ''
+    tooltip.text = bucketLabels[bucket] || bucket
+    positionTooltip(evt.originalEvent)
+    tooltip.visible = true
+  })
+  cy.on('mouseout', 'node edge', () => {
+    tooltip.visible = false
+  })
+  cy.on('mousemove', (evt) => {
+    if (tooltip.visible && evt.originalEvent) {
+      positionTooltip(evt.originalEvent)
+    }
+  })
+
   // Initial render + reactive refresh whenever the center
   // song changes. watch with immediate: true fires once at
   // mount with the current id.
@@ -247,6 +326,99 @@ onMounted(async () => {
     { immediate: true },
   )
 })
+
+// positionTooltip converts a screen-space MouseEvent into
+// container-relative coords. The overlay div is absolutely
+// positioned inside canvasEl, so we subtract the canvas
+// bounding rect's origin.
+function positionTooltip(ev) {
+  if (!canvasEl.value || !ev) return
+  const rect = canvasEl.value.getBoundingClientRect()
+  tooltip.x = ev.clientX - rect.left + 12
+  tooltip.y = ev.clientY - rect.top + 12
+}
+
+// handleCandidateClick kicks off the existing search-acquire
+// flow for the clicked (title, artist). The pipeline:
+//   1. POST /api/queue/search with {title, artist, imageUrl}
+//      — backend inserts a queue stub (or reuses an existing
+//      one via FindSongForReuse), returns the songID.
+//   2. Optimistically recenter the graph on the new songID so
+//      the UI reacts instantly (neighbor edges will populate
+//      once Discogs hydration finishes).
+//   3. Poll queueStore.songs for the songID reaching status=
+//      ready. When it does, playerStore.play(song) starts
+//      audio. The currentSong watcher in onMounted will then
+//      refresh the graph with correct metadata.
+//   4. If it never reaches ready within ~90s, clear the
+//      queueing banner — the user can still play the song
+//      manually from their queue.
+async function handleCandidateClick({ title, artist, imageUrl }) {
+  if (!title || !artist) return
+  queueingMessage.value = `Queueing "${artist} — ${title}"…`
+  let songId = ''
+  try {
+    const r = await queueStore.searchAndQueue({
+      title,
+      artist,
+      imageUrl: imageUrl || '',
+      query: `${artist} — ${title}`,
+    })
+    if (!r.success) {
+      queueingMessage.value = `Couldn't queue: ${r.error || 'unknown error'}`
+      setTimeout(() => { queueingMessage.value = '' }, 4000)
+      return
+    }
+    songId = r.data?.songId || ''
+    if (!songId) {
+      queueingMessage.value = 'Queued but no song id returned'
+      setTimeout(() => { queueingMessage.value = '' }, 4000)
+      return
+    }
+    // Recenter graph immediately on the new songID. If
+    // hydration hasn't landed yet the graph will render with
+    // just a center; once metadata arrives a later refresh
+    // fills in the neighbors.
+    loadGraph(songId)
+    // Refresh the queue store so the newly-queued song is in
+    // queueStore.songs — otherwise the polling below won't see
+    // it arrive.
+    await queueStore.fetchQueue(true)
+  } catch (e) {
+    queueingMessage.value = `Couldn't queue: ${e.message || 'unknown error'}`
+    setTimeout(() => { queueingMessage.value = '' }, 4000)
+    return
+  }
+
+  // Poll the queue for the song becoming ready; when it does,
+  // play it. Poll budget is ~90 seconds — a typical Soulseek
+  // download takes 10-60s. After that we give up silently.
+  const deadline = Date.now() + 90_000
+  const checkReady = () => {
+    const song = queueStore.songs.find((s) => s.id === songId)
+    if (song && song.status === 'ready') {
+      playerStore.play(song)
+      queueingMessage.value = ''
+      return true
+    }
+    return false
+  }
+  if (checkReady()) return
+  const interval = setInterval(async () => {
+    if (Date.now() > deadline) {
+      clearInterval(interval)
+      queueingMessage.value = ''
+      return
+    }
+    // Pull a fresh queue listing; most of the data is already
+    // polled by other surfaces, but this is the one action
+    // that specifically cares about a *just-queued* song.
+    await queueStore.fetchQueue(true)
+    if (checkReady()) {
+      clearInterval(interval)
+    }
+  }, 3000)
+}
 
 onUnmounted(() => {
   if (cy) {
